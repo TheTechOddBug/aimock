@@ -495,6 +495,82 @@
   }
 }</code></pre>
         </div>
+
+        <!-- ─── Multi-Turn Conversations ───────────────────────────── -->
+
+        <h2>Multi-Turn Conversations</h2>
+
+        <h3>Choosing a multi-turn matcher</h3>
+        <p>
+          aimock provides four match fields for multi-turn fixtures, each suited to a different
+          scenario. <strong><code>turnIndex</code></strong> matches by conversation depth (how many
+          assistant replies precede this request) and is stateless, so it works with concurrent
+          clients. <strong><code>hasToolResult</code></strong> is a boolean that distinguishes the
+          initial request from the follow-up after a tool executes &mdash; ideal for simple two-step
+          tool rounds. <strong><code>toolCallId</code></strong> matches a specific tool call by its
+          ID, useful when the agent calls multiple tools and you need to respond to exactly one.
+          <strong><code>sequenceIndex</code></strong> is a stateful counter (&ldquo;first request
+          gets A, second gets B&rdquo;) but is not safe for concurrent requests to the same fixture.
+          See the <a href="/multi-turn">Multi-Turn Conversations</a> reference for the full details.
+        </p>
+
+        <h3>Multi-turn conversation with turnIndex</h3>
+        <p>
+          Use <code>turnIndex</code> to give different responses at each conversational turn.
+          Combine with <code>hasToolResult</code> to handle the post-tool-execution follow-up.
+        </p>
+        <div class="code-block">
+          <div class="code-block-header">
+            fixtures/examples/llm/multi-turn-turnindex.json <span class="lang-tag">json</span>
+          </div>
+          <pre><code>{
+  <span class="key">"fixtures"</span>: [
+    {
+      <span class="key">"match"</span>: { <span class="key">"userMessage"</span>: <span class="str">"plan a trip"</span>, <span class="key">"turnIndex"</span>: <span class="num">0</span> },
+      <span class="key">"response"</span>: { <span class="key">"content"</span>: <span class="str">"I'd love to help plan your trip! Where would you like to go?"</span> }
+    },
+    {
+      <span class="key">"match"</span>: { <span class="key">"userMessage"</span>: <span class="str">"plan a trip"</span>, <span class="key">"turnIndex"</span>: <span class="num">1</span> },
+      <span class="key">"response"</span>: {
+        <span class="key">"content"</span>: <span class="str">"Great choice! Let me search for flights."</span>,
+        <span class="key">"toolCalls"</span>: [{ <span class="key">"name"</span>: <span class="str">"search_flights"</span>, <span class="key">"arguments"</span>: <span class="str">"{\"destination\": \"Tokyo\"}"</span> }]
+      }
+    },
+    {
+      <span class="key">"match"</span>: { <span class="key">"userMessage"</span>: <span class="str">"plan a trip"</span>, <span class="key">"turnIndex"</span>: <span class="num">2</span>, <span class="key">"hasToolResult"</span>: <span class="kw">true</span> },
+      <span class="key">"response"</span>: { <span class="key">"content"</span>: <span class="str">"I found several flights to Tokyo. The best option is..."</span> }
+    }
+  ]
+}</code></pre>
+        </div>
+
+        <h3>Tool-call cycle with hasToolResult</h3>
+        <p>
+          For a simple tool round-trip, <code>hasToolResult</code> is the most concise matcher:
+          <code>false</code> on the initial request, <code>true</code> after the tool result comes
+          back.
+        </p>
+        <div class="code-block">
+          <div class="code-block-header">
+            fixtures/examples/llm/tool-cycle-hastoolresult.json
+            <span class="lang-tag">json</span>
+          </div>
+          <pre><code>{
+  <span class="key">"fixtures"</span>: [
+    {
+      <span class="key">"match"</span>: { <span class="key">"userMessage"</span>: <span class="str">"what's the weather?"</span>, <span class="key">"hasToolResult"</span>: <span class="kw">false</span> },
+      <span class="key">"response"</span>: {
+        <span class="key">"content"</span>: <span class="kw">null</span>,
+        <span class="key">"toolCalls"</span>: [{ <span class="key">"name"</span>: <span class="str">"get_weather"</span>, <span class="key">"arguments"</span>: <span class="str">"{\"city\": \"San Francisco\"}"</span> }]
+      }
+    },
+    {
+      <span class="key">"match"</span>: { <span class="key">"userMessage"</span>: <span class="str">"what's the weather?"</span>, <span class="key">"hasToolResult"</span>: <span class="kw">true</span> },
+      <span class="key">"response"</span>: { <span class="key">"content"</span>: <span class="str">"It's 72°F and sunny in San Francisco!"</span> }
+    }
+  ]
+}</code></pre>
+        </div>
       </main>
       <aside class="page-toc" id="page-toc"></aside>
     </div>
