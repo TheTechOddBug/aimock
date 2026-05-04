@@ -108,7 +108,7 @@ export async function handleElevenLabsAudio(
   // No fixture match
   if (!fixture) {
     if (defaults.record) {
-      const proxied = await proxyAndRecord(
+      const outcome = await proxyAndRecord(
         req,
         res,
         syntheticReq,
@@ -118,13 +118,14 @@ export async function handleElevenLabsAudio(
         defaults,
         body,
       );
-      if (proxied) {
+      if (outcome === "handled_by_hook") return;
+      if (outcome === "relayed") {
         journal.add({
           method,
           path,
           headers: {},
           body: syntheticReq,
-          response: { status: res.statusCode ?? 200, fixture: null },
+          response: { status: res.statusCode ?? 200, fixture: null, source: "proxy" },
         });
         return;
       }

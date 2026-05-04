@@ -52,7 +52,7 @@ import { handleWebSocketResponses } from "./ws-responses.js";
 import { handleWebSocketRealtime } from "./ws-realtime.js";
 import { handleWebSocketGeminiLive } from "./ws-gemini-live.js";
 import { Logger } from "./logger.js";
-import { applyChaos } from "./chaos.js";
+import { applyChaosAction, evaluateChaos } from "./chaos.js";
 import { createMetricsRegistry, normalizePathLabel } from "./metrics.js";
 import { proxyAndRecord } from "./recorder.js";
 
@@ -461,8 +461,16 @@ async function handleCompletions(
     return;
   }
 
-  // Match fixture
+  const method = req.method ?? "POST";
+  const path = req.url ?? COMPLETIONS_PATH;
+  const flatHeaders = flattenHeaders(req.headers);
+
+  // Set endpoint type once early so router/recorder and journal see it
   body._endpointType = "chat";
+
+  // Match fixture first — chaos resolution depends on fixture-level overrides
+  // (headers > fixture.chaos > server defaults), so the fixture has to be
+  // known before we can roll with the right config.
   const testId = getTestId(req);
   const fixture = matchFixture(
     fixtures,
@@ -483,34 +491,88 @@ async function handleCompletions(
     );
   }
 
-  const method = req.method ?? "POST";
-  const path = req.url ?? COMPLETIONS_PATH;
-  const flatHeaders = flattenHeaders(req.headers);
+  // Roll chaos once per request. Dispatch by action + path:
+  //   drop / disconnect → apply immediately; upstream is never called and no
+  //                       response body is produced.
+  //   malformed, fixture path → write invalid JSON instead of the fixture.
+  //   malformed, proxy path  → proxy to upstream, then swap body via the
+  //                            beforeWriteResponse hook (passed only when the
+  //                            action is malformed, so the hook doesn't need
+  //                            to re-check the action).
+  const chaosAction = evaluateChaos(fixture, defaults.chaos, req.headers, defaults.logger);
+  const chaosContext = { method, path, headers: flatHeaders, body };
 
-  // Apply chaos before normal response handling
-  if (
-    applyChaos(
+  if (chaosAction === "drop" || chaosAction === "disconnect") {
+    applyChaosAction(
+      chaosAction,
       res,
       fixture,
-      defaults.chaos,
-      req.headers,
       journal,
-      {
-        method,
-        path,
-        headers: flatHeaders,
-        body,
-      },
+      chaosContext,
+      fixture ? "fixture" : "proxy",
       defaults.registry,
-      defaults.logger,
-    )
-  )
+    );
     return;
+  }
+
+  if (fixture && chaosAction === "malformed") {
+    applyChaosAction(
+      chaosAction,
+      res,
+      fixture,
+      journal,
+      chaosContext,
+      "fixture",
+      defaults.registry,
+    );
+    return;
+  }
 
   if (!fixture) {
     // Try record-and-replay proxy if configured
     if (defaults.record && providerKey) {
-      const proxied = await proxyAndRecord(
+      // Hook is only passed when chaos wants to mutate the response. When
+      // it's passed, it unconditionally applies malformed + journals + tells
+      // proxyAndRecord to skip its default relay. The hook has no branching
+      // logic — that decision is made here, at the call site.
+      const hookOptions =
+        chaosAction === "malformed"
+          ? {
+              // Malformed is emitted as a hardcoded invalid-JSON body, so the
+              // captured upstream response isn't used here (the parameter is
+              // intentionally omitted rather than declared-and-ignored).
+              // Future dispatch (phase 3: non-JSON / streaming) will accept
+              // the response and branch on contentType.
+              beforeWriteResponse: () => {
+                applyChaosAction(
+                  chaosAction,
+                  res,
+                  null,
+                  journal,
+                  chaosContext,
+                  "proxy",
+                  defaults.registry,
+                );
+                return true;
+              },
+              // SSE can't be mutated post-facto (bytes already on the wire).
+              // Record the bypass so the rolled action isn't invisible in
+              // logs / Prometheus — otherwise malformedRate: 1.0 on SSE
+              // traffic silently means 0%.
+              onHookBypassed: (reason: "sse_streamed") => {
+                defaults.logger.warn(
+                  `[chaos] malformed bypassed on proxy: upstream returned SSE (${reason})`,
+                );
+                defaults.registry?.incrementCounter("aimock_chaos_bypassed_total", {
+                  action: "malformed",
+                  source: "proxy",
+                  reason,
+                });
+              },
+            }
+          : undefined;
+
+      const outcome = await proxyAndRecord(
         req,
         res,
         body,
@@ -519,8 +581,10 @@ async function handleCompletions(
         fixtures,
         defaults,
         raw,
+        hookOptions,
       );
-      if (proxied) {
+      if (outcome === "handled_by_hook") return;
+      if (outcome === "relayed") {
         journal.add({
           method: req.method ?? "POST",
           path: req.url ?? COMPLETIONS_PATH,
@@ -530,6 +594,7 @@ async function handleCompletions(
         });
         return;
       }
+      // outcome === "not_configured" — fall through to strict/404
     }
 
     const strictStatus = defaults.strict ? 503 : 404;
@@ -1230,7 +1295,7 @@ export async function createServer(
     const videoStatusMatch = pathname.match(VIDEOS_STATUS_RE);
     if (videoStatusMatch && req.method === "GET") {
       const videoId = videoStatusMatch[1];
-      handleVideoStatus(req, res, videoId, journal, setCorsHeaders, videoStates);
+      handleVideoStatus(req, res, videoId, journal, defaults, setCorsHeaders, videoStates);
       return;
     }
 
@@ -1644,22 +1709,24 @@ export async function createServer(
       setCorsHeaders(res);
       try {
         const raw = await readBody(req);
-        const chaosResult = applyChaos(
-          res,
-          null,
-          defaults.chaos,
-          req.headers,
-          journal,
-          {
-            method: req.method ?? "POST",
-            path: pathname,
-            headers: flattenHeaders(req.headers),
-            body: { model: "", messages: [] },
-          },
-          defaults.registry,
-          defaults.logger,
-        );
-        if (chaosResult) return;
+        const chaosAction = evaluateChaos(null, defaults.chaos, req.headers, defaults.logger);
+        if (chaosAction) {
+          applyChaosAction(
+            chaosAction,
+            res,
+            null,
+            journal,
+            {
+              method: req.method ?? "POST",
+              path: pathname,
+              headers: flattenHeaders(req.headers),
+              body: { model: "", messages: [] },
+            },
+            "fixture",
+            defaults.registry,
+          );
+          return;
+        }
         await handleElevenLabsAudio(req, res, raw, fixtures, defaults, journal, "sound-generation");
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Internal error";
@@ -1683,22 +1750,24 @@ export async function createServer(
       const musicSubType = musicMatch[1] ?? "music";
       try {
         const raw = await readBody(req);
-        const chaosResult = applyChaos(
-          res,
-          null,
-          defaults.chaos,
-          req.headers,
-          journal,
-          {
-            method: req.method ?? "POST",
-            path: pathname,
-            headers: flattenHeaders(req.headers),
-            body: { model: "", messages: [] },
-          },
-          defaults.registry,
-          defaults.logger,
-        );
-        if (chaosResult) return;
+        const chaosAction = evaluateChaos(null, defaults.chaos, req.headers, defaults.logger);
+        if (chaosAction) {
+          applyChaosAction(
+            chaosAction,
+            res,
+            null,
+            journal,
+            {
+              method: req.method ?? "POST",
+              path: pathname,
+              headers: flattenHeaders(req.headers),
+              body: { model: "", messages: [] },
+            },
+            "fixture",
+            defaults.registry,
+          );
+          return;
+        }
         await handleElevenLabsAudio(req, res, raw, fixtures, defaults, journal, musicSubType);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Internal error";
@@ -1721,22 +1790,24 @@ export async function createServer(
       setCorsHeaders(res);
       try {
         const raw = await readBody(req);
-        const chaosResult = applyChaos(
-          res,
-          null,
-          defaults.chaos,
-          req.headers,
-          journal,
-          {
-            method: req.method ?? "POST",
-            path: pathname,
-            headers: flattenHeaders(req.headers),
-            body: { model: "", messages: [] },
-          },
-          defaults.registry,
-          defaults.logger,
-        );
-        if (chaosResult) return;
+        const chaosAction = evaluateChaos(null, defaults.chaos, req.headers, defaults.logger);
+        if (chaosAction) {
+          applyChaosAction(
+            chaosAction,
+            res,
+            null,
+            journal,
+            {
+              method: req.method ?? "POST",
+              path: pathname,
+              headers: flattenHeaders(req.headers),
+              body: { model: "", messages: [] },
+            },
+            "fixture",
+            defaults.registry,
+          );
+          return;
+        }
         await handleFalQueue(req, res, raw, pathname, fixtures, defaults, journal);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Internal error";
@@ -1762,22 +1833,24 @@ export async function createServer(
       setCorsHeaders(res);
       try {
         const raw = req.method === "POST" ? await readBody(req) : "{}";
-        const chaosResult = applyChaos(
-          res,
-          null,
-          defaults.chaos,
-          req.headers,
-          journal,
-          {
-            method: req.method ?? "GET",
-            path: pathname,
-            headers: flattenHeaders(req.headers),
-            body: { model: "", messages: [] },
-          },
-          defaults.registry,
-          defaults.logger,
-        );
-        if (chaosResult) return;
+        const chaosAction = evaluateChaos(null, defaults.chaos, req.headers, defaults.logger);
+        if (chaosAction) {
+          applyChaosAction(
+            chaosAction,
+            res,
+            null,
+            journal,
+            {
+              method: req.method ?? "GET",
+              path: pathname,
+              headers: flattenHeaders(req.headers),
+              body: { model: "", messages: [] },
+            },
+            "fixture",
+            defaults.registry,
+          );
+          return;
+        }
         await handleFalQueue(req, res, raw, pathname, fixtures, defaults, journal);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Internal error";
@@ -1800,22 +1873,24 @@ export async function createServer(
       setCorsHeaders(res);
       try {
         const raw = await readBody(req);
-        const chaosResult = applyChaos(
-          res,
-          null,
-          defaults.chaos,
-          req.headers,
-          journal,
-          {
-            method: req.method ?? "POST",
-            path: pathname,
-            headers: flattenHeaders(req.headers),
-            body: { model: "", messages: [] },
-          },
-          defaults.registry,
-          defaults.logger,
-        );
-        if (chaosResult) return;
+        const chaosAction = evaluateChaos(null, defaults.chaos, req.headers, defaults.logger);
+        if (chaosAction) {
+          applyChaosAction(
+            chaosAction,
+            res,
+            null,
+            journal,
+            {
+              method: req.method ?? "POST",
+              path: pathname,
+              headers: flattenHeaders(req.headers),
+              body: { model: "", messages: [] },
+            },
+            "fixture",
+            defaults.registry,
+          );
+          return;
+        }
         await handleFalQueue(req, res, raw, pathname, fixtures, defaults, journal);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Internal error";

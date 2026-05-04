@@ -103,6 +103,7 @@ export async function handleSpeech(
       req.headers,
       journal,
       { method, path, headers: flattenHeaders(req.headers), body: syntheticReq },
+      fixture ? "fixture" : "proxy",
       defaults.registry,
       defaults.logger,
     )
@@ -111,7 +112,7 @@ export async function handleSpeech(
 
   if (!fixture) {
     if (defaults.record) {
-      const proxied = await proxyAndRecord(
+      const outcome = await proxyAndRecord(
         req,
         res,
         syntheticReq,
@@ -121,7 +122,7 @@ export async function handleSpeech(
         defaults,
         raw,
       );
-      if (proxied) {
+      if (outcome !== "not_configured") {
         journal.add({
           method,
           path,

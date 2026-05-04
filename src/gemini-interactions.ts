@@ -687,6 +687,7 @@ export async function handleGeminiInteractions(
         headers: flattenHeaders(req.headers),
         body: completionReq,
       },
+      fixture ? "fixture" : "proxy",
       defaults.registry,
       defaults.logger,
     )
@@ -695,7 +696,7 @@ export async function handleGeminiInteractions(
 
   if (!fixture) {
     if (defaults.record) {
-      const proxied = await proxyAndRecord(
+      const outcome = await proxyAndRecord(
         req,
         res,
         completionReq,
@@ -705,7 +706,8 @@ export async function handleGeminiInteractions(
         defaults,
         raw,
       );
-      if (proxied) {
+      if (outcome === "handled_by_hook") return;
+      if (outcome === "relayed") {
         journal.add({
           method: req.method ?? "POST",
           path: urlPath,

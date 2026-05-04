@@ -144,6 +144,7 @@ export async function handleEmbeddings(
         headers: flattenHeaders(req.headers),
         body: syntheticReq,
       },
+      fixture ? "fixture" : "proxy",
       defaults.registry,
       defaults.logger,
     )
@@ -207,7 +208,7 @@ export async function handleEmbeddings(
 
   // No fixture match — try record-and-replay proxy if configured
   if (defaults.record) {
-    const proxied = await proxyAndRecord(
+    const outcome = await proxyAndRecord(
       req,
       res,
       syntheticReq,
@@ -217,7 +218,7 @@ export async function handleEmbeddings(
       defaults,
       raw,
     );
-    if (proxied) {
+    if (outcome !== "not_configured") {
       journal.add({
         method: req.method ?? "POST",
         path: req.url ?? "/v1/embeddings",

@@ -131,12 +131,16 @@ interface ChaosJournalContext {
   method: string;
   path: string;
   headers: Record<string, string>;
-  body: ChatCompletionRequest;
+  body: ChatCompletionRequest | null;
 }
 
 /**
  * Apply chaos to a request. Returns true if chaos was applied (caller should
  * return early), false if the request should proceed normally.
+ *
+ * `source` is required so the invariant "this handler only applies chaos in
+ * the <X> phase" is enforced at the type level. A future handler that grows
+ * a proxy path MUST pass `"proxy"` explicitly; the default can't drift silently.
  */
 export function applyChaos(
   res: http.ServerResponse,
@@ -145,21 +149,45 @@ export function applyChaos(
   rawHeaders: http.IncomingHttpHeaders,
   journal: Journal,
   context: ChaosJournalContext,
+  source: "fixture" | "proxy" | "internal",
   registry?: MetricsRegistry,
   logger?: Logger,
 ): boolean {
   const action = evaluateChaos(fixture, serverDefaults, rawHeaders, logger);
   if (!action) return false;
+  applyChaosAction(action, res, fixture, journal, context, source, registry);
+  return true;
+}
 
+/**
+ * Apply a specific (already-rolled) chaos action. Exposed so callers that roll
+ * the dice themselves can dispatch without re-rolling — important when the
+ * caller wants to branch on the action before committing (e.g. pre-flight vs.
+ * post-response phases).
+ *
+ * `source` is required (not optional) so callers can't silently omit it on
+ * one branch and journal an ambiguous entry. Pass `"fixture"` when a fixture
+ * matched (or would have) and `"proxy"` when the request was headed for the
+ * proxy path.
+ */
+export function applyChaosAction(
+  action: ChaosAction,
+  res: http.ServerResponse,
+  fixture: Fixture | null,
+  journal: Journal,
+  context: ChaosJournalContext,
+  source: "fixture" | "proxy" | "internal",
+  registry?: MetricsRegistry,
+): void {
   if (registry) {
-    registry.incrementCounter("aimock_chaos_triggered_total", { action });
+    registry.incrementCounter("aimock_chaos_triggered_total", { action, source });
   }
 
   switch (action) {
     case "drop": {
       journal.add({
         ...context,
-        response: { status: 500, fixture, chaosAction: "drop" },
+        response: { status: 500, fixture, chaosAction: "drop", source },
       });
       writeErrorResponse(
         res,
@@ -172,29 +200,29 @@ export function applyChaos(
           },
         }),
       );
-      return true;
+      return;
     }
     case "malformed": {
       journal.add({
         ...context,
-        response: { status: 200, fixture, chaosAction: "malformed" },
+        response: { status: 200, fixture, chaosAction: "malformed", source },
       });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end("{malformed json: <<<chaos>>>");
-      return true;
+      return;
     }
     case "disconnect": {
       journal.add({
         ...context,
-        response: { status: 0, fixture, chaosAction: "disconnect" },
+        response: { status: 0, fixture, chaosAction: "disconnect", source },
       });
       res.destroy();
-      return true;
+      return;
     }
     default: {
       const _exhaustive: never = action;
       void _exhaustive;
-      return false;
+      return;
     }
   }
 }

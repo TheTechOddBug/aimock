@@ -37,12 +37,61 @@ const STRIP_HEADERS = new Set([
 ]);
 
 /**
+ * Captured upstream response, exposed to the `beforeWriteResponse` hook so
+ * callers can decide whether to relay it or mutate it (e.g. chaos injection).
+ */
+export interface ProxyCapturedResponse {
+  status: number;
+  contentType: string;
+  body: Buffer;
+}
+
+export interface ProxyOptions {
+  /**
+   * Called after the upstream response has been captured and recorded, but
+   * before the relay to the client. Contract when the hook returns `true`:
+   *   1. It wrote its own response body on `res`.
+   *   2. It journaled the outcome (proxyAndRecord will NOT journal it).
+   *   3. proxyAndRecord skips its default relay and returns `"handled_by_hook"`.
+   *
+   * Returning `false` (or omitting the hook) lets proxyAndRecord relay the
+   * upstream response normally and leaves journaling to the caller via the
+   * `"relayed"` outcome. Rejected promises propagate and leave the response
+   * unwritten.
+   *
+   * NOT invoked when the upstream response was streamed progressively to the
+   * client (SSE) — the bytes are already on the wire and can't be mutated.
+   * Callers that need to observe the bypass should pass `onHookBypassed`.
+   */
+  beforeWriteResponse?: (response: ProxyCapturedResponse) => boolean | Promise<boolean>;
+  /**
+   * Called when `beforeWriteResponse` was provided but could not be invoked
+   * because the upstream response was streamed to the client progressively.
+   * The hook was rolled + wired but the bytes left before it could fire.
+   * Intended for observability (log/metric/journal annotation) — proxyAndRecord
+   * still returns `"relayed"`.
+   */
+  onHookBypassed?: (reason: "sse_streamed") => void;
+}
+
+/**
+ * Outcome of a proxyAndRecord call, returned so the caller can decide whether
+ * to journal, fall through, or stop — without sharing a mutable flag with the
+ * `beforeWriteResponse` hook.
+ *
+ * - `"not_configured"` — no upstream URL for this provider; caller should fall
+ *    through to its next branch (typically strict/404).
+ * - `"relayed"` — the default code path wrote a response (upstream success or
+ *    synthesized 502 error). Caller should journal the outcome.
+ * - `"handled_by_hook"` — the hook wrote + journaled its own response. Caller
+ *    should not double-journal.
+ */
+export type ProxyOutcome = "not_configured" | "relayed" | "handled_by_hook";
+
+/**
  * Proxy an unmatched request to the real upstream provider, record the
  * response as a fixture on disk and in memory, then relay the response
  * back to the original client.
- *
- * Returns `true` if the request was proxied (provider configured),
- * `false` if no upstream URL is configured for the given provider key.
  */
 export async function proxyAndRecord(
   req: http.IncomingMessage,
@@ -57,9 +106,10 @@ export async function proxyAndRecord(
     requestTransform?: (req: ChatCompletionRequest) => ChatCompletionRequest;
   },
   rawBody?: string,
-): Promise<boolean> {
+  options?: ProxyOptions,
+): Promise<ProxyOutcome> {
   const record = defaults.record;
-  if (!record) return false;
+  if (!record) return "not_configured";
 
   const providers = record.providers;
   // gemini-interactions shares the same upstream config as gemini
@@ -68,7 +118,7 @@ export async function proxyAndRecord(
 
   if (!upstreamUrl) {
     defaults.logger.warn(`No upstream URL configured for provider "${providerKey}" — cannot proxy`);
-    return false;
+    return "not_configured";
   }
 
   const fixturePath = record.fixturePath ?? "./fixtures/recorded";
@@ -84,7 +134,7 @@ export async function proxyAndRecord(
         error: { message: `Invalid upstream URL: ${upstreamUrl}`, type: "proxy_error" },
       }),
     );
-    return true;
+    return "relayed";
   }
 
   defaults.logger.warn(`NO FIXTURE MATCH — proxying to ${upstreamUrl}${pathname}`);
@@ -131,10 +181,14 @@ export async function proxyAndRecord(
       // SSE headers already sent — gracefully close the connection
       res.end();
     }
-    return true;
+    return "relayed";
   }
 
-  // Detect streaming response and collapse if necessary
+  // Detect streaming response and collapse if necessary.
+  // NOTE: collapse buffers the entire upstream body in memory. Fine for
+  // current chat-completions traffic (responses are small), but revisit if
+  // this path ever proxies long-lived or large streams — both the buffer
+  // here and the hook below receive the full payload.
   const contentType = upstreamHeaders["content-type"];
   const ctString = Array.isArray(contentType) ? contentType.join(", ") : (contentType ?? "");
   const isBinaryStream = ctString.toLowerCase().includes("application/vnd.amazon.eventstream");
@@ -229,7 +283,7 @@ export async function proxyAndRecord(
     defaults.logger.warn(
       "Client disconnected mid-stream — skipping fixture save to avoid truncated data",
     );
-    return true;
+    return "relayed";
   }
 
   // Build the match criteria from the (optionally transformed) request
@@ -271,7 +325,10 @@ export async function proxyAndRecord(
         warnings.push("Stream response was truncated — fixture may be incomplete");
       }
 
-      // Auth headers are forwarded to upstream but excluded from saved fixtures for security
+      // Auth headers are forwarded to upstream but excluded from saved fixtures for security.
+      // NOTE: the persisted fixture is always the real upstream response, even when chaos
+      // later mutates the relay (e.g. malformed via beforeWriteResponse). Chaos is a live-traffic
+      // decoration; the recorded artifact must stay truthful so replay sees what upstream said.
       const fileContent: Record<string, unknown> = { fixtures: [fixture] };
       if (warnings.length > 0) {
         fileContent._warning = warnings.join("; ");
@@ -304,7 +361,26 @@ export async function proxyAndRecord(
   // Relay upstream response to client (skip when SSE was already streamed
   // progressively by makeUpstreamRequest — headers and body are already on
   // the wire).
-  if (!streamedToClient) {
+  if (streamedToClient) {
+    // SSE: the hook can't run because the body is already on the wire. Surface
+    // the bypass so the caller (typically the chaos layer) can record it —
+    // otherwise a configured chaos action silently no-ops on SSE traffic.
+    if (options?.beforeWriteResponse && options.onHookBypassed) {
+      options.onHookBypassed("sse_streamed");
+    }
+  } else {
+    // Give the caller a chance to mutate or replace the response before relay.
+    // Used by the chaos layer to turn a successful proxy into a malformed body.
+    // `body` is the raw upstream bytes so binary payloads survive round-tripping.
+    if (options?.beforeWriteResponse) {
+      const handled = await options.beforeWriteResponse({
+        status: upstreamStatus,
+        contentType: ctString,
+        body: rawBuffer,
+      });
+      if (handled) return "handled_by_hook";
+    }
+
     const relayHeaders: Record<string, string> = {};
     if (ctString) {
       relayHeaders["Content-Type"] = ctString;
@@ -314,7 +390,7 @@ export async function proxyAndRecord(
     res.end(isBinaryStream || isAudioRelay ? rawBuffer : upstreamBody);
   }
 
-  return true;
+  return "relayed";
 }
 
 // ---------------------------------------------------------------------------

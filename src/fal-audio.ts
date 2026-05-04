@@ -247,7 +247,7 @@ async function handleQueueSubmit(
 
   if (!fixture) {
     if (defaults.record) {
-      const proxied = await proxyAndRecord(
+      const outcome = await proxyAndRecord(
         req,
         res,
         syntheticReq,
@@ -257,13 +257,14 @@ async function handleQueueSubmit(
         defaults,
         body,
       );
-      if (proxied) {
+      if (outcome === "handled_by_hook") return;
+      if (outcome === "relayed") {
         journal.add({
           method: req.method ?? "POST",
           path: pathname,
           headers: {},
           body: syntheticReq,
-          response: { status: res.statusCode ?? 200, fixture: null },
+          response: { status: res.statusCode ?? 200, fixture: null, source: "proxy" },
         });
         return;
       }
@@ -528,7 +529,7 @@ async function handleSyncRun(
 
   if (!fixture) {
     if (defaults.record) {
-      const proxied = await proxyAndRecord(
+      const outcome = await proxyAndRecord(
         req,
         res,
         syntheticReq,
@@ -538,13 +539,14 @@ async function handleSyncRun(
         defaults,
         body,
       );
-      if (proxied) {
+      if (outcome === "handled_by_hook") return;
+      if (outcome === "relayed") {
         journal.add({
           method: req.method ?? "POST",
           path: pathname,
           headers: {},
           body: syntheticReq,
-          response: { status: res.statusCode ?? 200, fixture: null },
+          response: { status: res.statusCode ?? 200, fixture: null, source: "proxy" },
         });
         return;
       }

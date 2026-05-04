@@ -1,5 +1,11 @@
 # @copilotkit/aimock
 
+## [Unreleased]
+
+### Added
+
+- **Chaos testing in proxy mode** — Pre-flight chaos (drop/disconnect) prevents upstream contact; post-response chaos (malformed) corrupts relay body after recording the real upstream response. SSE bypass tracked via `aimock_chaos_bypassed_total` metric. Explicit `source` label (`fixture`/`proxy`/`internal`) on all chaos Prometheus counters and journal entries.
+
 ## [1.17.0] - 2026-05-04
 
 ### Added

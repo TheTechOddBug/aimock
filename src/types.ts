@@ -206,6 +206,15 @@ export interface StreamingProfile {
   jitter?: number; // Random variance factor (0-1), default 0
 }
 
+/**
+ * Probabilistic chaos injection rates.
+ *
+ * Rates are evaluated sequentially per request — drop → malformed → disconnect
+ * — and the first hit wins. Consequently malformedRate is conditional on drop
+ * not firing, and disconnectRate is conditional on neither drop nor malformed
+ * firing. A config of `{ dropRate: 0.5, malformedRate: 0.5 }` yields a ~25 %
+ * effective malformed rate, not 50 %.
+ */
 export interface ChaosConfig {
   dropRate?: number;
   malformedRate?: number;
@@ -322,7 +331,13 @@ export interface JournalEntry {
   response: {
     status: number;
     fixture: Fixture | null;
-    source?: "fixture" | "proxy";
+    /**
+     * What was going to serve this request. "fixture" = a fixture matched (or
+     * would have, before chaos intervened). "proxy" = no fixture matched and
+     * proxy was configured. Absent when the distinction doesn't apply (e.g.
+     * 404/503 fallback where nothing was going to serve).
+     */
+    source?: "fixture" | "proxy" | "internal";
     interrupted?: boolean;
     interruptReason?: string;
     chaosAction?: ChaosAction;

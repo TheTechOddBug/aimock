@@ -150,6 +150,7 @@ export async function handleVideoCreate(
       req.headers,
       journal,
       { method, path, headers: flattenHeaders(req.headers), body: syntheticReq },
+      fixture ? "fixture" : "proxy",
       defaults.registry,
       defaults.logger,
     )
@@ -158,7 +159,7 @@ export async function handleVideoCreate(
 
   if (!fixture) {
     if (defaults.record) {
-      const proxied = await proxyAndRecord(
+      const outcome = await proxyAndRecord(
         req,
         res,
         syntheticReq,
@@ -168,7 +169,7 @@ export async function handleVideoCreate(
         defaults,
         raw,
       );
-      if (proxied) {
+      if (outcome !== "not_configured") {
         journal.add({
           method,
           path,
@@ -263,12 +264,28 @@ export function handleVideoStatus(
   res: http.ServerResponse,
   videoId: string,
   journal: Journal,
+  defaults: HandlerDefaults,
   setCorsHeaders: (res: http.ServerResponse) => void,
   videoStates: VideoStateMap,
 ): void {
   setCorsHeaders(res);
   const path = req.url ?? `/v1/videos/${videoId}`;
   const method = req.method ?? "GET";
+
+  if (
+    applyChaos(
+      res,
+      null,
+      defaults.chaos,
+      req.headers,
+      journal,
+      { method, path, headers: flattenHeaders(req.headers), body: null },
+      "internal",
+      defaults.registry,
+      defaults.logger,
+    )
+  )
+    return;
 
   const testId = getTestId(req);
   const stateKey = `${testId}:${videoId}`;
