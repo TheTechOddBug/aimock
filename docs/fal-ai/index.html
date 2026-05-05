@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>fal.ai — aimock</title>
+    <link rel="icon" type="image/svg+xml" href="../favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=Instrument+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../style.css" />
+    <script src="/pixels.js" defer></script>
+  </head>
+  <body>
+    <nav class="top-nav">
+      <div class="nav-inner">
+        <div style="display: flex; align-items: center; gap: 1rem">
+          <button
+            class="sidebar-toggle"
+            onclick="document.querySelector('.sidebar').classList.toggle('open')"
+            aria-label="Toggle sidebar"
+          >
+            &#9776;
+          </button>
+          <a href="/" class="nav-brand"> <span class="prompt">$</span> aimock </a>
+        </div>
+        <ul class="nav-links">
+          <li><a href="/">Home</a></li>
+          <li><a href="/docs" style="color: var(--accent)">Docs</a></li>
+          <li>
+            <a href="https://github.com/CopilotKit/aimock" class="gh-link" target="_blank">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                <path
+                  d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"
+                />
+              </svg>
+              GitHub
+            </a>
+          </li>
+        </ul>
+      </div>
+    </nav>
+
+    <div class="docs-layout">
+      <aside class="sidebar" id="sidebar"></aside>
+
+      <main class="docs-content">
+        <h1>fal.ai</h1>
+        <p class="lead">
+          aimock mocks the fal.ai inference API &mdash; queue-based and synchronous runs for image,
+          video, audio, and any other fal model. Routes by <code>x-fal-target-host</code> header to
+          mirror the <code>@fal-ai/client</code> proxy convention.
+        </p>
+
+        <h2>How It Works</h2>
+        <p>
+          The <code>@fal-ai/client</code> SDK routes requests through a proxy using the
+          <code>x-fal-target-host</code> header to indicate the upstream fal service:
+        </p>
+        <ul>
+          <li>
+            <code>queue.fal.run</code> &mdash; queue-based operations (submit, poll status, fetch
+            result)
+          </li>
+          <li><code>fal.run</code> &mdash; synchronous single-shot runs</li>
+          <li><code>rest.fal.ai</code> &mdash; storage and other REST endpoints</li>
+        </ul>
+        <p>
+          aimock intercepts <code>POST /fal/{owner}/{model}</code> requests bearing this header and
+          handles the full queue lifecycle: it auto-mints a <code>request_id</code>, returns status
+          and response URLs, and serves the matched fixture payload on result fetch.
+        </p>
+        <p>
+          Legacy path-based routing is also supported &mdash;
+          <code>/fal/queue/submit/{model}</code>, <code>/fal/queue/requests/{id}</code>, and
+          <code>/fal/run/{model}</code> all continue to work for backward compatibility.
+        </p>
+
+        <h2>Quick Start (Programmatic)</h2>
+
+        <div class="code-block">
+          <div class="code-block-header">fal-mock.test.ts <span class="lang-tag">ts</span></div>
+          <pre><code><span class="kw">import</span> { <span class="type">LLMock</span> } <span class="kw">from</span> <span class="str">"@copilotkit/aimock"</span>;
+<span class="kw">import</span> { <span class="fn">describe</span>, <span class="fn">it</span>, <span class="fn">expect</span>, <span class="fn">beforeAll</span>, <span class="fn">afterAll</span> } <span class="kw">from</span> <span class="str">"vitest"</span>;
+
+<span class="kw">let</span> <span class="op">mock</span>: <span class="type">LLMock</span>;
+
+<span class="fn">beforeAll</span>(<span class="kw">async</span> () <span class="kw">=&gt;</span> {
+  <span class="op">mock</span> = <span class="kw">new</span> <span class="type">LLMock</span>();
+  <span class="kw">await</span> <span class="op">mock</span>.<span class="fn">start</span>();
+});
+
+<span class="fn">afterAll</span>(<span class="kw">async</span> () <span class="kw">=&gt;</span> {
+  <span class="kw">await</span> <span class="op">mock</span>.<span class="fn">stop</span>();
+});
+
+<span class="fn">it</span>(<span class="str">"image generation via queue"</span>, <span class="kw">async</span> () <span class="kw">=&gt;</span> {
+  <span class="cm">// Register a queue fixture for Flux image generation</span>
+  <span class="op">mock</span>.<span class="fn">onFalQueue</span>(<span class="str">/flux/</span>, { <span class="prop">images</span>: [{ <span class="prop">url</span>: <span class="str">"https://example.com/cat.png"</span> }] });
+
+  <span class="cm">// Submit &rarr; status &rarr; result, just like the real API</span>
+});
+
+<span class="fn">it</span>(<span class="str">"video generation via queue"</span>, <span class="kw">async</span> () <span class="kw">=&gt;</span> {
+  <span class="op">mock</span>.<span class="fn">onFalQueue</span>(<span class="str">/kling/</span>, { <span class="prop">video</span>: { <span class="prop">url</span>: <span class="str">"https://example.com/v.mp4"</span> } });
+});
+
+<span class="fn">it</span>(<span class="str">"synchronous transcription"</span>, <span class="kw">async</span> () <span class="kw">=&gt;</span> {
+  <span class="cm">// Sync runs skip the queue entirely</span>
+  <span class="op">mock</span>.<span class="fn">onFalRun</span>(<span class="str">/whisper/</span>, { <span class="prop">text</span>: <span class="str">"Hello world"</span> });
+});</code></pre>
+        </div>
+
+        <h2>Client Configuration</h2>
+        <p>
+          Point the <code>@fal-ai/client</code> at aimock using <code>requestMiddleware</code> to
+          rewrite the proxy URL:
+        </p>
+
+        <div class="code-block">
+          <div class="code-block-header">fal-client-config.ts <span class="lang-tag">ts</span></div>
+          <pre><code><span class="kw">import</span> { <span class="op">fal</span> } <span class="kw">from</span> <span class="str">"@fal-ai/client"</span>;
+
+<span class="op">fal</span>.<span class="fn">config</span>({
+  <span class="prop">requestMiddleware</span>: <span class="op">fal</span>.<span class="fn">withMiddleware</span>(
+    <span class="op">fal</span>.<span class="fn">withProxy</span>({
+      <span class="prop">targetUrl</span>: <span class="str">"http://localhost:4005/fal"</span>,  <span class="cm">// aimock default port</span>
+    })
+  ),
+});</code></pre>
+        </div>
+
+        <div class="info-box">
+          <p>
+            The client sends the original target host (e.g. <code>queue.fal.run</code>) in the
+            <code>x-fal-target-host</code> header. aimock reads this header to decide whether to
+            handle the request as a queue operation, a sync run, or a storage call.
+          </p>
+        </div>
+
+        <h2>Queue Lifecycle</h2>
+        <p>
+          Queue-based operations follow a four-step lifecycle. aimock handles all steps
+          automatically once a fixture is registered:
+        </p>
+
+        <table class="endpoint-table">
+          <thead>
+            <tr>
+              <th>Step</th>
+              <th>Method</th>
+              <th>Path</th>
+              <th>Response</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Submit</td>
+              <td>POST</td>
+              <td><code>/fal/{owner}/{model}</code></td>
+              <td>
+                <code>{ request_id, status_url, response_url, cancel_url }</code>
+              </td>
+            </tr>
+            <tr>
+              <td>Status</td>
+              <td>GET</td>
+              <td><code>/fal/{owner}/{model}/requests/{id}/status</code></td>
+              <td><code>{ status: "COMPLETED" }</code></td>
+            </tr>
+            <tr>
+              <td>Result</td>
+              <td>GET</td>
+              <td><code>/fal/{owner}/{model}/requests/{id}</code></td>
+              <td>The matched fixture payload</td>
+            </tr>
+            <tr>
+              <td>Cancel</td>
+              <td>PUT</td>
+              <td><code>/fal/{owner}/{model}/requests/{id}/cancel</code></td>
+              <td><code>{ status: "ALREADY_COMPLETED" }</code> (400)</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h2>JSON Fixture File</h2>
+
+        <div class="code-block">
+          <div class="code-block-header">fixtures/fal.json <span class="lang-tag">json</span></div>
+          <pre><code>{
+  <span class="key">"fixtures"</span>: [
+    {
+      <span class="key">"match"</span>: { <span class="key">"model"</span>: <span class="str">"fal-ai/flux/dev"</span>, <span class="key">"endpoint"</span>: <span class="str">"fal"</span> },
+      <span class="key">"response"</span>: {
+        <span class="key">"json"</span>: {
+          <span class="key">"images"</span>: [{ <span class="key">"url"</span>: <span class="str">"https://example.com/result.png"</span> }]
+        }
+      }
+    }
+  ]
+}</code></pre>
+        </div>
+
+        <h2>Record &amp; Replay</h2>
+        <p>
+          Use <code>--record</code> with the <code>providers.fal</code> configuration to capture
+          real fal.ai responses and replay them in tests:
+        </p>
+
+        <div class="code-block">
+          <div class="code-block-header">CLI <span class="lang-tag">sh</span></div>
+          <pre><code><span class="fn">npx</span> aimock <span class="op">--record</span> <span class="op">--fixtures</span> fixtures/fal.json</code></pre>
+        </div>
+
+        <p>
+          When recording, the <code>x-fal-target-host</code> header is used to resolve the upstream
+          fal service automatically &mdash; no additional provider configuration is needed.
+          Responses are saved as fixtures that can be replayed without network access.
+        </p>
+
+        <h2>Legacy Routes</h2>
+        <p>
+          For backward compatibility, aimock also supports the older path-based routing convention
+          used by the audio-specific handler (<code>fal-audio.ts</code>):
+        </p>
+        <ul>
+          <li><code>POST /fal/queue/submit/{model}</code> &mdash; submit a queue job</li>
+          <li><code>GET /fal/queue/requests/{id}</code> &mdash; fetch the result</li>
+          <li><code>POST /fal/run/{model}</code> &mdash; synchronous run</li>
+        </ul>
+        <p>
+          These paths work identically to the header-routed equivalents and share the same fixture
+          matching logic.
+        </p>
+      </main>
+      <aside class="page-toc" id="page-toc"></aside>
+    </div>
+
+    <footer class="docs-footer">
+      <div class="footer-inner">
+        <div class="footer-left"><span>$</span> aimock &middot; MIT License</div>
+        <ul class="footer-links">
+          <li><a href="https://github.com/CopilotKit/aimock" target="_blank">GitHub</a></li>
+          <li>
+            <a href="https://www.npmjs.com/package/@copilotkit/aimock" target="_blank">npm</a>
+          </li>
+        </ul>
+      </div>
+    </footer>
+    <script src="../sidebar.js"></script>
+    <script src="../cli-tabs.js"></script>
+  </body>
+</html>
