@@ -4,6 +4,7 @@ on:
     types: [opened]
 jobs:
   notify:
+    if: github.event_name == 'issues'
     runs-on: ubuntu-latest
     env:
       TITLE: ${{ github.event.issue.title }}
