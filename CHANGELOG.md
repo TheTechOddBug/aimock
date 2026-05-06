@@ -1,10 +1,10 @@
 # @copilotkit/aimock
 
-## [Unreleased]
+## [1.19.0] - 2026-05-06
 
 ### Added
 
-- **Async fixture responses** — Fixture responses can now be sync or async functions that receive the request and return the response dynamically. Enables awaiting side effects (database writes, API calls) before constructing the response — eliminating race conditions in complex multi-turn E2E tests. Works with all providers, streaming, and convenience methods (`on()`, `onMessage()`, `onTurn()`). (Feature request by @5ebastianMeier, issue #154)
+- **Async fixture responses** — Fixture responses can now be sync or async functions that receive the request and return the response dynamically. Enables awaiting side effects (database writes, API calls) before constructing the response — eliminating race conditions in complex multi-turn E2E tests. Works with all providers, streaming, and convenience methods (`on()`, `onMessage()`, `onTurn()`, `onToolCall()`, `onToolResult()`). (Feature request by @5ebastianMeier, issue #154)
 - **Snapshot-style recording** — When `X-Test-Id` is present, recorded fixtures are saved to `<fixturePath>/<slugified-testId>/<provider>.json` instead of timestamp-based filenames. Multiple fixtures for the same test+provider merge into one file. Stable paths enable meaningful PR diffs and easy test-to-fixture mapping. (Feature request by @jantimon, issue #155)
 
 ### Fixed
