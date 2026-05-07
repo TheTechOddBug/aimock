@@ -1,5 +1,12 @@
 # @copilotkit/aimock
 
+## [Unreleased]
+
+### Fixed
+
+- **Fixture loader: snapshot-style subdirectories skipped on boot** — `loadFixturesFromDir` now recurses one level into subdirectories to load `<testId>/<provider>.json` files written by the snapshot recorder. Previously the loader skipped all subdirectories with a warning, so recorded fixtures could never be replayed. (Issue #161, reported by @jantimon)
+- **CLI: immediate exit on npx/bunx** — Entry-point guard now matches the `aimock` bin name (not just `aimock-cli.js`), fixing silent exit when invoked via `npx aimock` or `bunx aimock`. (Issue #160)
+
 ## [1.19.0] - 2026-05-06
 
 ### Added

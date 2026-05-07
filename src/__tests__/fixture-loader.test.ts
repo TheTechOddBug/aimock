@@ -455,22 +455,102 @@ describe("loadFixturesFromDir", () => {
     expect(fixtures[0].match.userMessage).toBe("nested");
   });
 
-  it("warns and skips subdirectories, still loads sibling JSON files", () => {
+  it("recurses one level into subdirectories (snapshot-style layout)", () => {
     writeJson(tmpDir, "a-valid.json", {
       fixtures: [{ match: { userMessage: "top" }, response: { content: "yes" } }],
     });
-    const subDir = join(tmpDir, "nested");
+    const subDir = join(tmpDir, "greeting--hello-world");
     mkdirSync(subDir);
-    writeJson(subDir, "inner.json", {
-      fixtures: [{ match: { userMessage: "deep" }, response: { content: "nope" } }],
+    writeJson(subDir, "openai.json", {
+      fixtures: [{ match: { userMessage: "deep" }, response: { content: "found" } }],
     });
 
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const fixtures = loadFixturesFromDir(tmpDir);
+    expect(fixtures).toHaveLength(2);
+    expect(fixtures[0].match.userMessage).toBe("top");
+    expect(fixtures[1].match.userMessage).toBe("deep");
+  });
+
+  it("loads multiple provider files from one snapshot subdirectory", () => {
+    const subDir = join(tmpDir, "test-greeting");
+    mkdirSync(subDir);
+    writeJson(subDir, "anthropic.json", {
+      fixtures: [{ match: { userMessage: "hi anthropic" }, response: { content: "A" } }],
+    });
+    writeJson(subDir, "openai.json", {
+      fixtures: [{ match: { userMessage: "hi openai" }, response: { content: "O" } }],
+    });
+
+    const fixtures = loadFixturesFromDir(tmpDir);
+    expect(fixtures).toHaveLength(2);
+    // Alphabetical order within subdirectory
+    expect(fixtures[0].match.userMessage).toBe("hi anthropic");
+    expect(fixtures[1].match.userMessage).toBe("hi openai");
+  });
+
+  it("loads fixtures from multiple snapshot subdirectories in alphabetical order", () => {
+    const subA = join(tmpDir, "a-test");
+    const subB = join(tmpDir, "b-test");
+    mkdirSync(subA);
+    mkdirSync(subB);
+    writeJson(subA, "openai.json", {
+      fixtures: [{ match: { userMessage: "a" }, response: { content: "A" } }],
+    });
+    writeJson(subB, "openai.json", {
+      fixtures: [{ match: { userMessage: "b" }, response: { content: "B" } }],
+    });
+
+    const fixtures = loadFixturesFromDir(tmpDir);
+    expect(fixtures).toHaveLength(2);
+    expect(fixtures[0].match.userMessage).toBe("a");
+    expect(fixtures[1].match.userMessage).toBe("b");
+  });
+
+  it("does not recurse deeper than one level", () => {
+    const subDir = join(tmpDir, "level1");
+    const deepDir = join(subDir, "level2");
+    mkdirSync(subDir);
+    mkdirSync(deepDir);
+    writeJson(subDir, "openai.json", {
+      fixtures: [{ match: { userMessage: "one" }, response: { content: "1" } }],
+    });
+    writeJson(deepDir, "openai.json", {
+      fixtures: [{ match: { userMessage: "two" }, response: { content: "2" } }],
+    });
+
     const fixtures = loadFixturesFromDir(tmpDir);
     expect(fixtures).toHaveLength(1);
+    expect(fixtures[0].match.userMessage).toBe("one");
+  });
+
+  it("top-level JSON files come before subdirectory fixtures", () => {
+    writeJson(tmpDir, "z-top.json", {
+      fixtures: [{ match: { userMessage: "top" }, response: { content: "T" } }],
+    });
+    const subDir = join(tmpDir, "a-sub");
+    mkdirSync(subDir);
+    writeJson(subDir, "openai.json", {
+      fixtures: [{ match: { userMessage: "sub" }, response: { content: "S" } }],
+    });
+
+    const fixtures = loadFixturesFromDir(tmpDir);
+    expect(fixtures).toHaveLength(2);
+    // Top-level files load first (regardless of sort order vs subdirectory names)
     expect(fixtures[0].match.userMessage).toBe("top");
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("Skipping subdirectory"));
-    warn.mockRestore();
+    expect(fixtures[1].match.userMessage).toBe("sub");
+  });
+
+  it("ignores non-.json files inside subdirectories", () => {
+    const subDir = join(tmpDir, "test-sub");
+    mkdirSync(subDir);
+    writeFileSync(join(subDir, "readme.txt"), "ignore me", "utf-8");
+    writeJson(subDir, "openai.json", {
+      fixtures: [{ match: { userMessage: "real" }, response: { content: "yes" } }],
+    });
+
+    const fixtures = loadFixturesFromDir(tmpDir);
+    expect(fixtures).toHaveLength(1);
+    expect(fixtures[0].match.userMessage).toBe("real");
   });
 });
 
