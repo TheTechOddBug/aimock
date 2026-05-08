@@ -6,10 +6,10 @@
  * individual WebSocket text frames.
  */
 
+import { randomBytes } from "node:crypto";
 import type { ChatCompletionRequest, ChatMessage, Fixture } from "./types.js";
 import { matchFixture } from "./router.js";
 import {
-  generateId,
   generateToolCallId,
   isTextResponse,
   isToolCallResponse,
@@ -21,6 +21,11 @@ import { delay } from "./sse-writer.js";
 import { DEFAULT_TEST_ID, type Journal } from "./journal.js";
 import type { Logger } from "./logger.js";
 import type { WebSocketConnection } from "./ws-framing.js";
+
+/** Generate a Realtime-API-style ID with underscore separator (e.g. event_xxx, item_xxx). */
+function realtimeId(prefix: string): string {
+  return `${prefix}_${randomBytes(12).toString("base64url")}`;
+}
 
 // ─── Realtime protocol types ────────────────────────────────────────────────
 
@@ -114,7 +119,7 @@ export function realtimeItemsToMessages(
 // ─── Event builders ─────────────────────────────────────────────────────────
 
 function evt(type: string, extra: Record<string, unknown> = {}): string {
-  return JSON.stringify({ type, event_id: generateId("evt"), ...extra });
+  return JSON.stringify({ type, event_id: realtimeId("event"), ...extra });
 }
 
 function buildErrorRealtimeEvent(
@@ -142,7 +147,7 @@ export function handleWebSocketRealtime(
   },
 ): void {
   const { logger } = defaults;
-  const sessionId = generateId("sess");
+  const sessionId = realtimeId("sess");
 
   const session: SessionConfig = {
     model: defaults.model,
@@ -159,7 +164,19 @@ export function handleWebSocketRealtime(
   const conversationItems: RealtimeItem[] = [];
 
   // Send session.created immediately on connect
-  ws.send(evt("session.created", { session: { id: sessionId, ...session } }));
+  ws.send(
+    evt("session.created", {
+      session: {
+        id: sessionId,
+        object: "realtime.session",
+        ...session,
+        expires_at: Math.floor(Date.now() / 1000) + 3600,
+        max_response_output_tokens: "inf",
+        input_audio_transcription: null,
+        tool_choice: "auto",
+      },
+    }),
+  );
 
   // Serialize message processing to prevent event interleaving
   let pending = Promise.resolve();
@@ -226,7 +243,18 @@ async function processMessage(
         session.temperature = parsed.session.temperature;
       }
     }
-    ws.send(evt("session.updated", { session: { ...session } }));
+    ws.send(
+      evt("session.updated", {
+        session: {
+          ...session,
+          object: "realtime.session",
+          expires_at: Math.floor(Date.now() / 1000) + 3600,
+          max_response_output_tokens: "inf",
+          input_audio_transcription: null,
+          tool_choice: "auto",
+        },
+      }),
+    );
     return;
   }
 
@@ -243,10 +271,14 @@ async function processMessage(
     }
     const item = parsed.item;
     if (!item.id) {
-      item.id = generateId("item");
+      item.id = realtimeId("item");
     }
+    const previousId =
+      conversationItems.length > 0
+        ? (conversationItems[conversationItems.length - 1].id ?? null)
+        : null;
     conversationItems.push(item);
-    ws.send(evt("conversation.item.created", { item }));
+    ws.send(evt("conversation.item.created", { previous_item_id: previousId, item }));
     return;
   }
 
@@ -290,7 +322,7 @@ async function handleResponseCreate(
     journal.getFixtureMatchCountsForTest(testId),
     defaults.requestTransform,
   );
-  const responseId = generateId("resp");
+  const responseId = realtimeId("resp");
 
   if (fixture) {
     journal.incrementFixtureMatchCount(fixture, fixtures, testId);
@@ -312,13 +344,21 @@ async function handleResponseCreate(
     // Send response.created with failed status then response.done with error
     ws.send(
       evt("response.created", {
-        response: { id: responseId, status: "failed", output: [] },
+        response: {
+          id: responseId,
+          object: "realtime.response",
+          status: "failed",
+          status_details: null,
+          output: [],
+          usage: null,
+        },
       }),
     );
     ws.send(
       evt("response.done", {
         response: {
           id: responseId,
+          object: "realtime.response",
           status: "failed",
           output: [],
           status_details: {
@@ -329,6 +369,7 @@ async function handleResponseCreate(
               code: "no_fixture_match",
             },
           },
+          usage: { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
         },
       }),
     );
@@ -351,13 +392,21 @@ async function handleResponseCreate(
     });
     ws.send(
       evt("response.created", {
-        response: { id: responseId, status: "failed", output: [] },
+        response: {
+          id: responseId,
+          object: "realtime.response",
+          status: "failed",
+          status_details: null,
+          output: [],
+          usage: null,
+        },
       }),
     );
     ws.send(
       evt("response.done", {
         response: {
           id: responseId,
+          object: "realtime.response",
           status: "failed",
           output: [],
           status_details: {
@@ -368,6 +417,7 @@ async function handleResponseCreate(
               code: response.error.code,
             },
           },
+          usage: { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
         },
       }),
     );
@@ -384,7 +434,7 @@ async function handleResponseCreate(
       response: { status: 200, fixture },
     });
 
-    const itemId = generateId("item");
+    const itemId = realtimeId("item");
     const contentIndex = 0;
     const outputIndex = 0;
 
@@ -392,13 +442,21 @@ async function handleResponseCreate(
       id: itemId,
       type: "message",
       role: "assistant",
+      status: "completed",
       content: [{ type: "text", text: response.content }],
     };
 
     // response.created
     ws.send(
       evt("response.created", {
-        response: { id: responseId, status: "in_progress", output: [] },
+        response: {
+          id: responseId,
+          object: "realtime.response",
+          status: "in_progress",
+          status_details: null,
+          output: [],
+          usage: null,
+        },
       }),
     );
 
@@ -407,7 +465,13 @@ async function handleResponseCreate(
       evt("response.output_item.added", {
         response_id: responseId,
         output_index: outputIndex,
-        item: { id: itemId, type: "message", role: "assistant", content: [] },
+        item: {
+          id: itemId,
+          type: "message",
+          role: "assistant",
+          status: "in_progress",
+          content: [],
+        },
       }),
     );
 
@@ -498,7 +562,13 @@ async function handleResponseCreate(
     // response.done
     ws.send(
       evt("response.done", {
-        response: { id: responseId, status: "completed", output: [outputItem] },
+        response: {
+          id: responseId,
+          object: "realtime.response",
+          status: "completed",
+          output: [outputItem],
+          usage: { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
+        },
       }),
     );
 
@@ -525,7 +595,14 @@ async function handleResponseCreate(
     // response.created
     ws.send(
       evt("response.created", {
-        response: { id: responseId, status: "in_progress", output: [] },
+        response: {
+          id: responseId,
+          object: "realtime.response",
+          status: "in_progress",
+          status_details: null,
+          output: [],
+          usage: null,
+        },
       }),
     );
 
@@ -536,11 +613,12 @@ async function handleResponseCreate(
     for (let tcIdx = 0; tcIdx < response.toolCalls.length; tcIdx++) {
       const tc = response.toolCalls[tcIdx];
       const callId = tc.id ?? generateToolCallId();
-      const itemId = generateId("item");
+      const itemId = realtimeId("item");
 
       const outputItem = {
         id: itemId,
         type: "function_call",
+        status: "completed",
         call_id: callId,
         name: tc.name,
         arguments: tc.arguments,
@@ -554,6 +632,7 @@ async function handleResponseCreate(
           item: {
             id: itemId,
             type: "function_call",
+            status: "in_progress",
             call_id: callId,
             name: tc.name,
             arguments: "",
@@ -628,7 +707,13 @@ async function handleResponseCreate(
     // response.done
     ws.send(
       evt("response.done", {
-        response: { id: responseId, status: "completed", output: outputItems },
+        response: {
+          id: responseId,
+          object: "realtime.response",
+          status: "completed",
+          output: outputItems,
+          usage: { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
+        },
       }),
     );
 
