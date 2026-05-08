@@ -1,5 +1,11 @@
 # @copilotkit/aimock
 
+## [Unreleased]
+
+### Fixed
+
+- **Converse stream: spurious `type` field in contentBlockDelta and contentBlockStart** — `delta` objects contained a Claude Messages API `type` field (`text_delta`, `thinking_delta`) that is not a member of the Converse API's tagged union. botocore's single-member union parser rejected the extra field with `ResponseParserError`. Also fixed reasoning deltas to use `reasoningContent` (Converse format) instead of `thinking` (Claude format). (Issue #165, reported by @KMiya84377)
+
 ## [1.19.3] - 2026-05-08
 
 ### Fixed
