@@ -107,6 +107,108 @@ export function openaiChatCompletionChunkShape(): ShapeNode {
   });
 }
 
+/**
+ * Non-streaming completion with reasoning_content on the message.
+ * Models like o1/o3 emit reasoning_content alongside the assistant content.
+ */
+export function openaiChatCompletionReasoningShape(): ShapeNode {
+  return extractShape({
+    id: "chatcmpl-abc123",
+    object: "chat.completion",
+    created: 1700000000,
+    model: "gpt-4o-mini",
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: "The answer is 42.",
+          refusal: null,
+          reasoning_content: "Let me think step by step...",
+        },
+        logprobs: null,
+        finish_reason: "stop",
+      },
+    ],
+    usage: {
+      prompt_tokens: 10,
+      completion_tokens: 5,
+      total_tokens: 15,
+    },
+    system_fingerprint: "fp_abc123",
+  });
+}
+
+/**
+ * Streaming chunk with reasoning_content delta.
+ * Reasoning chunks are emitted before the role/content chunks.
+ */
+export function openaiChatCompletionReasoningChunkShape(): ShapeNode {
+  return extractShape({
+    id: "chatcmpl-abc123",
+    object: "chat.completion.chunk",
+    created: 1700000000,
+    model: "gpt-4o-mini",
+    choices: [
+      {
+        index: 0,
+        delta: {
+          reasoning_content: "Let me think",
+        },
+        logprobs: null,
+        finish_reason: null,
+      },
+    ],
+    system_fingerprint: "fp_abc123",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Moderations
+// ---------------------------------------------------------------------------
+
+export function openaiModerationResponseShape(): ShapeNode {
+  return extractShape({
+    id: "modr-abc123",
+    model: "text-moderation-latest",
+    results: [
+      {
+        flagged: false,
+        categories: {
+          sexual: false,
+          hate: false,
+          harassment: false,
+          "self-harm": false,
+          "sexual/minors": false,
+          "hate/threatening": false,
+          "violence/graphic": false,
+          "self-harm/intent": false,
+          "self-harm/instructions": false,
+          "harassment/threatening": false,
+          violence: false,
+          illicit: false,
+          "illicit/violent": false,
+        },
+        category_scores: {
+          sexual: 0,
+          hate: 0,
+          harassment: 0,
+          "self-harm": 0,
+          "sexual/minors": 0,
+          "hate/threatening": 0,
+          "violence/graphic": 0,
+          "self-harm/intent": 0,
+          "self-harm/instructions": 0,
+          "harassment/threatening": 0,
+          violence: 0,
+          illicit: 0,
+          "illicit/violent": 0,
+        },
+      },
+    ],
+  });
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI Embeddings
 // ---------------------------------------------------------------------------
@@ -299,6 +401,75 @@ export function openaiResponsesToolCallEventShapes(): SSEEventShape[] {
   ];
 }
 
+export function openaiResponsesReasoningEventShapes(): SSEEventShape[] {
+  return [
+    {
+      type: "response.output_item.added",
+      dataShape: extractShape({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          type: "reasoning",
+          id: "rs_abc123",
+          summary: [],
+        },
+      }),
+    },
+    {
+      type: "response.reasoning_summary_part.added",
+      dataShape: extractShape({
+        type: "response.reasoning_summary_part.added",
+        item_id: "rs_abc123",
+        output_index: 0,
+        summary_index: 0,
+        part: { type: "summary_text", text: "" },
+      }),
+    },
+    {
+      type: "response.reasoning_summary_text.delta",
+      dataShape: extractShape({
+        type: "response.reasoning_summary_text.delta",
+        item_id: "rs_abc123",
+        output_index: 0,
+        summary_index: 0,
+        delta: "Step by step",
+      }),
+    },
+    {
+      type: "response.reasoning_summary_text.done",
+      dataShape: extractShape({
+        type: "response.reasoning_summary_text.done",
+        item_id: "rs_abc123",
+        output_index: 0,
+        summary_index: 0,
+        text: "Step by step...",
+      }),
+    },
+    {
+      type: "response.reasoning_summary_part.done",
+      dataShape: extractShape({
+        type: "response.reasoning_summary_part.done",
+        item_id: "rs_abc123",
+        output_index: 0,
+        summary_index: 0,
+        part: { type: "summary_text", text: "Step by step..." },
+      }),
+    },
+    {
+      type: "response.output_item.done",
+      dataShape: extractShape({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "reasoning",
+          id: "rs_abc123",
+          summary: [{ type: "summary_text", text: "Step by step..." }],
+        },
+      }),
+    },
+  ];
+}
+
 export function openaiResponsesNonStreamingShape(): ShapeNode {
   return extractShape({
     id: "resp_abc123",
@@ -424,6 +595,91 @@ export function anthropicStreamEventShapes(): SSEEventShape[] {
   ];
 }
 
+export function anthropicThinkingMessageShape(): ShapeNode {
+  return extractShape({
+    id: "msg_abc123",
+    type: "message",
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "I need to consider...", signature: "" },
+      { type: "text", text: "Hello!" },
+    ],
+    model: "claude-3-haiku-20240307",
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: {
+      input_tokens: 10,
+      output_tokens: 5,
+    },
+  });
+}
+
+export function anthropicThinkingStreamEventShapes(): SSEEventShape[] {
+  return [
+    {
+      type: "message_start",
+      dataShape: extractShape({
+        type: "message_start",
+        message: {
+          id: "msg_abc123",
+          type: "message",
+          role: "assistant",
+          content: [],
+          model: "claude-3-haiku-20240307",
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 10, output_tokens: 0 },
+        },
+      }),
+    },
+    {
+      type: "content_block_start",
+      dataShape: extractShape({
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "thinking", thinking: "", signature: "" },
+      }),
+    },
+    {
+      type: "content_block_delta",
+      dataShape: extractShape({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "thinking_delta", thinking: "I need to consider..." },
+      }),
+    },
+    {
+      type: "content_block_delta",
+      dataShape: extractShape({
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "signature_delta", signature: "" },
+      }),
+    },
+    {
+      type: "content_block_stop",
+      dataShape: extractShape({
+        type: "content_block_stop",
+        index: 0,
+      }),
+    },
+    {
+      type: "message_delta",
+      dataShape: extractShape({
+        type: "message_delta",
+        delta: { stop_reason: "end_turn", stop_sequence: null },
+        usage: { output_tokens: 5 },
+      }),
+    },
+    {
+      type: "message_stop",
+      dataShape: extractShape({
+        type: "message_stop",
+      }),
+    },
+  ];
+}
+
 export function anthropicToolStreamEventShapes(): SSEEventShape[] {
   return [
     {
@@ -460,9 +716,10 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
       type: "session.created",
       dataShape: extractShape({
         type: "session.created",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         session: {
           id: "sess_abc123",
+          object: "realtime.session",
           model: "gpt-4o-mini",
           modalities: ["text"],
           instructions: "",
@@ -472,6 +729,10 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
           output_audio_format: null,
           turn_detection: null,
           temperature: 0.8,
+          expires_at: 1700000000,
+          max_response_output_tokens: "inf",
+          input_audio_transcription: null,
+          tool_choice: "auto",
         },
       }),
     },
@@ -479,8 +740,9 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
       type: "session.updated",
       dataShape: extractShape({
         type: "session.updated",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         session: {
+          object: "realtime.session",
           model: "gpt-4o-mini",
           modalities: ["text"],
           instructions: "",
@@ -490,6 +752,10 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
           output_audio_format: null,
           turn_detection: null,
           temperature: 0.8,
+          expires_at: 1700000000,
+          max_response_output_tokens: "inf",
+          input_audio_transcription: null,
+          tool_choice: "auto",
         },
       }),
     },
@@ -497,7 +763,8 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
       type: "conversation.item.created",
       dataShape: extractShape({
         type: "conversation.item.created",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
+        previous_item_id: null,
         item: {
           type: "message",
           id: "item_abc123",
@@ -510,11 +777,14 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
       type: "response.created",
       dataShape: extractShape({
         type: "response.created",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response: {
           id: "resp_abc123",
+          object: "realtime.response",
           status: "in_progress",
+          status_details: null,
           output: [],
+          usage: null,
         },
       }),
     },
@@ -522,13 +792,14 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
       type: "response.output_item.added",
       dataShape: extractShape({
         type: "response.output_item.added",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response_id: "resp_abc123",
         output_index: 0,
         item: {
           id: "item_abc123",
           type: "message",
           role: "assistant",
+          status: "in_progress",
           content: [],
         },
       }),
@@ -537,7 +808,7 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
       type: "response.content_part.added",
       dataShape: extractShape({
         type: "response.content_part.added",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response_id: "resp_abc123",
         item_id: "item_abc123",
         output_index: 0,
@@ -549,7 +820,7 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
       type: "response.text.delta",
       dataShape: extractShape({
         type: "response.text.delta",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response_id: "resp_abc123",
         item_id: "item_abc123",
         output_index: 0,
@@ -561,7 +832,7 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
       type: "response.text.done",
       dataShape: extractShape({
         type: "response.text.done",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response_id: "resp_abc123",
         item_id: "item_abc123",
         output_index: 0,
@@ -573,7 +844,7 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
       type: "response.content_part.done",
       dataShape: extractShape({
         type: "response.content_part.done",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response_id: "resp_abc123",
         item_id: "item_abc123",
         output_index: 0,
@@ -585,13 +856,14 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
       type: "response.output_item.done",
       dataShape: extractShape({
         type: "response.output_item.done",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response_id: "resp_abc123",
         output_index: 0,
         item: {
           id: "item_abc123",
           type: "message",
           role: "assistant",
+          status: "completed",
           content: [{ type: "text", text: "Hello!" }],
         },
       }),
@@ -600,18 +872,21 @@ export function openaiRealtimeTextEventShapes(): SSEEventShape[] {
       type: "response.done",
       dataShape: extractShape({
         type: "response.done",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response: {
           id: "resp_abc123",
+          object: "realtime.response",
           status: "completed",
           output: [
             {
               id: "item_abc123",
               type: "message",
               role: "assistant",
+              status: "completed",
               content: [{ type: "text", text: "Hello!" }],
             },
           ],
+          usage: { total_tokens: 0, input_tokens: 0, output_tokens: 0 },
         },
       }),
     },
@@ -624,12 +899,13 @@ export function openaiRealtimeToolCallEventShapes(): SSEEventShape[] {
       type: "response.output_item.added",
       dataShape: extractShape({
         type: "response.output_item.added",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response_id: "resp_abc123",
         output_index: 0,
         item: {
           id: "item_abc123",
           type: "function_call",
+          status: "in_progress",
           call_id: "call_abc123",
           name: "get_weather",
           arguments: "",
@@ -640,7 +916,7 @@ export function openaiRealtimeToolCallEventShapes(): SSEEventShape[] {
       type: "response.function_call_arguments.delta",
       dataShape: extractShape({
         type: "response.function_call_arguments.delta",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response_id: "resp_abc123",
         item_id: "item_abc123",
         output_index: 0,
@@ -652,7 +928,7 @@ export function openaiRealtimeToolCallEventShapes(): SSEEventShape[] {
       type: "response.function_call_arguments.done",
       dataShape: extractShape({
         type: "response.function_call_arguments.done",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response_id: "resp_abc123",
         item_id: "item_abc123",
         output_index: 0,
@@ -664,12 +940,13 @@ export function openaiRealtimeToolCallEventShapes(): SSEEventShape[] {
       type: "response.output_item.done",
       dataShape: extractShape({
         type: "response.output_item.done",
-        event_id: "evt_abc123",
+        event_id: "event_abc123",
         response_id: "resp_abc123",
         output_index: 0,
         item: {
           id: "item_abc123",
           type: "function_call",
+          status: "completed",
           call_id: "call_abc123",
           name: "get_weather",
           arguments: '{"city":"Paris"}',
@@ -1041,6 +1318,49 @@ export function geminiStreamLastChunkShape(): ShapeNode {
   });
 }
 
+/**
+ * Expected shape for a Gemini 2.5+ non-streaming response that includes
+ * thinking/reasoning tokens. Thinking parts carry `thought: true`.
+ */
+export function geminiThinkingContentResponseShape(): ShapeNode {
+  return extractShape({
+    candidates: [
+      {
+        content: {
+          role: "model",
+          parts: [{ text: "Let me think...", thought: true }, { text: "Hello!" }],
+        },
+        finishReason: "STOP",
+        index: 0,
+      },
+    ],
+    usageMetadata: {
+      promptTokenCount: 10,
+      candidatesTokenCount: 5,
+      totalTokenCount: 15,
+    },
+  });
+}
+
+/**
+ * Expected shape for a Gemini 2.5+ streaming thinking chunk.
+ * Intermediate thinking chunks have `thought: true` on the text part
+ * and no finishReason.
+ */
+export function geminiThinkingStreamChunkShape(): ShapeNode {
+  return extractShape({
+    candidates: [
+      {
+        content: {
+          role: "model",
+          parts: [{ text: "Let me think...", thought: true }],
+        },
+        index: 0,
+      },
+    ],
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Google Gemini Interactions API (Beta)
 // ---------------------------------------------------------------------------
@@ -1179,4 +1499,42 @@ export function geminiInteractionsToolCallStreamEventShapes(): SSEEventShape[] {
       }),
     },
   ];
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Transcription / Whisper (STT)
+// ---------------------------------------------------------------------------
+
+/**
+ * Basic transcription response shape per OpenAI Whisper API spec.
+ * Returned when response_format is "json" (default).
+ * Ref: https://platform.openai.com/docs/api-reference/audio/createTranscription
+ */
+export function openaiTranscriptionBasicShape(): ShapeNode {
+  return extractShape({
+    text: "Hello, world.",
+  });
+}
+
+/**
+ * Verbose transcription response shape per OpenAI Whisper API spec.
+ * Returned when response_format is "verbose_json".
+ * Ref: https://platform.openai.com/docs/api-reference/audio/verbose-json-object
+ */
+export function openaiTranscriptionVerboseShape(): ShapeNode {
+  return extractShape({
+    task: "transcribe",
+    language: "english",
+    duration: 2.5,
+    text: "Hello, world.",
+    words: [{ word: "Hello,", start: 0.0, end: 0.4 }],
+    segments: [
+      {
+        id: 0,
+        text: "Hello, world.",
+        start: 0.0,
+        end: 2.5,
+      },
+    ],
+  });
 }

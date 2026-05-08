@@ -50,6 +50,36 @@ export async function httpPost(
   });
 }
 
+/** POST raw string body (bypasses JSON.stringify — useful for malformed JSON tests). */
+export async function httpPostRaw(
+  url: string,
+  rawBody: string,
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode!,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString(),
+          }),
+        );
+      },
+    );
+    req.on("error", reject);
+    req.write(rawBody);
+    req.end();
+  });
+}
+
 // ---------------------------------------------------------------------------
 // SSE parsers
 // ---------------------------------------------------------------------------
@@ -114,12 +144,17 @@ export const TOOL_FIXTURE: Fixture = {
   },
 };
 
+export const THINKING_FIXTURE: Fixture = {
+  match: { userMessage: "Think about hello" },
+  response: { content: "Hello!", reasoning: "I need to consider..." },
+};
+
 // ---------------------------------------------------------------------------
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
 export async function startDriftServer(): Promise<ServerInstance> {
-  return createServer([TEXT_FIXTURE, TOOL_FIXTURE], {
+  return createServer([TEXT_FIXTURE, TOOL_FIXTURE, THINKING_FIXTURE], {
     port: 0,
     chunkSize: 100,
   });

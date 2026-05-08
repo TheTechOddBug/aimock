@@ -10,7 +10,13 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import type { ServerInstance } from "../../server.js";
 import { extractShape, triangulate, formatDriftReport, shouldFail } from "./schema.js";
-import { httpPost, parseDataOnlySSE, startDriftServer, stopDriftServer } from "./helpers.js";
+import {
+  httpPost,
+  httpPostRaw,
+  parseDataOnlySSE,
+  startDriftServer,
+  stopDriftServer,
+} from "./helpers.js";
 
 // ---------------------------------------------------------------------------
 // Credentials check
@@ -119,8 +125,102 @@ async function cohereChatStreaming(
 }
 
 // ---------------------------------------------------------------------------
+// Error shape stubs
+// ---------------------------------------------------------------------------
+
+/**
+ * Cohere error envelope shape returned by aimock for validation errors
+ * and no-fixture-match scenarios.
+ */
+function cohereErrorShape() {
+  return extractShape({
+    error: {
+      message: "Some error message",
+      type: "invalid_request_error",
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe("Cohere error shapes", () => {
+  it("malformed JSON returns 400 with error envelope", async () => {
+    const res = await httpPostRaw(`${instance.url}/v2/chat`, "{not valid json");
+
+    expect(res.status).toBe(400);
+
+    const body = JSON.parse(res.body);
+    const sdkShape = cohereErrorShape();
+    const mockShape = extractShape(body);
+
+    const diffs = triangulate(sdkShape, sdkShape, mockShape);
+    const report = formatDriftReport("Cohere /v2/chat malformed JSON error", diffs);
+
+    if (shouldFail(diffs)) {
+      expect.soft([], report).toEqual(diffs.filter((d) => d.severity === "critical"));
+    }
+  });
+
+  it("missing model field returns 400 with error envelope", async () => {
+    const res = await httpPost(`${instance.url}/v2/chat`, {
+      messages: [{ role: "user", content: "hello" }],
+    });
+
+    expect(res.status).toBe(400);
+
+    const body = JSON.parse(res.body);
+    const sdkShape = cohereErrorShape();
+    const mockShape = extractShape(body);
+
+    const diffs = triangulate(sdkShape, sdkShape, mockShape);
+    const report = formatDriftReport("Cohere /v2/chat missing model error", diffs);
+
+    if (shouldFail(diffs)) {
+      expect.soft([], report).toEqual(diffs.filter((d) => d.severity === "critical"));
+    }
+  });
+
+  it("missing messages array returns 400 with error envelope", async () => {
+    const res = await httpPost(`${instance.url}/v2/chat`, {
+      model: "command-r-plus",
+    });
+
+    expect(res.status).toBe(400);
+
+    const body = JSON.parse(res.body);
+    const sdkShape = cohereErrorShape();
+    const mockShape = extractShape(body);
+
+    const diffs = triangulate(sdkShape, sdkShape, mockShape);
+    const report = formatDriftReport("Cohere /v2/chat missing messages error", diffs);
+
+    if (shouldFail(diffs)) {
+      expect.soft([], report).toEqual(diffs.filter((d) => d.severity === "critical"));
+    }
+  });
+
+  it("no fixture match returns 404 with error envelope", async () => {
+    const res = await httpPost(`${instance.url}/v2/chat`, {
+      model: "command-r-plus",
+      messages: [{ role: "user", content: "this will not match any fixture" }],
+    });
+
+    expect(res.status).toBe(404);
+
+    const body = JSON.parse(res.body);
+    const sdkShape = cohereErrorShape();
+    const mockShape = extractShape(body);
+
+    const diffs = triangulate(sdkShape, sdkShape, mockShape);
+    const report = formatDriftReport("Cohere /v2/chat no fixture match error", diffs);
+
+    if (shouldFail(diffs)) {
+      expect.soft([], report).toEqual(diffs.filter((d) => d.severity === "critical"));
+    }
+  });
+});
 
 describe.skipIf(!HAS_CREDENTIALS)("Cohere drift", () => {
   it("non-streaming /v2/chat shape matches", async () => {
