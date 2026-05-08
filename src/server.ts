@@ -436,6 +436,7 @@ async function handleCompletions(
         error: {
           message: "Malformed JSON",
           type: "invalid_request_error",
+          param: null,
           code: "invalid_json",
         },
       }),
@@ -459,6 +460,8 @@ async function handleCompletions(
         error: {
           message: "Missing required parameter: 'messages'",
           type: "invalid_request_error",
+          param: null,
+          code: null,
         },
       }),
     );
@@ -625,6 +628,7 @@ async function handleCompletions(
         error: {
           message: strictMessage,
           type: "invalid_request_error",
+          param: null,
           code: "no_fixture_match",
         },
       }),
@@ -646,7 +650,17 @@ async function handleCompletions(
       body,
       response: { status, fixture },
     });
-    writeErrorResponse(res, status, JSON.stringify(response));
+    // Serialize only the error envelope (strip internal-only fields like `status`)
+    // and ensure `param` is present per OpenAI spec
+    const errorBody = {
+      error: {
+        message: response.error.message,
+        type: response.error.type ?? "server_error",
+        param: null,
+        code: response.error.code ?? null,
+      },
+    };
+    writeErrorResponse(res, status, JSON.stringify(errorBody));
     return;
   }
 

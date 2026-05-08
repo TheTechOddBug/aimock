@@ -179,17 +179,20 @@ export async function handleTranscription(
   const useVerbose = responseFormat === "verbose_json" || t.words != null || t.segments != null;
 
   if (useVerbose) {
+    const verboseBody: Record<string, unknown> = {
+      task: "transcribe",
+      language: t.language ?? "english",
+      duration: t.duration ?? 0,
+      text: t.text,
+    };
+    if (t.words && t.words.length > 0) {
+      verboseBody.words = t.words;
+    }
+    if (t.segments && t.segments.length > 0) {
+      verboseBody.segments = t.segments;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        task: "transcribe",
-        language: t.language ?? "english",
-        duration: t.duration ?? 0,
-        text: t.text,
-        words: t.words ?? [],
-        segments: t.segments ?? [],
-      }),
-    );
+    res.end(JSON.stringify(verboseBody));
   } else {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ text: t.text }));
