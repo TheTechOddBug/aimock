@@ -377,6 +377,53 @@ describe("responsesToCompletionRequest", () => {
     });
     expect(result.tools).toBeUndefined();
   });
+
+  it("forwards max_output_tokens as max_tokens", () => {
+    const result = responsesToCompletionRequest({
+      model: "gpt-4o",
+      input: [{ role: "user", content: "hi" }],
+      max_output_tokens: 4096,
+    });
+    expect(result.max_tokens).toBe(4096);
+  });
+
+  it("leaves max_tokens undefined when max_output_tokens is not set", () => {
+    const result = responsesToCompletionRequest({
+      model: "gpt-4o",
+      input: [{ role: "user", content: "hi" }],
+    });
+    expect(result.max_tokens).toBeUndefined();
+  });
+
+  it("forwards response_format", () => {
+    const result = responsesToCompletionRequest({
+      model: "gpt-4o",
+      input: [{ role: "user", content: "hi" }],
+      response_format: { type: "json_object" },
+    });
+    expect(result.response_format).toEqual({ type: "json_object" });
+  });
+
+  it("forwards response_format with json_schema", () => {
+    const schema = {
+      type: "json_schema",
+      json_schema: { name: "my_schema", schema: { type: "object" } },
+    };
+    const result = responsesToCompletionRequest({
+      model: "gpt-4o",
+      input: [{ role: "user", content: "hi" }],
+      response_format: schema,
+    });
+    expect(result.response_format).toEqual(schema);
+  });
+
+  it("leaves response_format undefined when not set", () => {
+    const result = responsesToCompletionRequest({
+      model: "gpt-4o",
+      input: [{ role: "user", content: "hi" }],
+    });
+    expect(result.response_format).toBeUndefined();
+  });
 });
 
 // ─── Integration tests: POST /v1/responses ───────────────────────────────────

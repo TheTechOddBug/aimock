@@ -251,7 +251,7 @@ function buildClaudeTextStreamEvents(
     events.push({
       type: "content_block_start",
       index: blockIndex,
-      content_block: { type: "thinking", thinking: "" },
+      content_block: { type: "thinking", thinking: "", signature: "" },
     });
 
     for (let i = 0; i < reasoning.length; i += chunkSize) {
@@ -262,6 +262,12 @@ function buildClaudeTextStreamEvents(
         delta: { type: "thinking_delta", thinking: slice },
       });
     }
+
+    events.push({
+      type: "content_block_delta",
+      index: blockIndex,
+      delta: { type: "signature_delta", signature: "" },
+    });
 
     events.push({
       type: "content_block_stop",
@@ -408,7 +414,7 @@ function buildClaudeTextResponse(
   const contentBlocks: object[] = [];
 
   if (reasoning) {
-    contentBlocks.push({ type: "thinking", thinking: reasoning });
+    contentBlocks.push({ type: "thinking", thinking: reasoning, signature: "" });
   }
 
   contentBlocks.push({ type: "text", text: content });
@@ -494,7 +500,7 @@ function buildClaudeContentWithToolCallsStreamEvents(
     events.push({
       type: "content_block_start",
       index: blockIndex,
-      content_block: { type: "thinking", thinking: "" },
+      content_block: { type: "thinking", thinking: "", signature: "" },
     });
 
     for (let i = 0; i < reasoning.length; i += chunkSize) {
@@ -505,6 +511,12 @@ function buildClaudeContentWithToolCallsStreamEvents(
         delta: { type: "thinking_delta", thinking: slice },
       });
     }
+
+    events.push({
+      type: "content_block_delta",
+      index: blockIndex,
+      delta: { type: "signature_delta", signature: "" },
+    });
 
     events.push({
       type: "content_block_stop",
@@ -607,7 +619,7 @@ function buildClaudeContentWithToolCallsResponse(
   const contentBlocks: object[] = [];
 
   if (reasoning) {
-    contentBlocks.push({ type: "thinking", thinking: reasoning });
+    contentBlocks.push({ type: "thinking", thinking: reasoning, signature: "" });
   }
 
   contentBlocks.push({ type: "text", text: content });

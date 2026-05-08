@@ -349,23 +349,23 @@ describe("WS Responses API conformance", () => {
 
 describe("WS Realtime API conformance", () => {
   describe("session.created on connect", () => {
-    it("session.created is sent immediately on connect with event_id evt- prefix", async () => {
+    it("session.created is sent immediately on connect with event_id event_ prefix", async () => {
       const ws = await connectWebSocket(instance.url, "/v1/realtime");
       const raw = await ws.waitForMessages(1);
       ws.close();
       const frame = JSON.parse(raw[0]) as any;
       expect(frame.type).toBe("session.created");
       expect(typeof frame.event_id).toBe("string");
-      expect(frame.event_id).toMatch(/^evt-/);
+      expect(frame.event_id).toMatch(/^event_/);
     });
 
-    it("session.created has session with id (sess- prefix), modalities, tools", async () => {
+    it("session.created has session with id (sess_ prefix), modalities, tools", async () => {
       const ws = await connectWebSocket(instance.url, "/v1/realtime");
       const raw = await ws.waitForMessages(1);
       ws.close();
       const frame = JSON.parse(raw[0]) as any;
       const session = frame.session;
-      expect(session.id).toMatch(/^sess-/);
+      expect(session.id).toMatch(/^sess_/);
       expect(Array.isArray(session.modalities)).toBe(true);
       expect(session.modalities).toContain("text");
       expect(Array.isArray(session.tools)).toBe(true);
@@ -373,7 +373,7 @@ describe("WS Realtime API conformance", () => {
   });
 
   describe("session.updated", () => {
-    it("session.updated reflects session changes with event_id evt- prefix", async () => {
+    it("session.updated reflects session changes with event_id event_ prefix", async () => {
       const ws = await connectWebSocket(instance.url, "/v1/realtime");
       await ws.waitForMessages(1); // session.created
       ws.send(
@@ -386,7 +386,7 @@ describe("WS Realtime API conformance", () => {
       ws.close();
       const frame = JSON.parse(raw[1]) as any;
       expect(frame.type).toBe("session.updated");
-      expect(frame.event_id).toMatch(/^evt-/);
+      expect(frame.event_id).toMatch(/^event_/);
       expect(frame.session.instructions).toBe("Be concise.");
     });
   });
@@ -420,18 +420,18 @@ describe("WS Realtime API conformance", () => {
       return raw.slice(2).map((m) => JSON.parse(m) as any);
     }
 
-    it("all response events have event_id starting with evt-", async () => {
+    it("all response events have event_id starting with event_", async () => {
       const frames = await getTextResponseFrames();
       for (const f of frames) {
-        expect(f.event_id).toMatch(/^evt-/);
+        expect(f.event_id).toMatch(/^event_/);
       }
     });
 
-    it("response.created has response.id (resp- prefix), status in_progress", async () => {
+    it("response.created has response.id (resp_ prefix), status in_progress", async () => {
       const frames = await getTextResponseFrames();
       const created = frames.find((f: any) => f.type === "response.created")!;
       expect(created).toBeDefined();
-      expect((created.response as any).id).toMatch(/^resp-/);
+      expect((created.response as any).id).toMatch(/^resp_/);
       expect((created.response as any).status).toBe("in_progress");
     });
 
@@ -588,7 +588,7 @@ describe("WS Realtime API conformance", () => {
       expect(resp.status_details.error.message).toBe("Rate limited");
     });
 
-    it("malformed JSON: error event has type error with evt- event_id", async () => {
+    it("malformed JSON: error event has type error with event_ event_id", async () => {
       const ws = await connectWebSocket(instance.url, "/v1/realtime");
       await ws.waitForMessages(1); // session.created
       ws.send("{not valid json");
@@ -596,7 +596,7 @@ describe("WS Realtime API conformance", () => {
       ws.close();
       const frame = JSON.parse(raw[1]) as any;
       expect(frame.type).toBe("error");
-      expect(frame.event_id).toMatch(/^evt-/);
+      expect(frame.event_id).toMatch(/^event_/);
       expect(frame.error.message).toBe("Malformed JSON");
     });
   });
@@ -646,19 +646,23 @@ describe("WS Gemini Live BidiGenerateContent conformance", () => {
       }
     });
 
-    it("turnComplete is boolean (true for single-chunk response)", async () => {
+    it("turnComplete is sent as separate message after content (single-chunk)", async () => {
       const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
       ws.send(geminiSetup());
       await ws.waitForMessages(1);
       ws.send(geminiClientContent("hello"));
-      const raw = await ws.waitForMessages(2);
+      const raw = await ws.waitForMessages(3); // setupComplete + content + turnComplete
       ws.close();
-      const msg = JSON.parse(raw[1]) as any;
-      expect(typeof msg.serverContent.turnComplete).toBe("boolean");
-      expect(msg.serverContent.turnComplete).toBe(true);
+      // Content chunk should NOT have turnComplete
+      const contentMsg = JSON.parse(raw[1]) as any;
+      expect(contentMsg.serverContent.turnComplete).toBeUndefined();
+      // Separate turnComplete message
+      const turnCompleteMsg = JSON.parse(raw[2]) as any;
+      expect(typeof turnCompleteMsg.serverContent.turnComplete).toBe("boolean");
+      expect(turnCompleteMsg.serverContent.turnComplete).toBe(true);
     });
 
-    it("intermediate chunks have turnComplete false, last chunk has turnComplete true", async () => {
+    it("content chunks omit turnComplete; separate turnComplete sent after last chunk", async () => {
       // Use a fixture-level chunkSize override to force multiple chunks
       const longFixture: Fixture = {
         match: { userMessage: "long-conformance" },
@@ -678,20 +682,25 @@ describe("WS Gemini Live BidiGenerateContent conformance", () => {
             },
           }),
         );
-        // 20 chars / 3 = 7 chunks (6 × 3 + 1 × 2)
-        const raw = await ws.waitForMessages(8); // 1 setupComplete + 7 chunks
+        // 20 chars / 3 = 7 chunks + 1 turnComplete
+        const raw = await ws.waitForMessages(9); // 1 setupComplete + 7 chunks + 1 turnComplete
         ws.close();
-        const chunks = raw.slice(1).map((r) => JSON.parse(r) as any);
-        for (let i = 0; i < chunks.length - 1; i++) {
-          expect(chunks[i].serverContent.turnComplete).toBe(false);
+        const contentChunks = raw.slice(1, 8).map((r) => JSON.parse(r) as any);
+        // Content chunks should NOT have turnComplete
+        for (const chunk of contentChunks) {
+          expect(chunk.serverContent.turnComplete).toBeUndefined();
+          expect(chunk.serverContent.modelTurn).toBeDefined();
         }
-        expect(chunks[chunks.length - 1].serverContent.turnComplete).toBe(true);
+        // Last message is separate turnComplete
+        const turnCompleteMsg = JSON.parse(raw[8]) as any;
+        expect(turnCompleteMsg.serverContent.turnComplete).toBe(true);
+        expect(turnCompleteMsg.serverContent.modelTurn).toBeUndefined();
       } finally {
         await new Promise<void>((r) => smallInstance.server.close(() => r()));
       }
     });
 
-    it("empty text: single frame with turnComplete true and empty text part", async () => {
+    it("empty text: content frame + separate turnComplete", async () => {
       const emptyFixture: Fixture = {
         match: { userMessage: "empty-conformance" },
         response: { content: "" },
@@ -709,11 +718,13 @@ describe("WS Gemini Live BidiGenerateContent conformance", () => {
             },
           }),
         );
-        const raw = await ws.waitForMessages(2); // setupComplete + 1 serverContent
+        const raw = await ws.waitForMessages(3); // setupComplete + content + turnComplete
         ws.close();
-        const msg = JSON.parse(raw[1]) as any;
-        expect(msg.serverContent.turnComplete).toBe(true);
-        expect(msg.serverContent.modelTurn.parts[0].text).toBe("");
+        const contentMsg = JSON.parse(raw[1]) as any;
+        expect(contentMsg.serverContent.modelTurn.parts[0].text).toBe("");
+        expect(contentMsg.serverContent.turnComplete).toBeUndefined();
+        const turnCompleteMsg = JSON.parse(raw[2]) as any;
+        expect(turnCompleteMsg.serverContent.turnComplete).toBe(true);
       } finally {
         await new Promise<void>((r) => emptyInstance.server.close(() => r()));
       }
@@ -782,7 +793,7 @@ describe("WS Gemini Live BidiGenerateContent conformance", () => {
       expect(typeof msg.error.status).toBe("string");
     });
 
-    it("error fixture: code matches fixture status, message matches fixture message", async () => {
+    it("error fixture: gRPC code mapped from HTTP status, message matches fixture", async () => {
       const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
       ws.send(geminiSetup());
       await ws.waitForMessages(1);
@@ -791,12 +802,12 @@ describe("WS Gemini Live BidiGenerateContent conformance", () => {
       ws.close();
       const msg = JSON.parse(raw[1]) as any;
       expect(msg.error).toBeDefined();
-      expect(msg.error.code).toBe(429);
+      expect(msg.error.code).toBe(8); // gRPC RESOURCE_EXHAUSTED (mapped from HTTP 429)
       expect(msg.error.message).toBe("Rate limited");
       expect(msg.error.status).toBe("RESOURCE_EXHAUSTED");
     });
 
-    it("no-match error: code 404, status NOT_FOUND", async () => {
+    it("no-match error: gRPC code 5 (NOT_FOUND)", async () => {
       const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
       ws.send(geminiSetup());
       await ws.waitForMessages(1);
@@ -804,11 +815,11 @@ describe("WS Gemini Live BidiGenerateContent conformance", () => {
       const raw = await ws.waitForMessages(2);
       ws.close();
       const msg = JSON.parse(raw[1]) as any;
-      expect(msg.error.code).toBe(404);
+      expect(msg.error.code).toBe(5); // gRPC NOT_FOUND
       expect(msg.error.status).toBe("NOT_FOUND");
     });
 
-    it("error before setup: code 400, status FAILED_PRECONDITION", async () => {
+    it("error before setup: gRPC code 9 (FAILED_PRECONDITION)", async () => {
       const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
       // Send clientContent without setup first
       ws.send(geminiClientContent("hello"));
@@ -816,11 +827,11 @@ describe("WS Gemini Live BidiGenerateContent conformance", () => {
       ws.close();
       const msg = JSON.parse(raw[0]) as any;
       expect(msg.error).toBeDefined();
-      expect(msg.error.code).toBe(400);
+      expect(msg.error.code).toBe(9); // gRPC FAILED_PRECONDITION
       expect(msg.error.status).toBe("FAILED_PRECONDITION");
     });
 
-    it("malformed JSON: error with code 400, status INVALID_ARGUMENT", async () => {
+    it("malformed JSON: gRPC code 3 (INVALID_ARGUMENT)", async () => {
       const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
       ws.send(geminiSetup());
       await ws.waitForMessages(1);
@@ -829,7 +840,7 @@ describe("WS Gemini Live BidiGenerateContent conformance", () => {
       ws.close();
       const msg = JSON.parse(raw[1]) as any;
       expect(msg.error).toBeDefined();
-      expect(msg.error.code).toBe(400);
+      expect(msg.error.code).toBe(3); // gRPC INVALID_ARGUMENT
       expect(msg.error.status).toBe("INVALID_ARGUMENT");
     });
   });

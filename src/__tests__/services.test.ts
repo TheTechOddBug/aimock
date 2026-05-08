@@ -55,11 +55,21 @@ describe("POST /search", () => {
     const { status, json } = await post(`${url}/search`, { query: "What is the weather?" });
 
     expect(status).toBe(200);
-    const data = json as { results: Array<{ title: string; url: string; content: string }> };
+    const data = json as {
+      query: string;
+      results: Array<{ title: string; url: string; content: string }>;
+      images: unknown[];
+      response_time: number;
+      answer: null;
+    };
+    expect(data.query).toBe("What is the weather?");
     expect(data.results).toHaveLength(1);
     expect(data.results[0].title).toBe("Weather Report");
     expect(data.results[0].url).toBe("https://example.com/weather");
     expect(data.results[0].content).toBe("Sunny today");
+    expect(data.images).toEqual([]);
+    expect(data.response_time).toBe(0);
+    expect(data.answer).toBeNull();
   });
 
   it("returns empty results when no fixture matches", async () => {
@@ -117,7 +127,6 @@ describe("POST /v2/rerank", () => {
       results: Array<{
         index: number;
         relevance_score: number;
-        document: { text: string };
       }>;
       meta: { billed_units: { search_units: number } };
     };
@@ -125,9 +134,8 @@ describe("POST /v2/rerank", () => {
     expect(data.results).toHaveLength(2);
     expect(data.results[0].index).toBe(0);
     expect(data.results[0].relevance_score).toBe(0.99);
-    expect(data.results[0].document.text).toBe("ML is a subset of AI");
     expect(data.results[1].index).toBe(2);
-    expect(data.results[1].document.text).toBe("Deep learning overview");
+    expect(data.results[1].relevance_score).toBe(0.85);
     expect(data.meta.billed_units.search_units).toBe(0);
   });
 
@@ -315,7 +323,7 @@ describe("POST /v2/rerank — edge cases", () => {
     expect(data.error.code).toBe("invalid_json");
   });
 
-  it("extracts text from object documents with text property", async () => {
+  it("result items only contain index and relevance_score (no document field)", async () => {
     mock = new LLMock();
     mock.onRerank("test", [
       { index: 0, relevance_score: 0.95 },
@@ -331,31 +339,19 @@ describe("POST /v2/rerank — edge cases", () => {
 
     expect(status).toBe(200);
     const data = json as {
-      results: Array<{ index: number; document: { text: string } }>;
+      results: Array<{ index: number; relevance_score: number }>;
     };
-    expect(data.results[0].document.text).toBe("Object doc with text field");
-    expect(data.results[1].document.text).toBe("Plain string doc");
+    expect(data.results[0].index).toBe(0);
+    expect(data.results[0].relevance_score).toBe(0.95);
+    expect(data.results[1].index).toBe(1);
+    expect(data.results[1].relevance_score).toBe(0.8);
+    // Cohere v2 rerank results do not include document
+    for (const r of data.results) {
+      expect(r).not.toHaveProperty("document");
+    }
   });
 
-  it("returns empty text for documents that are neither string nor {text}", async () => {
-    mock = new LLMock();
-    mock.onRerank("test", [{ index: 0, relevance_score: 0.5 }]);
-    const url = await mock.start();
-
-    const { status, json } = await post(`${url}/v2/rerank`, {
-      query: "test query",
-      documents: [42],
-      model: "rerank-v3.5",
-    });
-
-    expect(status).toBe(200);
-    const data = json as {
-      results: Array<{ document: { text: string } }>;
-    };
-    expect(data.results[0].document.text).toBe("");
-  });
-
-  it("returns empty text when document index is out of bounds", async () => {
+  it("handles out-of-bounds index without document field", async () => {
     mock = new LLMock();
     mock.onRerank("test", [{ index: 5, relevance_score: 0.9 }]);
     const url = await mock.start();
@@ -368,10 +364,11 @@ describe("POST /v2/rerank — edge cases", () => {
 
     expect(status).toBe(200);
     const data = json as {
-      results: Array<{ index: number; document: { text: string } }>;
+      results: Array<{ index: number; relevance_score: number }>;
     };
     expect(data.results[0].index).toBe(5);
-    expect(data.results[0].document.text).toBe("");
+    expect(data.results[0].relevance_score).toBe(0.9);
+    expect(data.results[0]).not.toHaveProperty("document");
   });
 
   it("handles missing query and documents gracefully", async () => {
@@ -383,10 +380,11 @@ describe("POST /v2/rerank — edge cases", () => {
 
     expect(status).toBe(200);
     const data = json as {
-      results: Array<{ document: { text: string } }>;
+      results: Array<{ index: number; relevance_score: number }>;
     };
-    // document at index 0 of empty array -> undefined -> empty text
-    expect(data.results[0].document.text).toBe("");
+    expect(data.results[0].index).toBe(0);
+    expect(data.results[0].relevance_score).toBe(0.5);
+    expect(data.results[0]).not.toHaveProperty("document");
   });
 });
 
@@ -460,9 +458,13 @@ describe("/v2/rerank vs /v2/chat", () => {
       model: "rerank-v3.5",
     });
     expect(rerankRes.status).toBe(200);
-    const rerankData = rerankRes.json as { id: string; results: unknown[] };
+    const rerankData = rerankRes.json as {
+      id: string;
+      results: Array<{ index: number; relevance_score: number }>;
+    };
     expect(rerankData.id).toMatch(/^rerank-/);
     expect(rerankData.results).toHaveLength(1);
+    expect(rerankData.results[0]).not.toHaveProperty("document");
 
     // Cohere chat endpoint should still work
     const chatRes = await post(`${url}/v2/chat`, {

@@ -305,6 +305,45 @@ describe("geminiToCompletionRequest", () => {
     expect(result.temperature).toBe(0.7);
   });
 
+  it("forwards generationConfig.maxOutputTokens as max_tokens", () => {
+    const result = geminiToCompletionRequest(
+      {
+        contents: [{ role: "user", parts: [{ text: "hi" }] }],
+        generationConfig: { maxOutputTokens: 1024 },
+      },
+      "gemini-2.0-flash",
+      false,
+    );
+    expect(result.max_tokens).toBe(1024);
+  });
+
+  it("forwards generationConfig.topP and topK", () => {
+    const result = geminiToCompletionRequest(
+      {
+        contents: [{ role: "user", parts: [{ text: "hi" }] }],
+        generationConfig: { topP: 0.95, topK: 40 },
+      },
+      "gemini-2.0-flash",
+      false,
+    );
+    expect(result.top_p).toBe(0.95);
+    expect(result.top_k).toBe(40);
+  });
+
+  it("leaves max_tokens/top_p/top_k undefined when generationConfig omits them", () => {
+    const result = geminiToCompletionRequest(
+      {
+        contents: [{ role: "user", parts: [{ text: "hi" }] }],
+        generationConfig: { temperature: 0.5 },
+      },
+      "gemini-2.0-flash",
+      false,
+    );
+    expect(result.max_tokens).toBeUndefined();
+    expect(result.top_p).toBeUndefined();
+    expect(result.top_k).toBeUndefined();
+  });
+
   it("converts multiple functionResponse parts with unique tool_call_ids", () => {
     const result = geminiToCompletionRequest(
       {
@@ -426,6 +465,20 @@ describe("POST /v1beta/models/{model}:generateContent (non-streaming)", () => {
     expect(body.candidates[0].content.parts).toHaveLength(2);
     expect(body.candidates[0].content.parts[0].functionCall.name).toBe("get_weather");
     expect(body.candidates[0].content.parts[1].functionCall.name).toBe("get_time");
+  });
+
+  it("functionCall parts do NOT contain an id field", async () => {
+    instance = await createServer(allFixtures);
+    const res = await post(`${instance.url}/v1beta/models/gemini-2.0-flash:generateContent`, {
+      contents: [{ role: "user", parts: [{ text: "weather" }] }],
+    });
+
+    const body = JSON.parse(res.body);
+    const fc = body.candidates[0].content.parts[0].functionCall;
+    expect(fc.name).toBe("get_weather");
+    expect(fc.args).toEqual({ city: "NYC" });
+    // Gemini FunctionCall schema only has name + args — no id
+    expect(fc).not.toHaveProperty("id");
   });
 });
 

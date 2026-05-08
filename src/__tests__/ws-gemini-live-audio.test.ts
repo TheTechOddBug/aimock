@@ -175,13 +175,17 @@ describe("WebSocket Gemini Live — audio responses", () => {
       }),
     );
 
-    const raw = await ws.waitForMessages(2);
+    const raw = await ws.waitForMessages(3); // setupComplete + content + turnComplete
     const msg = JSON.parse(raw[1]);
 
     // The handler should process the text part and return a text response
     expect(msg.serverContent).toBeDefined();
     expect(msg.serverContent.modelTurn.parts[0].text).toBe("I heard your audio");
-    expect(msg.serverContent.turnComplete).toBe(true);
+    expect(msg.serverContent.turnComplete).toBeUndefined();
+
+    // Separate turnComplete message
+    const turnCompleteMsg = JSON.parse(raw[2]);
+    expect(turnCompleteMsg.serverContent.turnComplete).toBe(true);
 
     ws.close();
   });

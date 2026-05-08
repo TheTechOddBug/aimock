@@ -87,7 +87,27 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     ws.close();
   });
 
-  it("streams text response with serverContent and turnComplete", async () => {
+  it("responds with setupComplete when using config alias instead of setup", async () => {
+    instance = await createServer(allFixtures);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    // Use "config" instead of "setup"
+    ws.send(JSON.stringify({ config: { model: "gemini-2.0-flash-exp" } }));
+
+    const raw = await ws.waitForMessages(1);
+    const msg = JSON.parse(raw[0]);
+    expect(msg).toEqual({ setupComplete: {} });
+
+    // Verify the session is set up by sending a message
+    ws.send(clientContentMsg("hello"));
+    const raw2 = await ws.waitForMessages(3); // setupComplete + content + turnComplete
+    const contentMsg = JSON.parse(raw2[1]);
+    expect(contentMsg.serverContent).toBeDefined();
+
+    ws.close();
+  });
+
+  it("streams text response with serverContent and separate turnComplete", async () => {
     instance = await createServer(allFixtures);
     const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
 
@@ -96,12 +116,16 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
 
     ws.send(clientContentMsg("hello"));
 
-    // "Hi there!" is 9 chars, default chunkSize=20 → 1 chunk
-    const raw = await ws.waitForMessages(2); // setupComplete + 1 serverContent
-    const msg = JSON.parse(raw[1]);
-    expect(msg.serverContent).toBeDefined();
-    expect(msg.serverContent.modelTurn.parts[0].text).toBe("Hi there!");
-    expect(msg.serverContent.turnComplete).toBe(true);
+    // "Hi there!" is 9 chars, default chunkSize=20 → 1 chunk + 1 turnComplete
+    const raw = await ws.waitForMessages(3); // setupComplete + 1 serverContent + turnComplete
+    const contentMsg = JSON.parse(raw[1]);
+    expect(contentMsg.serverContent).toBeDefined();
+    expect(contentMsg.serverContent.modelTurn.parts[0].text).toBe("Hi there!");
+    expect(contentMsg.serverContent.turnComplete).toBeUndefined();
+
+    const turnCompleteMsg = JSON.parse(raw[2]);
+    expect(turnCompleteMsg.serverContent.turnComplete).toBe(true);
+    expect(turnCompleteMsg.serverContent.modelTurn).toBeUndefined();
 
     ws.close();
   });
@@ -120,25 +144,29 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
 
     ws.send(clientContentMsg("long"));
 
-    // "ABCDEFGHIJ" (10 chars) / chunkSize 3 → 4 chunks: ABC, DEF, GHI, J
-    const raw = await ws.waitForMessages(5); // 1 setupComplete + 4 chunks
-    const chunks = raw.slice(1).map((r) => JSON.parse(r));
+    // "ABCDEFGHIJ" (10 chars) / chunkSize 3 → 4 chunks + 1 turnComplete
+    const raw = await ws.waitForMessages(6); // 1 setupComplete + 4 chunks + 1 turnComplete
+    const contentChunks = raw.slice(1, 5).map((r) => JSON.parse(r));
 
-    // All but last should have turnComplete: false
-    for (let i = 0; i < chunks.length - 1; i++) {
-      expect(chunks[i].serverContent.turnComplete).toBe(false);
+    // Content chunks should NOT have turnComplete
+    for (const chunk of contentChunks) {
+      expect(chunk.serverContent.turnComplete).toBeUndefined();
+      expect(chunk.serverContent.modelTurn).toBeDefined();
     }
-    // Last chunk should have turnComplete: true
-    expect(chunks[chunks.length - 1].serverContent.turnComplete).toBe(true);
 
-    // Reconstruct full text
-    const fullText = chunks.map((c) => c.serverContent.modelTurn.parts[0].text).join("");
+    // Last message is separate turnComplete
+    const turnCompleteMsg = JSON.parse(raw[5]);
+    expect(turnCompleteMsg.serverContent.turnComplete).toBe(true);
+    expect(turnCompleteMsg.serverContent.modelTurn).toBeUndefined();
+
+    // Reconstruct full text from content chunks only
+    const fullText = contentChunks.map((c) => c.serverContent.modelTurn.parts[0].text).join("");
     expect(fullText).toBe("ABCDEFGHIJ");
 
     ws.close();
   });
 
-  it("returns toolCall for tool call fixture", async () => {
+  it("returns toolCall for tool call fixture with turnComplete", async () => {
     instance = await createServer(allFixtures);
     const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
 
@@ -147,13 +175,18 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
 
     ws.send(clientContentMsg("weather"));
 
-    const raw = await ws.waitForMessages(2); // setupComplete + toolCall
+    const raw = await ws.waitForMessages(3); // setupComplete + toolCall + turnComplete
     const msg = JSON.parse(raw[1]);
     expect(msg.toolCall).toBeDefined();
     expect(msg.toolCall.functionCalls).toHaveLength(1);
     expect(msg.toolCall.functionCalls[0].name).toBe("get_weather");
     expect(msg.toolCall.functionCalls[0].args).toEqual({ city: "NYC" });
     expect(msg.toolCall.functionCalls[0].id).toBe("call_gemini_get_weather_0");
+
+    // Separate turnComplete message follows the toolCall
+    const turnCompleteMsg = JSON.parse(raw[2]);
+    expect(turnCompleteMsg.serverContent).toBeDefined();
+    expect(turnCompleteMsg.serverContent.turnComplete).toBe(true);
 
     ws.close();
   });
@@ -165,27 +198,30 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     ws.send(setupMsg());
     await ws.waitForMessages(1);
 
-    // First get a tool call
+    // First get a tool call (+ turnComplete)
     ws.send(clientContentMsg("weather"));
-    await ws.waitForMessages(2); // setupComplete + toolCall
+    await ws.waitForMessages(3); // setupComplete + toolCall + turnComplete
 
     // Send tool response
     ws.send(toolResponseMsg("get_weather", { temp: "72F" }, "call_gemini_get_weather_0"));
 
-    // "Weather in NYC is sunny, 72F" is 28 chars, default chunkSize=20 → 2 chunks
-    const raw = await ws.waitForMessages(4); // setupComplete + toolCall + 2 serverContent
-    const chunks = raw.slice(2).map((r) => JSON.parse(r));
+    // "Weather in NYC is sunny, 72F" is 28 chars, default chunkSize=20 → 2 content chunks + 1 turnComplete
+    const raw = await ws.waitForMessages(6); // setupComplete + toolCall + turnComplete + 2 content + turnComplete
+    const contentChunks = raw.slice(3, 5).map((r) => JSON.parse(r));
 
-    // First chunk: turnComplete false
-    expect(chunks[0].serverContent).toBeDefined();
-    expect(chunks[0].serverContent.turnComplete).toBe(false);
+    // Content chunks should NOT have turnComplete
+    expect(contentChunks[0].serverContent).toBeDefined();
+    expect(contentChunks[0].serverContent.turnComplete).toBeUndefined();
 
-    // Last chunk: turnComplete true
-    expect(chunks[1].serverContent).toBeDefined();
-    expect(chunks[1].serverContent.turnComplete).toBe(true);
+    expect(contentChunks[1].serverContent).toBeDefined();
+    expect(contentChunks[1].serverContent.turnComplete).toBeUndefined();
 
-    // Reconstruct full text
-    const fullText = chunks.map((c) => c.serverContent.modelTurn.parts[0].text).join("");
+    // Separate turnComplete message
+    const turnCompleteMsg = JSON.parse(raw[5]);
+    expect(turnCompleteMsg.serverContent.turnComplete).toBe(true);
+
+    // Reconstruct full text from content chunks
+    const fullText = contentChunks.map((c) => c.serverContent.modelTurn.parts[0].text).join("");
     expect(fullText).toBe("Weather in NYC is sunny, 72F");
 
     ws.close();
@@ -203,7 +239,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(2);
     const msg = JSON.parse(raw[1]);
     expect(msg.error).toBeDefined();
-    expect(msg.error.code).toBe(404);
+    expect(msg.error.code).toBe(5); // gRPC NOT_FOUND
     expect(msg.error.message).toBe("No fixture matched");
     expect(msg.error.status).toBe("NOT_FOUND");
 
@@ -222,7 +258,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(2);
     const msg = JSON.parse(raw[1]);
     expect(msg.error).toBeDefined();
-    expect(msg.error.code).toBe(429);
+    expect(msg.error.code).toBe(8); // gRPC RESOURCE_EXHAUSTED (mapped from HTTP 429)
     expect(msg.error.message).toBe("Rate limited");
     expect(msg.error.status).toBe("RESOURCE_EXHAUSTED");
 
@@ -237,7 +273,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     await ws.waitForMessages(1);
 
     ws.send(clientContentMsg("hello"));
-    await ws.waitForMessages(2);
+    await ws.waitForMessages(3); // setupComplete + content + turnComplete
 
     // Small pause to ensure journal write completed
     await new Promise((r) => setTimeout(r, 50));
@@ -380,7 +416,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(2);
     const msg = JSON.parse(raw[1]);
     expect(msg.error).toBeDefined();
-    expect(msg.error.code).toBe(400);
+    expect(msg.error.code).toBe(3); // gRPC INVALID_ARGUMENT
     expect(msg.error.message).toBe("Missing 'turns' in clientContent");
     expect(msg.error.status).toBe("INVALID_ARGUMENT");
 
@@ -400,7 +436,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(2);
     const msg = JSON.parse(raw[1]);
     expect(msg.error).toBeDefined();
-    expect(msg.error.code).toBe(400);
+    expect(msg.error.code).toBe(3); // gRPC INVALID_ARGUMENT
     expect(msg.error.message).toBe("Missing 'turns' in clientContent");
     expect(msg.error.status).toBe("INVALID_ARGUMENT");
 
@@ -420,7 +456,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(2);
     const msg = JSON.parse(raw[1]);
     expect(msg.error).toBeDefined();
-    expect(msg.error.code).toBe(400);
+    expect(msg.error.code).toBe(3); // gRPC INVALID_ARGUMENT
     expect(msg.error.message).toBe("Missing 'functionResponses' in toolResponse");
     expect(msg.error.status).toBe("INVALID_ARGUMENT");
 
@@ -440,7 +476,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(2);
     const msg = JSON.parse(raw[1]);
     expect(msg.error).toBeDefined();
-    expect(msg.error.code).toBe(400);
+    expect(msg.error.code).toBe(3); // gRPC INVALID_ARGUMENT
     expect(msg.error.message).toBe("Missing 'functionResponses' in toolResponse");
     expect(msg.error.status).toBe("INVALID_ARGUMENT");
 
@@ -459,7 +495,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(2);
     const msg = JSON.parse(raw[1]);
     expect(msg.error).toBeDefined();
-    expect(msg.error.code).toBe(400);
+    expect(msg.error.code).toBe(3); // gRPC INVALID_ARGUMENT
     expect(msg.error.message).toBe("Malformed JSON");
     expect(msg.error.status).toBe("INVALID_ARGUMENT");
 
@@ -479,7 +515,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(2);
     const msg = JSON.parse(raw[1]);
     expect(msg.error).toBeDefined();
-    expect(msg.error.code).toBe(400);
+    expect(msg.error.code).toBe(3); // gRPC INVALID_ARGUMENT
     expect(msg.error.message).toBe("Expected clientContent or toolResponse");
     expect(msg.error.status).toBe("INVALID_ARGUMENT");
 
@@ -511,11 +547,14 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
 
     ws.send(clientContentMsg("empty-content"));
 
-    const raw = await ws.waitForMessages(2);
-    const msg = JSON.parse(raw[1]);
-    expect(msg.serverContent).toBeDefined();
-    expect(msg.serverContent.modelTurn.parts[0].text).toBe("");
-    expect(msg.serverContent.turnComplete).toBe(true);
+    const raw = await ws.waitForMessages(3); // setupComplete + empty content + turnComplete
+    const contentMsg = JSON.parse(raw[1]);
+    expect(contentMsg.serverContent).toBeDefined();
+    expect(contentMsg.serverContent.modelTurn.parts[0].text).toBe("");
+    expect(contentMsg.serverContent.turnComplete).toBeUndefined();
+
+    const turnCompleteMsg = JSON.parse(raw[2]);
+    expect(turnCompleteMsg.serverContent.turnComplete).toBe(true);
 
     ws.close();
   });
@@ -692,6 +731,131 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     ws.close();
   });
 
+  it("maps HTTP 401 to gRPC 16 (UNAUTHENTICATED)", async () => {
+    const fixture: Fixture = {
+      match: { userMessage: "unauth" },
+      response: {
+        error: { message: "Not authenticated", type: "UNAUTHENTICATED" },
+        status: 401,
+      },
+    };
+    instance = await createServer([fixture]);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1);
+
+    ws.send(clientContentMsg("unauth"));
+
+    const raw = await ws.waitForMessages(2);
+    const msg = JSON.parse(raw[1]);
+    expect(msg.error.code).toBe(16);
+    expect(msg.error.message).toBe("Not authenticated");
+    expect(msg.error.status).toBe("UNAUTHENTICATED");
+
+    ws.close();
+  });
+
+  it("maps HTTP 403 to gRPC 7 (PERMISSION_DENIED)", async () => {
+    const fixture: Fixture = {
+      match: { userMessage: "forbidden" },
+      response: {
+        error: { message: "Forbidden", type: "PERMISSION_DENIED" },
+        status: 403,
+      },
+    };
+    instance = await createServer([fixture]);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1);
+
+    ws.send(clientContentMsg("forbidden"));
+
+    const raw = await ws.waitForMessages(2);
+    const msg = JSON.parse(raw[1]);
+    expect(msg.error.code).toBe(7);
+    expect(msg.error.message).toBe("Forbidden");
+    expect(msg.error.status).toBe("PERMISSION_DENIED");
+
+    ws.close();
+  });
+
+  it("maps HTTP 409 to gRPC 10 (ABORTED)", async () => {
+    const fixture: Fixture = {
+      match: { userMessage: "conflict" },
+      response: {
+        error: { message: "Conflict", type: "ABORTED" },
+        status: 409,
+      },
+    };
+    instance = await createServer([fixture]);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1);
+
+    ws.send(clientContentMsg("conflict"));
+
+    const raw = await ws.waitForMessages(2);
+    const msg = JSON.parse(raw[1]);
+    expect(msg.error.code).toBe(10);
+    expect(msg.error.message).toBe("Conflict");
+    expect(msg.error.status).toBe("ABORTED");
+
+    ws.close();
+  });
+
+  it("maps HTTP 501 to gRPC 12 (UNIMPLEMENTED)", async () => {
+    const fixture: Fixture = {
+      match: { userMessage: "not-impl" },
+      response: {
+        error: { message: "Not implemented", type: "UNIMPLEMENTED" },
+        status: 501,
+      },
+    };
+    instance = await createServer([fixture]);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1);
+
+    ws.send(clientContentMsg("not-impl"));
+
+    const raw = await ws.waitForMessages(2);
+    const msg = JSON.parse(raw[1]);
+    expect(msg.error.code).toBe(12);
+    expect(msg.error.message).toBe("Not implemented");
+    expect(msg.error.status).toBe("UNIMPLEMENTED");
+
+    ws.close();
+  });
+
+  it("maps HTTP 503 to gRPC 14 (UNAVAILABLE)", async () => {
+    const fixture: Fixture = {
+      match: { userMessage: "unavailable" },
+      response: {
+        error: { message: "Service unavailable", type: "UNAVAILABLE" },
+        status: 503,
+      },
+    };
+    instance = await createServer([fixture]);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1);
+
+    ws.send(clientContentMsg("unavailable"));
+
+    const raw = await ws.waitForMessages(2);
+    const msg = JSON.parse(raw[1]);
+    expect(msg.error.code).toBe(14);
+    expect(msg.error.message).toBe("Service unavailable");
+    expect(msg.error.status).toBe("UNAVAILABLE");
+
+    ws.close();
+  });
+
   it("handles error fixture with default status 500", async () => {
     const errorNoStatusFixture: Fixture = {
       match: { userMessage: "error-no-status" },
@@ -710,7 +874,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(2);
     const msg = JSON.parse(raw[1]);
     expect(msg.error).toBeDefined();
-    expect(msg.error.code).toBe(500);
+    expect(msg.error.code).toBe(13); // gRPC INTERNAL (mapped from HTTP 500)
     expect(msg.error.message).toBe("Something went wrong");
 
     ws.close();
@@ -845,7 +1009,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(2);
     const msg = JSON.parse(raw[1]);
     expect(msg.error).toBeDefined();
-    expect(msg.error.code).toBe(500);
+    expect(msg.error.code).toBe(13); // gRPC INTERNAL
     expect(msg.error.message).toBe("Fixture response did not match any known type");
     expect(msg.error.status).toBe("INTERNAL");
 
@@ -862,7 +1026,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(1);
     const msg = JSON.parse(raw[0]);
     expect(msg.error).toBeDefined();
-    expect(msg.error.code).toBe(400);
+    expect(msg.error.code).toBe(9); // gRPC FAILED_PRECONDITION
     expect(msg.error.message).toBe("Setup required");
     expect(msg.error.status).toBe("FAILED_PRECONDITION");
 

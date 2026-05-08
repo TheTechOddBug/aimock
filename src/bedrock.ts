@@ -269,7 +269,7 @@ function buildBedrockTextResponse(
 ): object {
   const contentBlocks: object[] = [];
   if (reasoning) {
-    contentBlocks.push({ type: "thinking", thinking: reasoning });
+    contentBlocks.push({ type: "thinking", thinking: reasoning, signature: "" });
   }
   contentBlocks.push({ type: "text", text: content });
 
@@ -683,7 +683,7 @@ export function buildBedrockStreamTextEvents(
       payload: {
         type: "content_block_start",
         index: blockIndex,
-        content_block: { type: "thinking", thinking: "" },
+        content_block: { type: "thinking", thinking: "", signature: "" },
       },
     });
 
@@ -698,6 +698,15 @@ export function buildBedrockStreamTextEvents(
         },
       });
     }
+
+    events.push({
+      eventType: BEDROCK_INVOKE_STREAM_EVENT_TYPE,
+      payload: {
+        type: "content_block_delta",
+        index: blockIndex,
+        delta: { type: "signature_delta", signature: "" },
+      },
+    });
 
     events.push({
       eventType: BEDROCK_INVOKE_STREAM_EVENT_TYPE,
@@ -764,7 +773,7 @@ export function buildBedrockStreamContentWithToolCallsEvents(
       payload: {
         type: "content_block_start",
         index: blockIndex,
-        content_block: { type: "thinking", thinking: "" },
+        content_block: { type: "thinking", thinking: "", signature: "" },
       },
     });
     for (let i = 0; i < reasoning.length; i += chunkSize) {
@@ -778,6 +787,14 @@ export function buildBedrockStreamContentWithToolCallsEvents(
         },
       });
     }
+    events.push({
+      eventType: BEDROCK_INVOKE_STREAM_EVENT_TYPE,
+      payload: {
+        type: "content_block_delta",
+        index: blockIndex,
+        delta: { type: "signature_delta", signature: "" },
+      },
+    });
     events.push({
       eventType: BEDROCK_INVOKE_STREAM_EVENT_TYPE,
       payload: { type: "content_block_stop", index: blockIndex },

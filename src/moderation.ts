@@ -40,6 +40,8 @@ const DEFAULT_RESULT: ModerationResult = {
     "self-harm/instructions": false,
     "harassment/threatening": false,
     violence: false,
+    illicit: false,
+    "illicit/violent": false,
   },
   category_scores: {
     sexual: 0,
@@ -53,6 +55,8 @@ const DEFAULT_RESULT: ModerationResult = {
     "self-harm/instructions": 0,
     "harassment/threatening": 0,
     violence: 0,
+    illicit: 0,
+    "illicit/violent": 0,
   },
 };
 

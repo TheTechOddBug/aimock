@@ -1,5 +1,28 @@
 # @copilotkit/aimock
 
+## [1.19.5] - 2026-05-09
+
+### Fixed
+
+- **Responses API request conversion** — forward `max_output_tokens` and `response_format` from Responses requests to the underlying Chat Completions call
+- **Gemini request conversion** — forward `maxOutputTokens`, `topP`, `topK` from `generationConfig`; remove synthetic `functionCall.id` that real Gemini does not produce
+- **Cohere request conversion** — structured content (images, documents), native tool definitions, `temperature`, `max_tokens`, and `stop_sequences` now forwarded
+- **Ollama request conversion** — `tool_calls` on assistant messages, base64 `images` on user messages, `system` parameter on `/api/generate`
+- **Chat Completions error responses** — add `param` field per OpenAI error spec
+- **Moderation response shape** — correct `categories` and `category_scores` to match the real OpenAI moderation object (boolean flags + float scores)
+- **Transcription verbose response** — add `task`, `duration`, `segments`, `words` fields for `verbose_json` format
+- **Search response shape** — add `status` field to search results
+- **Rerank response shape** — wrap results in `{ results: [...] }` with `relevance_score` per result
+- **Realtime WebSocket** — add `previous_item_id` to conversation items, correct event ID prefixes, add missing fields on session and response events
+- **Gemini Live WebSocket** — `generationConfig` alias for `generation_config`, `turnComplete` server event, correct gRPC status codes in error events, complete `httpToGrpc` mapper
+- **Anthropic thinking blocks** — add `signature` field to `thinking` content blocks and `signature_delta` event type for extended thinking with signatures
+
+### Added
+
+- **Drift tests for 9 multimedia/auxiliary providers** — images, speech/TTS, transcription/STT, moderation, ElevenLabs audio, fal.ai, fal.ai queue lifecycle, video, rerank
+- **Error shape drift tests** — OpenAI Chat, Anthropic Claude, Gemini, Cohere error response shapes validated against SDK types
+- **Reasoning/thinking drift tests** — OpenAI Chat `reasoning_effort`, OpenAI Responses `reasoning`, Anthropic `thinking` content blocks, Gemini `thinking_config`
+
 ## [1.19.4] - 2026-05-08
 
 ### Fixed

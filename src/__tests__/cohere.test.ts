@@ -1734,3 +1734,228 @@ describe("Cohere ResponseOverrides", () => {
     expect(json.finish_reason).toBe("COMPLETE");
   });
 });
+
+// ─── Fix: structured content extraction ───────────────────────────────────
+
+describe("cohereToCompletionRequest (structured content)", () => {
+  it("extracts text from array-of-parts content", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Hello " },
+            { type: "text", text: "world" },
+          ],
+        },
+      ],
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.messages[0].content).toBe("Hello world");
+  });
+
+  it("ignores non-text parts in structured content", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", text: undefined },
+            { type: "text", text: "Only this" },
+          ],
+        },
+      ],
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.messages[0].content).toBe("Only this");
+  });
+
+  it("handles string content unchanged", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [{ role: "user", content: "plain string" }],
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.messages[0].content).toBe("plain string");
+  });
+
+  it("extracts structured content for system messages", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [
+        {
+          role: "system",
+          content: [{ type: "text", text: "Be helpful" }],
+        },
+        { role: "user", content: "hi" },
+      ],
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.messages[0].content).toBe("Be helpful");
+  });
+
+  it("extracts structured content for assistant messages", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Hello!" }],
+        },
+      ],
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.messages[1].content).toBe("Hello!");
+  });
+
+  it("extracts structured content for tool messages", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [
+        {
+          role: "tool",
+          content: [{ type: "text", text: '{"result":42}' }],
+          tool_call_id: "call_1",
+        },
+      ],
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.messages[0].content).toBe('{"result":42}');
+  });
+});
+
+// ─── Fix: Cohere v2 native tool format ────────────────────────────────────
+
+describe("cohereToCompletionRequest (native Cohere v2 tools)", () => {
+  it("converts Cohere v2 native tool format (parameter_definitions)", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [
+        {
+          name: "get_weather",
+          description: "Get the weather",
+          parameter_definitions: {
+            city: { type: "str", description: "City name", required: true },
+          },
+        },
+      ],
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.tools).toHaveLength(1);
+    expect(result.tools![0]).toEqual({
+      type: "function",
+      function: {
+        name: "get_weather",
+        description: "Get the weather",
+        parameters: {
+          city: { type: "str", description: "City name", required: true },
+        },
+      },
+    });
+  });
+
+  it("still accepts OpenAI-style tool format", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "search",
+            description: "Search things",
+            parameters: { type: "object", properties: { q: { type: "string" } } },
+          },
+        },
+      ],
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.tools).toHaveLength(1);
+    expect(result.tools![0].function.name).toBe("search");
+    expect(result.tools![0].function.parameters).toEqual({
+      type: "object",
+      properties: { q: { type: "string" } },
+    });
+  });
+
+  it("handles mixed OpenAI and native tool formats", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "openai_tool",
+            description: "OpenAI style",
+          },
+        },
+        {
+          name: "native_tool",
+          description: "Cohere native",
+          parameter_definitions: { x: { type: "int" } },
+        },
+      ],
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.tools).toHaveLength(2);
+    expect(result.tools![0].function.name).toBe("openai_tool");
+    expect(result.tools![1].function.name).toBe("native_tool");
+    expect(result.tools![1].function.parameters).toEqual({ x: { type: "int" } });
+  });
+});
+
+// ─── Fix: temperature forwarding ──────────────────────────────────────────
+
+describe("cohereToCompletionRequest (temperature)", () => {
+  it("forwards temperature to ChatCompletionRequest", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [{ role: "user", content: "hello" }],
+      temperature: 0.7,
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.temperature).toBe(0.7);
+  });
+
+  it("forwards temperature=0", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [{ role: "user", content: "hello" }],
+      temperature: 0,
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.temperature).toBe(0);
+  });
+
+  it("omits temperature when not provided", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [{ role: "user", content: "hello" }],
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.temperature).toBeUndefined();
+  });
+});
+
+// ─── Fix: max_tokens forwarding ───────────────────────────────────────────
+
+describe("cohereToCompletionRequest (max_tokens)", () => {
+  it("forwards max_tokens to ChatCompletionRequest", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [{ role: "user", content: "hello" }],
+      max_tokens: 1024,
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.max_tokens).toBe(1024);
+  });
+
+  it("forwards max_tokens=0", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [{ role: "user", content: "hello" }],
+      max_tokens: 0,
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.max_tokens).toBe(0);
+  });
+
+  it("omits max_tokens when not provided", () => {
+    const result = cohereToCompletionRequest({
+      model: "command-r-plus",
+      messages: [{ role: "user", content: "hello" }],
+    } as Parameters<typeof cohereToCompletionRequest>[0]);
+    expect(result.max_tokens).toBeUndefined();
+  });
+});

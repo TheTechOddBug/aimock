@@ -373,6 +373,7 @@ describe("POST /model/{id}/invoke (reasoning non-streaming)", () => {
     expect(body.content).toHaveLength(2);
     expect(body.content[0].type).toBe("thinking");
     expect(body.content[0].thinking).toBe("Let me think step by step about this problem.");
+    expect(body.content[0].signature).toBe("");
     expect(body.content[1].type).toBe("text");
     expect(body.content[1].text).toBe("The answer is 42.");
   });
@@ -457,6 +458,12 @@ describe("POST /model/{id}/invoke-with-response-stream (reasoning streaming)", (
     expect(thinkingStartIdx).toBeGreaterThan(0);
     expect(textStartIdx).toBeGreaterThan(thinkingStartIdx);
 
+    // Verify thinking content_block_start has signature field
+    const thinkingStartPayload = frames[thinkingStartIdx].payload as {
+      content_block: { type: string; thinking: string; signature: string };
+    };
+    expect(thinkingStartPayload.content_block.signature).toBe("");
+
     // Verify thinking content
     const thinkingDeltas = frames.filter(
       (f) =>
@@ -467,6 +474,17 @@ describe("POST /model/{id}/invoke-with-response-stream (reasoning streaming)", (
       .map((f) => (f.payload as { delta: { thinking: string } }).delta.thinking)
       .join("");
     expect(fullThinking).toBe("Let me think step by step about this problem.");
+
+    // Verify signature_delta event is present
+    const signatureDeltas = frames.filter(
+      (f) =>
+        (f.payload as { type?: string }).type === "content_block_delta" &&
+        (f.payload as { delta?: { type?: string } }).delta?.type === "signature_delta",
+    );
+    expect(signatureDeltas).toHaveLength(1);
+    expect((signatureDeltas[0].payload as { delta: { signature: string } }).delta.signature).toBe(
+      "",
+    );
 
     // Verify text content
     const textDeltas = frames.filter(
@@ -772,7 +790,7 @@ describe("buildBedrockStreamTextEvents (reasoning)", () => {
       payload: {
         type: "content_block_start",
         index: 0,
-        content_block: { type: "thinking", thinking: "" },
+        content_block: { type: "thinking", thinking: "", signature: "" },
       },
     });
     expect(events[2]).toEqual({
@@ -785,11 +803,19 @@ describe("buildBedrockStreamTextEvents (reasoning)", () => {
     });
     expect(events[3]).toEqual({
       eventType: "chunk",
+      payload: {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "signature_delta", signature: "" },
+      },
+    });
+    expect(events[4]).toEqual({
+      eventType: "chunk",
       payload: { type: "content_block_stop", index: 0 },
     });
 
     // Text block at index 1
-    expect(events[4]).toEqual({
+    expect(events[5]).toEqual({
       eventType: "chunk",
       payload: {
         type: "content_block_start",
@@ -797,7 +823,7 @@ describe("buildBedrockStreamTextEvents (reasoning)", () => {
         content_block: { type: "text", text: "" },
       },
     });
-    expect(events[5]).toEqual({
+    expect(events[6]).toEqual({
       eventType: "chunk",
       payload: {
         type: "content_block_delta",
@@ -805,12 +831,12 @@ describe("buildBedrockStreamTextEvents (reasoning)", () => {
         delta: { type: "text_delta", text: "The answer." },
       },
     });
-    expect(events[6]).toEqual({
+    expect(events[7]).toEqual({
       eventType: "chunk",
       payload: { type: "content_block_stop", index: 1 },
     });
 
-    expect(types.slice(7)).toEqual(["message_delta", "message_stop"]);
+    expect(types.slice(8)).toEqual(["message_delta", "message_stop"]);
   });
 
   it("no thinking block when reasoning is absent", () => {

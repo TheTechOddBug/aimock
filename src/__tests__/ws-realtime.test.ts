@@ -120,16 +120,21 @@ describe("WebSocket /v1/realtime", () => {
     expect(event.type).toBe("session.created");
     expect(event.event_id).toBeDefined();
     expect(typeof event.event_id).toBe("string");
-    expect((event.event_id as string).startsWith("evt-")).toBe(true);
+    expect((event.event_id as string).startsWith("event_")).toBe(true);
 
     const session = event.session as Record<string, unknown>;
     expect(session.id).toBeDefined();
-    expect((session.id as string).startsWith("sess-")).toBe(true);
+    expect((session.id as string).startsWith("sess_")).toBe(true);
+    expect(session.object).toBe("realtime.session");
     expect(session.modalities).toEqual(["text"]);
     expect(session.instructions).toBe("");
     expect(session.tools).toEqual([]);
     expect(session.voice).toBeNull();
     expect(session.temperature).toBe(0.8);
+    expect(typeof session.expires_at).toBe("number");
+    expect(session.max_response_output_tokens).toBe("inf");
+    expect(session.input_audio_transcription).toBeNull();
+    expect(session.tool_choice).toBe("auto");
 
     ws.close();
   });
@@ -155,6 +160,11 @@ describe("WebSocket /v1/realtime", () => {
     const session = event.session as Record<string, unknown>;
     expect(session.instructions).toBe("You are helpful.");
     expect(session.tools).toEqual([{ type: "function", name: "get_weather" }]);
+    expect(session.object).toBe("realtime.session");
+    expect(typeof session.expires_at).toBe("number");
+    expect(session.max_response_output_tokens).toBe("inf");
+    expect(session.input_audio_transcription).toBeNull();
+    expect(session.tool_choice).toBe("auto");
 
     ws.close();
   });
@@ -197,11 +207,46 @@ describe("WebSocket /v1/realtime", () => {
     const fullText = deltas.map((d) => d.delta).join("");
     expect(fullText).toBe("Hi there!");
 
-    // Verify response.done contains completed response
+    // Verify response.created has correct response resource fields
+    const createdEvent = responseEvents[0];
+    const createdResp = createdEvent.response as Record<string, unknown>;
+    expect(createdResp.object).toBe("realtime.response");
+    expect(createdResp.status).toBe("in_progress");
+    expect(createdResp.status_details).toBeNull();
+    expect(createdResp.usage).toBeNull();
+    expect((createdResp.id as string).startsWith("resp_")).toBe(true);
+
+    // Verify output_item.added has status "in_progress"
+    const addedEvent = responseEvents.find((e) => e.type === "response.output_item.added");
+    const addedItem = addedEvent!.item as Record<string, unknown>;
+    expect(addedItem.status).toBe("in_progress");
+
+    // Verify output_item.done has status "completed"
+    const doneItemEvent = responseEvents.find((e) => e.type === "response.output_item.done");
+    const doneItem = doneItemEvent!.item as Record<string, unknown>;
+    expect(doneItem.status).toBe("completed");
+
+    // Verify response.done contains completed response with new fields
     const doneEvent = responseEvents[responseEvents.length - 1];
     const resp = doneEvent.response as Record<string, unknown>;
     expect(resp.status).toBe("completed");
+    expect(resp.object).toBe("realtime.response");
+    expect(resp.usage).toEqual({ total_tokens: 0, input_tokens: 0, output_tokens: 0 });
     expect(Array.isArray(resp.output)).toBe(true);
+
+    // Verify conversation.item.created has previous_item_id (null for first item)
+    const itemCreatedEvent = parseEvents(allRaw.slice(1, 2))[0];
+    expect(itemCreatedEvent.type).toBe("conversation.item.created");
+    expect(itemCreatedEvent.previous_item_id).toBeNull();
+
+    // Send a second item and verify previous_item_id points to the last conversation item
+    // (the assistant response item pushed during handleResponseCreate)
+    const assistantItemId = (doneItem as Record<string, unknown>).id as string;
+    ws.send(conversationItemCreate("user", "how are you?"));
+    const secondAckRaw = await ws.waitForMessages(allRaw.length + 1);
+    const secondAckEvent = JSON.parse(secondAckRaw[secondAckRaw.length - 1]) as WSEvent;
+    expect(secondAckEvent.type).toBe("conversation.item.created");
+    expect(secondAckEvent.previous_item_id).toBe(assistantItemId);
 
     ws.close();
   });
@@ -239,11 +284,28 @@ describe("WebSocket /v1/realtime", () => {
     const fullArgs = argDeltas.map((d) => d.delta).join("");
     expect(fullArgs).toBe('{"city":"NYC"}');
 
-    // Verify output_item.added has function_call type
+    // Verify output_item.added has function_call type and status
     const addedItem = responseEvents.find((e) => e.type === "response.output_item.added");
     const item = addedItem!.item as Record<string, unknown>;
     expect(item.type).toBe("function_call");
     expect(item.name).toBe("get_weather");
+    expect(item.status).toBe("in_progress");
+
+    // Verify output_item.done has status "completed"
+    const doneItemEvent = responseEvents.find((e) => e.type === "response.output_item.done");
+    const doneItem = doneItemEvent!.item as Record<string, unknown>;
+    expect(doneItem.status).toBe("completed");
+
+    // Verify response.created has object and usage fields
+    const createdResp = responseEvents[0].response as Record<string, unknown>;
+    expect(createdResp.object).toBe("realtime.response");
+    expect(createdResp.status_details).toBeNull();
+    expect(createdResp.usage).toBeNull();
+
+    // Verify response.done has object and usage fields
+    const doneResp = responseEvents[responseEvents.length - 1].response as Record<string, unknown>;
+    expect(doneResp.object).toBe("realtime.response");
+    expect(doneResp.usage).toEqual({ total_tokens: 0, input_tokens: 0, output_tokens: 0 });
 
     ws.close();
   });
@@ -267,10 +329,15 @@ describe("WebSocket /v1/realtime", () => {
     expect(responseEvents[0].type).toBe("response.created");
     const resp = responseEvents[0].response as Record<string, unknown>;
     expect(resp.status).toBe("failed");
+    expect(resp.object).toBe("realtime.response");
+    expect(resp.status_details).toBeNull();
+    expect(resp.usage).toBeNull();
 
     expect(responseEvents[1].type).toBe("response.done");
     const doneResp = responseEvents[1].response as Record<string, unknown>;
     expect(doneResp.status).toBe("failed");
+    expect(doneResp.object).toBe("realtime.response");
+    expect(doneResp.usage).toEqual({ total_tokens: 0, input_tokens: 0, output_tokens: 0 });
     const details = doneResp.status_details as Record<string, unknown>;
     expect(details.type).toBe("error");
     const error = details.error as Record<string, unknown>;
@@ -296,10 +363,16 @@ describe("WebSocket /v1/realtime", () => {
     const responseEvents = parseEvents(allRaw.slice(2));
 
     expect(responseEvents[0].type).toBe("response.created");
-    expect(responseEvents[1].type).toBe("response.done");
+    const createdResp = responseEvents[0].response as Record<string, unknown>;
+    expect(createdResp.object).toBe("realtime.response");
+    expect(createdResp.status_details).toBeNull();
+    expect(createdResp.usage).toBeNull();
 
+    expect(responseEvents[1].type).toBe("response.done");
     const doneResp = responseEvents[1].response as Record<string, unknown>;
     expect(doneResp.status).toBe("failed");
+    expect(doneResp.object).toBe("realtime.response");
+    expect(doneResp.usage).toEqual({ total_tokens: 0, input_tokens: 0, output_tokens: 0 });
     const details = doneResp.status_details as Record<string, unknown>;
     const error = details.error as Record<string, unknown>;
     expect(error.message).toBe("Rate limited");
@@ -639,7 +712,7 @@ describe("WebSocket /v1/realtime", () => {
     expect(event.type).toBe("conversation.item.created");
     const item = event.item as Record<string, unknown>;
     expect(item.id).toBeDefined();
-    expect((item.id as string).startsWith("item-")).toBe(true);
+    expect((item.id as string).startsWith("item_")).toBe(true);
 
     ws.close();
   });
@@ -665,6 +738,11 @@ describe("WebSocket /v1/realtime", () => {
     expect(session.modalities).toEqual(["text", "audio"]);
     expect(session.model).toBe("gpt-4o-mini-realtime");
     expect(session.temperature).toBe(0.5);
+    expect(session.object).toBe("realtime.session");
+    expect(typeof session.expires_at).toBe("number");
+    expect(session.max_response_output_tokens).toBe("inf");
+    expect(session.input_audio_transcription).toBeNull();
+    expect(session.tool_choice).toBe("auto");
 
     ws.close();
   });

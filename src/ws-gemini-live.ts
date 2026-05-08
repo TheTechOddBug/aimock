@@ -78,6 +78,7 @@ interface GeminiLiveToolResponse {
 
 interface GeminiLiveMessage {
   setup?: GeminiLiveSetup;
+  config?: GeminiLiveSetup;
   clientContent?: GeminiLiveClientContent;
   toolResponse?: GeminiLiveToolResponse;
 }
@@ -94,6 +95,33 @@ interface SessionState {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 const WS_PATH = "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+
+/**
+ * Map HTTP status codes to gRPC error codes.
+ * Gemini Live uses gRPC codes, not HTTP status codes.
+ */
+function httpToGrpc(httpCode: number): number {
+  switch (httpCode) {
+    case 400:
+      return 3; // INVALID_ARGUMENT
+    case 401:
+      return 16; // UNAUTHENTICATED
+    case 403:
+      return 7; // PERMISSION_DENIED
+    case 404:
+      return 5; // NOT_FOUND
+    case 409:
+      return 10; // ABORTED
+    case 429:
+      return 8; // RESOURCE_EXHAUSTED
+    case 501:
+      return 12; // UNIMPLEMENTED
+    case 503:
+      return 14; // UNAVAILABLE
+    default:
+      return 13; // INTERNAL
+  }
+}
 
 /**
  * Convert Gemini Live turns into ChatMessage[] for fixture matching.
@@ -217,7 +245,7 @@ export function handleWebSocketGeminiLive(
         try {
           ws.send(
             JSON.stringify({
-              error: { code: 500, message: msg, status: "INTERNAL" },
+              error: { code: 13, message: msg, status: "INTERNAL" },
             }),
           );
         } catch {
@@ -250,17 +278,18 @@ async function processMessage(
   } catch {
     ws.send(
       JSON.stringify({
-        error: { code: 400, message: "Malformed JSON", status: "INVALID_ARGUMENT" },
+        error: { code: 3, message: "Malformed JSON", status: "INVALID_ARGUMENT" },
       }),
     );
     return;
   }
 
-  // Handle setup message
-  if (parsed.setup) {
+  // Handle setup message (accept both `setup` and `config` as aliases)
+  const setupMsg = parsed.setup ?? parsed.config;
+  if (setupMsg) {
     session.setupDone = true;
-    session.model = parsed.setup.model ?? defaults.model;
-    session.tools = convertTools(parsed.setup.tools);
+    session.model = setupMsg.model ?? defaults.model;
+    session.tools = convertTools(setupMsg.tools);
     ws.send(JSON.stringify({ setupComplete: {} }));
     return;
   }
@@ -269,7 +298,7 @@ async function processMessage(
   if (!session.setupDone) {
     ws.send(
       JSON.stringify({
-        error: { code: 400, message: "Setup required", status: "FAILED_PRECONDITION" },
+        error: { code: 9, message: "Setup required", status: "FAILED_PRECONDITION" },
       }),
     );
     return;
@@ -283,7 +312,7 @@ async function processMessage(
       ws.send(
         JSON.stringify({
           error: {
-            code: 400,
+            code: 3,
             message: "Missing 'turns' in clientContent",
             status: "INVALID_ARGUMENT",
           },
@@ -300,7 +329,7 @@ async function processMessage(
       ws.send(
         JSON.stringify({
           error: {
-            code: 400,
+            code: 3,
             message: "Missing 'functionResponses' in toolResponse",
             status: "INVALID_ARGUMENT",
           },
@@ -313,7 +342,7 @@ async function processMessage(
     ws.send(
       JSON.stringify({
         error: {
-          code: 400,
+          code: 3,
           message: "Expected clientContent or toolResponse",
           status: "INVALID_ARGUMENT",
         },
@@ -365,7 +394,7 @@ async function processMessage(
     });
     ws.send(
       JSON.stringify({
-        error: { code: 404, message: "No fixture matched", status: "NOT_FOUND" },
+        error: { code: 5, message: "No fixture matched", status: "NOT_FOUND" },
       }),
     );
     return;
@@ -391,7 +420,7 @@ async function processMessage(
     ws.send(
       JSON.stringify({
         error: {
-          code: status,
+          code: httpToGrpc(status),
           message: response.error.message,
           status: response.error.type ?? "INTERNAL",
         },
@@ -459,14 +488,13 @@ async function processMessage(
     const interruption = createInterruptionSignal(fixture);
     let interrupted = false;
 
-    // Stream text content chunks
+    // Stream text content chunks (turnComplete omitted — sent as a separate message later)
     if (content.length === 0) {
       if (!ws.isClosed) {
         ws.send(
           JSON.stringify({
             serverContent: {
               modelTurn: { parts: [{ text: "" }] },
-              turnComplete: false,
             },
           }),
         );
@@ -485,7 +513,6 @@ async function processMessage(
           JSON.stringify({
             serverContent: {
               modelTurn: { parts: [{ text: chunkList[i] }] },
-              turnComplete: false,
             },
           }),
         );
@@ -592,12 +619,17 @@ async function processMessage(
 
     if (content.length === 0) {
       if (ws.isClosed) return;
+      // Empty content: send empty modelTurn, then separate turnComplete
       ws.send(
         JSON.stringify({
           serverContent: {
             modelTurn: { parts: [{ text: "" }] },
-            turnComplete: true,
           },
+        }),
+      );
+      ws.send(
+        JSON.stringify({
+          serverContent: { turnComplete: true },
         }),
       );
       return;
@@ -612,6 +644,7 @@ async function processMessage(
     const interruption = createInterruptionSignal(fixture);
     let interrupted = false;
 
+    // Stream content chunks without turnComplete (sent separately after)
     for (let i = 0; i < chunks.length; i++) {
       if (ws.isClosed) break;
       if (latency > 0) await delay(latency, interruption?.signal);
@@ -621,12 +654,10 @@ async function processMessage(
       }
       if (ws.isClosed) break;
 
-      const isLast = i === chunks.length - 1;
       ws.send(
         JSON.stringify({
           serverContent: {
             modelTurn: { parts: [{ text: chunks[i] }] },
-            turnComplete: isLast,
           },
         }),
       );
@@ -646,6 +677,15 @@ async function processMessage(
     }
 
     interruption?.cleanup();
+
+    // Send separate turnComplete message
+    if (!ws.isClosed) {
+      ws.send(
+        JSON.stringify({
+          serverContent: { turnComplete: true },
+        }),
+      );
+    }
 
     // Add assistant response to conversation history
     session.conversationHistory.push({ role: "assistant", content });
@@ -711,6 +751,15 @@ async function processMessage(
 
     interruption?.cleanup();
 
+    // Send turnComplete after tool call
+    if (!ws.isClosed) {
+      ws.send(
+        JSON.stringify({
+          serverContent: { turnComplete: true },
+        }),
+      );
+    }
+
     // Add assistant tool_calls to conversation history
     session.conversationHistory.push({
       role: "assistant",
@@ -738,7 +787,7 @@ async function processMessage(
   ws.send(
     JSON.stringify({
       error: {
-        code: 500,
+        code: 13,
         message: "Fixture response did not match any known type",
         status: "INTERNAL",
       },

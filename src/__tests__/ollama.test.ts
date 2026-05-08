@@ -1843,3 +1843,143 @@ describe("handleOllamaGenerate (direct handler call, method/url fallbacks)", () 
     expect(entry!.response.status).toBe(500);
   });
 });
+
+// ─── Fix: tool_calls on assistant messages preserved in conversion ───────────
+
+describe("ollamaToCompletionRequest (tool_calls on assistant messages)", () => {
+  it("maps inbound tool_calls to ChatMessage.tool_calls with stringified arguments", () => {
+    const result = ollamaToCompletionRequest({
+      model: "llama3",
+      messages: [
+        { role: "user", content: "weather?" },
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [{ function: { name: "get_weather", arguments: { city: "NYC" } } }],
+        },
+        { role: "tool", content: '{"temp": 72}' },
+      ],
+    });
+
+    expect(result.messages).toHaveLength(3);
+
+    const assistantMsg = result.messages[1];
+    expect(assistantMsg.tool_calls).toHaveLength(1);
+    expect(assistantMsg.tool_calls![0].id).toBe("call_0");
+    expect(assistantMsg.tool_calls![0].type).toBe("function");
+    expect(assistantMsg.tool_calls![0].function.name).toBe("get_weather");
+    // Arguments must be stringified JSON
+    expect(assistantMsg.tool_calls![0].function.arguments).toBe('{"city":"NYC"}');
+  });
+
+  it("handles string arguments without double-encoding", () => {
+    const result = ollamaToCompletionRequest({
+      model: "llama3",
+      messages: [
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [{ function: { name: "fn", arguments: '{"x":1}' } }],
+        },
+      ],
+    });
+
+    const assistantMsg = result.messages[0];
+    expect(assistantMsg.tool_calls).toHaveLength(1);
+    // Already a string — should pass through as-is
+    expect(assistantMsg.tool_calls![0].function.arguments).toBe('{"x":1}');
+  });
+
+  it("assigns sequential ids for multiple tool_calls", () => {
+    const result = ollamaToCompletionRequest({
+      model: "llama3",
+      messages: [
+        {
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            { function: { name: "fn_a", arguments: {} } },
+            { function: { name: "fn_b", arguments: { y: 2 } } },
+          ],
+        },
+      ],
+    });
+
+    const assistantMsg = result.messages[0];
+    expect(assistantMsg.tool_calls).toHaveLength(2);
+    expect(assistantMsg.tool_calls![0].id).toBe("call_0");
+    expect(assistantMsg.tool_calls![1].id).toBe("call_1");
+    expect(assistantMsg.tool_calls![0].function.name).toBe("fn_a");
+    expect(assistantMsg.tool_calls![1].function.name).toBe("fn_b");
+  });
+
+  it("does not add tool_calls when absent", () => {
+    const result = ollamaToCompletionRequest({
+      model: "llama3",
+      messages: [{ role: "user", content: "hi" }],
+    });
+
+    expect(result.messages[0].tool_calls).toBeUndefined();
+  });
+});
+
+// ─── Fix: images field preserved on OllamaMessage ─────────────────────────
+
+describe("ollamaToCompletionRequest (images field)", () => {
+  it("preserves images on message objects through parsing", () => {
+    // The images field is on the OllamaMessage interface — verify it parses
+    // without error by round-tripping through the conversion.
+    const result = ollamaToCompletionRequest({
+      model: "llava",
+      messages: [
+        {
+          role: "user",
+          content: "describe this image",
+          images: ["iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"],
+        },
+      ],
+    });
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].content).toBe("describe this image");
+    expect(result.model).toBe("llava");
+  });
+});
+
+// ─── Fix: system and images on /api/generate ────────────────────────────────
+
+describe("POST /api/generate (system field)", () => {
+  it("prepends system message in conversion so fixture matching sees it", async () => {
+    const systemFixture: Fixture = {
+      match: {
+        predicate: (req) =>
+          req.messages[0]?.role === "system" && req.messages[0]?.content === "You are a pirate",
+      },
+      response: { content: "Ahoy!" },
+    };
+    instance = await createServer([systemFixture]);
+    const res = await post(`${instance.url}/api/generate`, {
+      model: "llama3",
+      prompt: "greet me",
+      system: "You are a pirate",
+      stream: false,
+    });
+
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.response).toBe("Ahoy!");
+  });
+
+  it("works without system field (no extra message prepended)", async () => {
+    instance = await createServer(allFixtures);
+    const res = await post(`${instance.url}/api/generate`, {
+      model: "llama3",
+      prompt: "hello",
+      stream: false,
+    });
+
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.response).toBe("Hi there!");
+  });
+});

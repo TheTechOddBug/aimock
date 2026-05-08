@@ -100,5 +100,13 @@ export async function handleSearch(
   });
 
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ results: matchedResults }));
+  res.end(
+    JSON.stringify({
+      query,
+      results: matchedResults,
+      images: [],
+      response_time: 0,
+      answer: null,
+    }),
+  );
 }

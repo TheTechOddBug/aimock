@@ -37,9 +37,9 @@ export async function handleRerank(
   const { logger } = defaults;
   setCorsHeaders(res);
 
-  let body: { query?: string; documents?: unknown[]; model?: string };
+  let body: { query?: string; model?: string };
   try {
-    body = JSON.parse(raw) as { query?: string; documents?: unknown[]; model?: string };
+    body = JSON.parse(raw) as { query?: string; model?: string };
   } catch {
     journal.add({
       method: req.method ?? "POST",
@@ -63,7 +63,6 @@ export async function handleRerank(
   }
 
   const query = body.query ?? "";
-  const documents = body.documents ?? [];
 
   // Find first matching fixture
   let matchedResults: RerankResult[] = [];
@@ -83,21 +82,11 @@ export async function handleRerank(
     logger.debug(`No rerank fixture matched for query "${query.slice(0, 80)}" — returning empty`);
   }
 
-  // Build response with document text included (Cohere rerank v2 format)
-  const results = matchedResults.map((r) => {
-    const doc = documents[r.index];
-    const text =
-      typeof doc === "string"
-        ? doc
-        : typeof doc === "object" && doc !== null && "text" in doc
-          ? (doc as { text: string }).text
-          : "";
-    return {
-      index: r.index,
-      relevance_score: r.relevance_score,
-      document: { text },
-    };
-  });
+  // Build response (Cohere rerank v2 format: index + relevance_score only)
+  const results = matchedResults.map((r) => ({
+    index: r.index,
+    relevance_score: r.relevance_score,
+  }));
 
   journal.add({
     method: req.method ?? "POST",
