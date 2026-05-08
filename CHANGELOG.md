@@ -1,5 +1,11 @@
 # @copilotkit/aimock
 
+## [Unreleased]
+
+### Fixed
+
+- **Converse stream: double-wrapped Event Stream payloads** — `buildBedrockStreamTextEvents`, `buildBedrockStreamToolCallEvents`, and `buildBedrockStreamContentWithToolCallsEvents` emitted payloads wrapped with the event type name (e.g. `{ messageStart: { role: "assistant" } }`). The `:event-type` header already carries the event name, so AWS SDK (botocore) expected flat payloads (e.g. `{ role: "assistant" }`). The redundant wrapping caused botocore's `BaseEventStreamParser` to silently return empty dicts, producing `KeyError: 'role'` in downstream frameworks like Strands Agents. (Issue #162, reported by @KMiya84377)
+
 ## [1.19.1] - 2026-05-07
 
 ### Fixed
