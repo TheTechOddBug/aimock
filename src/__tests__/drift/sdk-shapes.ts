@@ -724,6 +724,61 @@ export function geminiLiveToolCallEventShapes(): SSEEventShape[] {
 }
 
 // ---------------------------------------------------------------------------
+// AWS Bedrock Converse Stream
+// ---------------------------------------------------------------------------
+
+/**
+ * Expected event shapes for Bedrock ConverseStream responses.
+ *
+ * ConverseStream uses AWS binary Event Stream framing where the event type is
+ * carried in the `:event-type` header and the payload is a flat JSON object
+ * (NOT wrapped with the event type name as a key).
+ */
+export function bedrockConverseStreamEventShapes(): SSEEventShape[] {
+  return [
+    {
+      type: "messageStart",
+      dataShape: extractShape({
+        role: "assistant",
+      }),
+    },
+    {
+      type: "contentBlockStart",
+      dataShape: extractShape({
+        contentBlockIndex: 0,
+        start: { type: "text" },
+      }),
+    },
+    {
+      type: "contentBlockDelta",
+      dataShape: extractShape({
+        contentBlockIndex: 0,
+        delta: { type: "text_delta", text: "Hello" },
+      }),
+    },
+    {
+      type: "contentBlockStop",
+      dataShape: extractShape({
+        contentBlockIndex: 0,
+      }),
+    },
+    {
+      type: "messageStop",
+      dataShape: extractShape({
+        stopReason: "end_turn",
+      }),
+    },
+    {
+      type: "metadata",
+      dataShape: extractShape({
+        usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        metrics: { latencyMs: 0 },
+      }),
+    },
+  ];
+}
+
+// ---------------------------------------------------------------------------
 // Google Gemini (HTTP)
 // ---------------------------------------------------------------------------
 
