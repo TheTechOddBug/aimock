@@ -115,17 +115,22 @@ function teeUpstreamStream(
       (upstreamRes) => {
         const upstreamStatus = upstreamRes.statusCode ?? 200;
 
-        // Set appropriate headers on the client response
+        // Normalize status codes: aimock acts as a gateway, so upstream
+        // provider details (429, 503, etc.) should not leak.
+        // Successes → 200, errors → 502 (Bad Gateway).
+        const clientStatus = upstreamStatus >= 200 && upstreamStatus < 300 ? 200 : 502;
+
+        // Set appropriate headers on the client response.
         if (!clientRes.headersSent) {
-          if (upstreamStatus >= 200 && upstreamStatus < 300) {
-            clientRes.writeHead(upstreamStatus, {
+          if (clientStatus === 200) {
+            clientRes.writeHead(200, {
               "Content-Type": "text/event-stream",
               "Cache-Control": "no-cache",
               Connection: "keep-alive",
             });
           } else {
             const ct = upstreamRes.headers["content-type"] || "application/json";
-            clientRes.writeHead(upstreamStatus, { "Content-Type": ct });
+            clientRes.writeHead(502, { "Content-Type": ct });
           }
         }
 
@@ -218,13 +223,12 @@ function teeUpstreamStream(
             logger.info("Proxied AG-UI request (proxy-only mode)");
           }
 
-          resolve(upstreamStatus);
+          resolve(clientStatus);
         });
       },
     );
 
     upstreamReq.on("timeout", () => {
-      if (!clientRes.writableEnded) clientRes.end();
       upstreamReq.destroy(
         new Error(`Upstream AG-UI request timed out after ${UPSTREAM_TIMEOUT_MS / 1000}s`),
       );

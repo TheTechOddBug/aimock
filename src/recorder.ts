@@ -455,7 +455,11 @@ export async function proxyAndRecord(
     if (ctString) {
       relayHeaders["Content-Type"] = ctString;
     }
-    res.writeHead(upstreamStatus, relayHeaders);
+    // Normalize status codes for the client: aimock acts as a gateway, so
+    // upstream provider details (429 rate-limits, 503 outages, etc.) should
+    // not leak. Successes → 200, errors → 502 (Bad Gateway).
+    const clientStatus = upstreamStatus >= 200 && upstreamStatus < 300 ? 200 : 502;
+    res.writeHead(clientStatus, relayHeaders);
     const isAudioRelay = ctString.toLowerCase().startsWith("audio/");
     res.end(isBinaryStream || isAudioRelay ? rawBuffer : upstreamBody);
   }
@@ -511,7 +515,12 @@ function makeUpstreamRequest(
         if (isSSE && clientRes && !clientRes.headersSent) {
           const relayHeaders: Record<string, string> = {};
           if (ctStr) relayHeaders["Content-Type"] = ctStr;
-          clientRes.writeHead(res.statusCode ?? 200, relayHeaders);
+          // Normalize status codes for the client: aimock acts as a gateway,
+          // so upstream provider details should not leak.
+          // Successes → 200, errors → 502 (Bad Gateway).
+          const rawStatus = res.statusCode ?? 200;
+          const clientStatus = rawStatus >= 200 && rawStatus < 300 ? 200 : 502;
+          clientRes.writeHead(clientStatus, relayHeaders);
           // Flush headers immediately so the client starts parsing frames
           // before the first data chunk arrives.
           if (typeof clientRes.flushHeaders === "function") clientRes.flushHeaders();

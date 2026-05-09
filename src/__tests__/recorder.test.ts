@@ -1199,9 +1199,10 @@ describe("recorder edge cases", () => {
       messages: [{ role: "user", content: "trigger error" }],
     });
 
-    expect(resp.status).toBe(500);
+    // Proxy relay normalizes upstream errors to 502 (Bad Gateway)
+    expect(resp.status).toBe(502);
 
-    // Fixture file created with error response
+    // Fixture file created with error response — preserves real upstream status
     const files = fs.readdirSync(tmpDir);
     const fixtureFiles = files.filter((f) => f.endsWith(".json"));
     expect(fixtureFiles).toHaveLength(1);
@@ -1217,6 +1218,7 @@ describe("recorder edge cases", () => {
     expect(savedResponse.status).toBe(500);
 
     // Replay: second identical request matches the recorded error fixture
+    // (served by aimock's fixture serving logic, which uses the fixture's status field)
     const resp2 = await post(`${recorder.url}/v1/chat/completions`, {
       model: "gpt-4",
       messages: [{ role: "user", content: "trigger error" }],
@@ -2259,6 +2261,183 @@ describe("recorder upstream connection failure", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Status code normalization — proxy relay normalizes upstream codes
+// ---------------------------------------------------------------------------
+
+describe("recorder status code normalization", () => {
+  it("normalizes upstream 201 to 200 for non-SSE responses", async () => {
+    // Create a raw upstream that returns 201 (e.g. Anthropic messages API)
+    const rawServer = http.createServer((_req, res) => {
+      res.writeHead(201, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          content: [{ type: "text", text: "created response" }],
+          model: "claude-3",
+          role: "assistant",
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => rawServer.listen(0, "127.0.0.1", resolve));
+    const rawAddr = rawServer.address() as { port: number };
+    const rawUrl = `http://127.0.0.1:${rawAddr.port}`;
+
+    try {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aimock-record-"));
+      recorder = await createServer([], {
+        port: 0,
+        record: { providers: { anthropic: rawUrl }, fixturePath: tmpDir },
+      });
+
+      const resp = await post(`${recorder.url}/v1/messages`, {
+        model: "claude-3",
+        messages: [{ role: "user", content: "hello 201" }],
+        max_tokens: 100,
+      });
+
+      // Client sees 200, not 201
+      expect(resp.status).toBe(200);
+    } finally {
+      await new Promise<void>((r) => rawServer.close(() => r()));
+    }
+  });
+
+  it("normalizes upstream 429 to 502 for non-SSE responses", async () => {
+    const rawServer = http.createServer((_req, res) => {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: { message: "Rate limited", type: "rate_limit_error" },
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => rawServer.listen(0, "127.0.0.1", resolve));
+    const rawAddr = rawServer.address() as { port: number };
+    const rawUrl = `http://127.0.0.1:${rawAddr.port}`;
+
+    try {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aimock-record-"));
+      recorder = await createServer([], {
+        port: 0,
+        record: { providers: { openai: rawUrl }, fixturePath: tmpDir },
+      });
+
+      const resp = await post(`${recorder.url}/v1/chat/completions`, {
+        model: "gpt-4",
+        messages: [{ role: "user", content: "rate limit me" }],
+      });
+
+      // Client sees 502, not 429
+      expect(resp.status).toBe(502);
+
+      // Fixture preserves the real upstream 429 status
+      const files = fs.readdirSync(tmpDir);
+      const fixtureFiles = files.filter((f) => f.endsWith(".json"));
+      expect(fixtureFiles).toHaveLength(1);
+      const fixtureContent = JSON.parse(
+        fs.readFileSync(path.join(tmpDir, fixtureFiles[0]), "utf-8"),
+      );
+      expect(fixtureContent.fixtures[0].response.status).toBe(429);
+    } finally {
+      await new Promise<void>((r) => rawServer.close(() => r()));
+    }
+  });
+
+  it("normalizes upstream 503 to 502 for non-SSE responses", async () => {
+    const rawServer = http.createServer((_req, res) => {
+      res.writeHead(503, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: { message: "Service unavailable", type: "server_error" },
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => rawServer.listen(0, "127.0.0.1", resolve));
+    const rawAddr = rawServer.address() as { port: number };
+    const rawUrl = `http://127.0.0.1:${rawAddr.port}`;
+
+    try {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aimock-record-"));
+      recorder = await createServer([], {
+        port: 0,
+        record: { providers: { openai: rawUrl }, fixturePath: tmpDir },
+      });
+
+      const resp = await post(`${recorder.url}/v1/chat/completions`, {
+        model: "gpt-4",
+        messages: [{ role: "user", content: "service unavailable" }],
+      });
+
+      // Client sees 502, not 503
+      expect(resp.status).toBe(502);
+    } finally {
+      await new Promise<void>((r) => rawServer.close(() => r()));
+    }
+  });
+
+  it("normalizes upstream 401 to 502 for non-SSE responses", async () => {
+    const rawServer = http.createServer((_req, res) => {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: { message: "Invalid API key", type: "authentication_error" },
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => rawServer.listen(0, "127.0.0.1", resolve));
+    const rawAddr = rawServer.address() as { port: number };
+    const rawUrl = `http://127.0.0.1:${rawAddr.port}`;
+
+    try {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aimock-record-"));
+      recorder = await createServer([], {
+        port: 0,
+        record: { providers: { openai: rawUrl }, fixturePath: tmpDir },
+      });
+
+      const resp = await post(`${recorder.url}/v1/chat/completions`, {
+        model: "gpt-4",
+        messages: [{ role: "user", content: "bad auth" }],
+      });
+
+      // Client sees 502, not 401
+      expect(resp.status).toBe(502);
+    } finally {
+      await new Promise<void>((r) => rawServer.close(() => r()));
+    }
+  });
+
+  it("normalizes SSE streaming upstream errors to 502", async () => {
+    // Upstream returns 429 with SSE content-type
+    const rawServer = http.createServer((_req, res) => {
+      res.writeHead(429, { "Content-Type": "text/event-stream" });
+      res.end("data: rate limited\n\n");
+    });
+    await new Promise<void>((resolve) => rawServer.listen(0, "127.0.0.1", resolve));
+    const rawAddr = rawServer.address() as { port: number };
+    const rawUrl = `http://127.0.0.1:${rawAddr.port}`;
+
+    try {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aimock-record-"));
+      recorder = await createServer([], {
+        port: 0,
+        record: { providers: { openai: rawUrl }, fixturePath: tmpDir },
+      });
+
+      const resp = await post(`${recorder.url}/v1/chat/completions`, {
+        model: "gpt-4",
+        messages: [{ role: "user", content: "sse rate limit" }],
+        stream: true,
+      });
+
+      // Client sees 502, not 429 — even for SSE content-type
+      expect(resp.status).toBe(502);
+    } finally {
+      await new Promise<void>((r) => rawServer.close(() => r()));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Filesystem write failure — response still relayed
 // ---------------------------------------------------------------------------
 
@@ -3204,12 +3383,14 @@ describe("buildFixtureResponse format detection", () => {
       messages: [{ role: "user", content: "rate limit test" }],
     });
 
-    expect(resp.status).toBe(429);
+    // Proxy relay normalizes upstream errors to 502 (Bad Gateway)
+    expect(resp.status).toBe(502);
 
     const files = fs.readdirSync(tmpDir);
     const fixtureFiles = files.filter((f) => f.endsWith(".json"));
     expect(fixtureFiles).toHaveLength(1);
 
+    // Fixture preserves real upstream status for fidelity
     const fixtureContent = JSON.parse(
       fs.readFileSync(path.join(tmpDir, fixtureFiles[0]), "utf-8"),
     ) as {

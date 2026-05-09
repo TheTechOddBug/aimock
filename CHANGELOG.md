@@ -1,5 +1,16 @@
 # @copilotkit/aimock
 
+## [Unreleased]
+
+### Fixed
+
+- **Drift tests passed vacuously with zero assertions** — the `shouldFail` guard silently skipped all `expect` calls when no critical diffs were found, so broken extraction logic or warning-level drift went completely undetected. Replaced every guarded assertion across all 21 drift test files (89 instances) with unconditional `expect(diffs.filter(...)).toEqual([])`
+- **Proxy relay leaked raw upstream HTTP status codes** — 5 recorder relay paths in `recorder.ts` and `agui-recorder.ts` forwarded raw upstream codes (429, 503, 401, 201, etc.) to aimock clients, exposing provider implementation details. Normalized to 200 for success and 502 for errors; fixture recording preserves the original status for fidelity
+
+### Added
+
+- **Status code normalization tests** — 5 tests verifying proxy relay normalization (201→200, 429→502, 503→502, 401→502, SSE 429→502) with fixture preservation assertions; 2 existing tests updated to expect normalized 502
+
 ## [1.19.5] - 2026-05-09
 
 ### Fixed
