@@ -12,6 +12,23 @@
 - **Drift detection compared only first event per type** — `compareSSESequences` now compares ALL events per type, not just the first, catching previously invisible divergences
 - **Ollama drift tests used broken async describe.skipIf** — replaced with synchronous env-var gate so tests are correctly skipped or executed
 - **12 unrestored spy/mock leaks and misleading assertions** — fix spy/mock leaks across test files and correct assertions that passed for the wrong reasons
+- Proxy relay hardcoded POST method — now forwards the original HTTP method
+- Response timeout timer leak — cleared after successful upstream completion
+- Client disconnect handler race — checks `writableFinished` before destroying upstream request
+- `onHookBypassed` and `beforeWriteResponse` callbacks not wrapped in try/catch
+- Audio error relay sent non-2xx responses with audio content-type instead of application/json
+- Snapshot-mode fixture writes not atomic — concurrent requests could corrupt the file
+- Undefined `toolCall` name/arguments silently dropped during fixture save
+- Video detection heuristic false-positives on LLM provider responses with `{id, status}` shape
+- One-shot error fixture splice during iteration (deferred via microtask)
+- Azure model injection catch swallowed non-SyntaxError exceptions
+- fal request body lost on passthrough (double `readBody` consumption)
+- fal queue handler dropped PUT request body
+- Recorder test: tmpDir leak on strict-mode reassignment, global fetch dependency, fragile fixturePath cleanup, duplicate helpers, spy leak on assertion failure
+
+### Added
+
+- Fixture-level chaos evaluation for non-completions endpoints (ElevenLabs, fal)
 
 ### Changed
 
