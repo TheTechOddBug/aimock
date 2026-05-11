@@ -563,7 +563,8 @@ export async function handleGemini(
   let geminiReq: GeminiRequest;
   try {
     geminiReq = JSON.parse(raw) as GeminiRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method: req.method ?? "POST",
       path: req.url ?? `/v1beta/models/${model}:generateContent`,
@@ -576,7 +577,7 @@ export async function handleGemini(
       400,
       JSON.stringify({
         error: {
-          message: "Malformed JSON",
+          message: `Malformed JSON body: ${detail}`,
           code: 400,
           status: "INVALID_ARGUMENT",
         },

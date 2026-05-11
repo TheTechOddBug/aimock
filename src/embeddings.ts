@@ -56,7 +56,8 @@ export async function handleEmbeddings(
   let embeddingReq: EmbeddingRequest;
   try {
     embeddingReq = JSON.parse(raw) as EmbeddingRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method: req.method ?? "POST",
       path: req.url ?? "/v1/embeddings",
@@ -69,7 +70,7 @@ export async function handleEmbeddings(
       400,
       JSON.stringify({
         error: {
-          message: "Malformed JSON",
+          message: `Malformed JSON body: ${detail}`,
           type: "invalid_request_error",
           code: "invalid_json",
         },

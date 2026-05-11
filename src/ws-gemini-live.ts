@@ -275,10 +275,11 @@ async function processMessage(
   let parsed: GeminiLiveMessage;
   try {
     parsed = JSON.parse(raw) as GeminiLiveMessage;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     ws.send(
       JSON.stringify({
-        error: { code: 3, message: "Malformed JSON", status: "INVALID_ARGUMENT" },
+        error: { code: 3, message: `Malformed JSON: ${detail}`, status: "INVALID_ARGUMENT" },
       }),
     );
     return;
