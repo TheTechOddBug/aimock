@@ -339,7 +339,8 @@ export async function handleBedrock(
   let bedrockReq: BedrockRequest;
   try {
     bedrockReq = JSON.parse(raw) as BedrockRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method: req.method ?? "POST",
       path: urlPath,
@@ -352,7 +353,7 @@ export async function handleBedrock(
       400,
       JSON.stringify({
         error: {
-          message: "Malformed JSON",
+          message: `Malformed JSON: ${detail}`,
           type: "invalid_request_error",
         },
       }),
@@ -953,7 +954,8 @@ export async function handleBedrockStream(
   let bedrockReq: BedrockRequest;
   try {
     bedrockReq = JSON.parse(raw) as BedrockRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method: req.method ?? "POST",
       path: urlPath,
@@ -966,7 +968,7 @@ export async function handleBedrockStream(
       400,
       JSON.stringify({
         error: {
-          message: "Malformed JSON",
+          message: `Malformed JSON: ${detail}`,
           type: "invalid_request_error",
         },
       }),

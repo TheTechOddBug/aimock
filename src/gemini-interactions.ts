@@ -640,7 +640,8 @@ export async function handleGeminiInteractions(
   let interactionsReq: InteractionsRequest;
   try {
     interactionsReq = JSON.parse(raw) as InteractionsRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method: req.method ?? "POST",
       path: urlPath,
@@ -651,7 +652,9 @@ export async function handleGeminiInteractions(
     writeErrorResponse(
       res,
       400,
-      JSON.stringify(buildInteractionsErrorResponse("Malformed JSON", "INVALID_ARGUMENT")),
+      JSON.stringify(
+        buildInteractionsErrorResponse(`Malformed JSON body: ${detail}`, "INVALID_ARGUMENT"),
+      ),
     );
     return;
   }

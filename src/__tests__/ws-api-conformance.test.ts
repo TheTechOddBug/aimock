@@ -338,7 +338,7 @@ describe("WS Responses API conformance", () => {
       ws.close();
       const frame = JSON.parse(raw[0]) as any;
       expect(frame.type).toBe("error");
-      expect(frame.error.message).toBe("Malformed JSON");
+      expect(frame.error.message).toMatch(/^Malformed JSON:/);
     });
   });
 });
@@ -597,7 +597,7 @@ describe("WS Realtime API conformance", () => {
       const frame = JSON.parse(raw[1]) as any;
       expect(frame.type).toBe("error");
       expect(frame.event_id).toMatch(/^event_/);
-      expect(frame.error.message).toBe("Malformed JSON");
+      expect(frame.error.message).toMatch(/^Malformed JSON:/);
     });
   });
 });

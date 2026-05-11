@@ -715,7 +715,8 @@ export async function handleMessages(
   let claudeReq: ClaudeRequest;
   try {
     claudeReq = JSON.parse(raw) as ClaudeRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method: req.method ?? "POST",
       path: req.url ?? "/v1/messages",
@@ -728,7 +729,7 @@ export async function handleMessages(
       400,
       JSON.stringify({
         error: {
-          message: "Malformed JSON",
+          message: `Malformed JSON: ${detail}`,
           type: "invalid_request_error",
         },
       }),

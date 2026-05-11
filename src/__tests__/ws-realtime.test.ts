@@ -666,7 +666,7 @@ describe("WebSocket /v1/realtime", () => {
     const raw = await ws.waitForMessages(2);
     const event = JSON.parse(raw[1]) as WSEvent;
     expect(event.type).toBe("error");
-    expect((event.error as Record<string, unknown>).message).toBe("Malformed JSON");
+    expect((event.error as Record<string, unknown>).message).toMatch(/^Malformed JSON:/);
 
     ws.close();
   });

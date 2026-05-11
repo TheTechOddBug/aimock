@@ -1,5 +1,23 @@
 # @copilotkit/aimock
 
+## [Unreleased]
+
+### Fixed
+
+- **Progressive relay for NDJSON and Bedrock binary event streams** — Ollama NDJSON and Bedrock binary event streams were fully buffered before relay, triggering downstream idle timeouts; now relayed progressively as chunks arrive
+- **JSON.parse error detail in bare catch blocks** — capture and surface parse-error detail in all bare catch blocks across 25+ provider/WebSocket/stream-collapse handlers instead of swallowing context
+- **Unguarded stream write/end calls** — wrap stream write/end in try/catch (recorder.ts, agui-recorder.ts) to prevent unhandled exceptions on client disconnect
+- **Response termination for headers-already-sent paths** — add response termination in error paths where headers were already sent (server.ts, a2a-mock.ts, mcp-mock.ts), preventing connection hangs
+- **Vector-mock double body consumption** — fix route passthrough consuming the request body twice, causing empty-body forwarding
+- **Drift detection compared only first event per type** — `compareSSESequences` now compares ALL events per type, not just the first, catching previously invisible divergences
+- **Ollama drift tests used broken async describe.skipIf** — replaced with synchronous env-var gate so tests are correctly skipped or executed
+- **12 unrestored spy/mock leaks and misleading assertions** — fix spy/mock leaks across test files and correct assertions that passed for the wrong reasons
+
+### Changed
+
+- **Anti-buffering headers on all progressive stream relay paths** — standard headers (Cache-Control, Connection, X-Accel-Buffering) added to all progressive stream relay paths to prevent intermediate proxy buffering
+- **Stream-collapse returns firstDroppedSample** — stream-collapse functions now return the first dropped sample for forensic debugging of collapsed streams
+
 ## [1.21.0] - 2026-05-11
 
 ### Added

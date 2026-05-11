@@ -39,7 +39,8 @@ export async function handleSpeech(
   let speechReq: SpeechRequest;
   try {
     speechReq = JSON.parse(raw) as SpeechRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method,
       path,
@@ -51,7 +52,11 @@ export async function handleSpeech(
       res,
       400,
       JSON.stringify({
-        error: { message: "Malformed JSON", type: "invalid_request_error", code: "invalid_json" },
+        error: {
+          message: `Malformed JSON: ${detail}`,
+          type: "invalid_request_error",
+          code: "invalid_json",
+        },
       }),
     );
     return;

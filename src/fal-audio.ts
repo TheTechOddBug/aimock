@@ -220,7 +220,8 @@ async function handleQueueSubmit(
   if (body.trim()) {
     try {
       parsed = JSON.parse(body) as Record<string, unknown>;
-    } catch {
+    } catch (parseErr) {
+      const detail = parseErr instanceof Error ? parseErr.message : "unknown";
       journal.add({
         method: req.method ?? "POST",
         path: pathname,
@@ -231,7 +232,7 @@ async function handleQueueSubmit(
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
-          error: { message: "Malformed JSON", type: "invalid_request_error" },
+          error: { message: `Malformed JSON: ${detail}`, type: "invalid_request_error" },
         }),
       );
       return;
@@ -502,7 +503,8 @@ async function handleSyncRun(
   if (body.trim()) {
     try {
       parsed = JSON.parse(body) as Record<string, unknown>;
-    } catch {
+    } catch (parseErr) {
+      const detail = parseErr instanceof Error ? parseErr.message : "unknown";
       journal.add({
         method: req.method ?? "POST",
         path: pathname,
@@ -513,7 +515,7 @@ async function handleSyncRun(
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
-          error: { message: "Malformed JSON", type: "invalid_request_error" },
+          error: { message: `Malformed JSON: ${detail}`, type: "invalid_request_error" },
         }),
       );
       return;

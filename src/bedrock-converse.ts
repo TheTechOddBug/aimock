@@ -509,7 +509,8 @@ export async function handleConverse(
   let converseReq: ConverseRequest;
   try {
     converseReq = JSON.parse(raw) as ConverseRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method: req.method ?? "POST",
       path: urlPath,
@@ -522,7 +523,7 @@ export async function handleConverse(
       400,
       JSON.stringify({
         error: {
-          message: "Malformed JSON",
+          message: `Malformed JSON: ${detail}`,
           type: "invalid_request_error",
         },
       }),
@@ -772,7 +773,8 @@ export async function handleConverseStream(
   let converseReq: ConverseRequest;
   try {
     converseReq = JSON.parse(raw) as ConverseRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method: req.method ?? "POST",
       path: urlPath,
@@ -785,7 +787,7 @@ export async function handleConverseStream(
       400,
       JSON.stringify({
         error: {
-          message: "Malformed JSON",
+          message: `Malformed JSON: ${detail}`,
           type: "invalid_request_error",
         },
       }),

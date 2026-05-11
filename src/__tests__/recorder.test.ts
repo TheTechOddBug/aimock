@@ -2659,7 +2659,8 @@ describe("recorder content + toolCalls coexistence", () => {
         response: { content?: string; toolCalls?: Array<{ name: string; arguments: string }> };
       }>;
     };
-    // toolCalls should win
+    // both content and toolCalls should be preserved
+    expect(fixtureContent.fixtures[0].response.content).toBeDefined();
     expect(fixtureContent.fixtures[0].response.toolCalls).toBeDefined();
     expect(fixtureContent.fixtures[0].response.toolCalls).toHaveLength(1);
     expect(fixtureContent.fixtures[0].response.toolCalls![0].name).toBe("search");
@@ -3533,7 +3534,7 @@ describe("recorder streaming edge cases", () => {
     expect(savedResponse.content).toBe("Hello World");
   });
 
-  it("streaming with content + toolCalls: fixture saves toolCalls (not content)", async () => {
+  it("streaming with content + toolCalls: fixture saves both content and toolCalls", async () => {
     // Create a raw upstream that returns SSE with both text and tool call deltas
     const rawServer = http.createServer((_req, res) => {
       res.writeHead(200, { "Content-Type": "text/event-stream" });
@@ -3595,7 +3596,8 @@ describe("recorder streaming edge cases", () => {
       toolCalls?: Array<{ name: string; arguments: string }>;
       content?: string;
     };
-    // When toolCalls exist, they win over content
+    // Both content and toolCalls should be preserved
+    expect(savedResponse.content).toBeDefined();
     expect(savedResponse.toolCalls).toBeDefined();
     expect(savedResponse.toolCalls).toHaveLength(1);
     expect(savedResponse.toolCalls![0].name).toBe("get_weather");
@@ -3954,8 +3956,11 @@ async function setupUpstreamAndRecorder(
 
 describe("makeUpstreamRequest body timeout", () => {
   let fastRawServer: http.Server | undefined;
+  let setTimeoutSpy: ReturnType<typeof vi.spyOn> | undefined;
 
   afterEach(async () => {
+    setTimeoutSpy?.mockRestore();
+    setTimeoutSpy = undefined;
     if (fastRawServer) {
       await new Promise<void>((resolve) => fastRawServer!.close(() => resolve()));
       fastRawServer = undefined;
@@ -3975,7 +3980,7 @@ describe("makeUpstreamRequest body timeout", () => {
     await new Promise<void>((resolve) => fastRawServer!.listen(0, "127.0.0.1", resolve));
     const { port } = fastRawServer!.address() as { port: number };
 
-    const setTimeoutSpy = vi.spyOn(http.IncomingMessage.prototype, "setTimeout");
+    setTimeoutSpy = vi.spyOn(http.IncomingMessage.prototype, "setTimeout");
 
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aimock-record-timeout-"));
     const record: RecordConfig = {
@@ -4009,7 +4014,6 @@ describe("makeUpstreamRequest body timeout", () => {
 
     // Verify res.setTimeout was called with the 30-second body accumulation timeout
     expect(setTimeoutSpy).toHaveBeenCalledWith(30_000, expect.any(Function));
-    setTimeoutSpy.mockRestore();
   });
 });
 

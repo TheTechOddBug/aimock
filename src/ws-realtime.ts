@@ -217,8 +217,11 @@ async function processMessage(
   let parsed: RealtimeMessage;
   try {
     parsed = JSON.parse(raw) as RealtimeMessage;
-  } catch {
-    ws.send(buildErrorRealtimeEvent("Malformed JSON", "invalid_request_error", "invalid_json"));
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
+    ws.send(
+      buildErrorRealtimeEvent(`Malformed JSON: ${detail}`, "invalid_request_error", "invalid_json"),
+    );
     return;
   }
 

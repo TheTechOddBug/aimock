@@ -103,9 +103,12 @@ async function processMessage(
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     ws.send(
-      JSON.stringify(buildErrorEvent("Malformed JSON", "invalid_request_error", "invalid_json")),
+      JSON.stringify(
+        buildErrorEvent(`Malformed JSON: ${detail}`, "invalid_request_error", "invalid_json"),
+      ),
     );
     return;
   }

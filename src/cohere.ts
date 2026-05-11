@@ -756,7 +756,8 @@ export async function handleCohere(
   let cohereReq: CohereRequest;
   try {
     cohereReq = JSON.parse(raw) as CohereRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method: req.method ?? "POST",
       path: req.url ?? "/v2/chat",
@@ -769,7 +770,7 @@ export async function handleCohere(
       400,
       JSON.stringify({
         error: {
-          message: "Malformed JSON",
+          message: `Malformed JSON body: ${detail}`,
           type: "invalid_request_error",
         },
       }),

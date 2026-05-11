@@ -49,6 +49,12 @@ describe("loadFixtureFile", () => {
   });
 
   afterEach(() => {
+    // Restore console spies that individual tests create via vi.spyOn(console, "warn").
+    // We cannot use vi.restoreAllMocks() here because the top-level vi.mock("node:fs")
+    // overrides would also be wiped, breaking subsequent tests.
+    if ("mockRestore" in console.warn) {
+      (console.warn as ReturnType<typeof vi.spyOn>).mockRestore();
+    }
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
@@ -360,6 +366,12 @@ describe("loadFixturesFromDir", () => {
   });
 
   afterEach(() => {
+    // Restore console spies that individual tests create via vi.spyOn(console, "warn").
+    // We cannot use vi.restoreAllMocks() here because the top-level vi.mock("node:fs")
+    // overrides would also be wiped, breaking subsequent tests.
+    if ("mockRestore" in console.warn) {
+      (console.warn as ReturnType<typeof vi.spyOn>).mockRestore();
+    }
     rmSync(tmpDir, { recursive: true, force: true });
   });
 

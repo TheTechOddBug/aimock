@@ -487,7 +487,8 @@ export async function handleOllama(
   let ollamaReq: OllamaRequest;
   try {
     ollamaReq = JSON.parse(raw) as OllamaRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method: req.method ?? "POST",
       path: urlPath,
@@ -500,7 +501,7 @@ export async function handleOllama(
       400,
       JSON.stringify({
         error: {
-          message: "Malformed JSON",
+          message: `Malformed JSON body: ${detail}`,
           type: "invalid_request_error",
         },
       }),
@@ -793,7 +794,8 @@ export async function handleOllamaGenerate(
   let generateReq: OllamaGenerateRequest;
   try {
     generateReq = JSON.parse(raw) as OllamaGenerateRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method: req.method ?? "POST",
       path: urlPath,
@@ -806,7 +808,7 @@ export async function handleOllamaGenerate(
       400,
       JSON.stringify({
         error: {
-          message: "Malformed JSON",
+          message: `Malformed JSON body: ${detail}`,
           type: "invalid_request_error",
         },
       }),

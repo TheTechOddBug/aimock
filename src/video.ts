@@ -91,7 +91,8 @@ export async function handleVideoCreate(
   let videoReq: VideoRequest;
   try {
     videoReq = JSON.parse(raw) as VideoRequest;
-  } catch {
+  } catch (parseErr) {
+    const detail = parseErr instanceof Error ? parseErr.message : "unknown";
     journal.add({
       method,
       path,
@@ -103,7 +104,11 @@ export async function handleVideoCreate(
       res,
       400,
       JSON.stringify({
-        error: { message: "Malformed JSON", type: "invalid_request_error", code: "invalid_json" },
+        error: {
+          message: `Malformed JSON: ${detail}`,
+          type: "invalid_request_error",
+          code: "invalid_json",
+        },
       }),
     );
     return;
