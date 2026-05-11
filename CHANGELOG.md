@@ -1,6 +1,6 @@
 # @copilotkit/aimock
 
-## [Unreleased]
+## [1.20.0] - 2026-05-11
 
 ### Fixed
 
@@ -9,6 +9,7 @@
 
 ### Added
 
+- **`match.systemMessage` fixture matcher** — gate a fixture on a substring (or regexp) found inside the concatenated text of every `system` role message in the request. Hosts that plumb dynamic context (persona, agent-context entries, dynamic config) through system messages can now narrow a fixture to a specific context state; when the caller changes that state the fixture stops matching and the request falls through to the next fixture or upstream proxy instead of silently returning a stale baked response. JSON form: `"match": { "userMessage": "Who am I?", "systemMessage": "name=Atai" }`. Programmatic form accepts `string | RegExp`.
 - **Status code normalization tests** — 5 tests verifying proxy relay normalization (201→200, 429→502, 503→502, 401→502, SSE 429→502) with fixture preservation assertions; 2 existing tests updated to expect normalized 502
 
 ## [1.19.5] - 2026-05-09

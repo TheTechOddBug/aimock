@@ -64,6 +64,16 @@ export interface ToolDefinition {
 
 export interface FixtureMatch {
   userMessage?: string | RegExp;
+  /**
+   * Substring or regexp matched against the concatenated text content of every
+   * `system` role message in the request. Gates fixture activation on values
+   * the host plumbs in via system messages (agent context, persona, dynamic
+   * config) instead of the user-typed prompt — so changing context state in
+   * the calling app causes stale fixtures to fall through to a real upstream
+   * instead of silently returning a baked response that no longer reflects
+   * reality.
+   */
+  systemMessage?: string | RegExp;
   inputText?: string | RegExp;
   toolCallId?: string;
   toolName?: string;
@@ -309,6 +319,7 @@ export interface FixtureFile {
 export interface FixtureFileEntry {
   match: {
     userMessage?: string;
+    systemMessage?: string;
     inputText?: string;
     toolCallId?: string;
     toolName?: string;

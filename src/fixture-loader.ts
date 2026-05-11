@@ -53,6 +53,7 @@ export function entryToFixture(entry: FixtureFileEntry): Fixture {
   return {
     match: {
       userMessage: entry.match.userMessage,
+      systemMessage: entry.match.systemMessage,
       inputText: entry.match.inputText,
       toolCallId: entry.match.toolCallId,
       toolName: entry.match.toolName,
@@ -618,6 +619,13 @@ export function validateFixtures(fixtures: Fixture[]): ValidationResult[] {
         message: `match.hasToolResult must be a boolean, got ${typeof f.match.hasToolResult}`,
       });
     }
+    if (f.match.systemMessage !== undefined && typeof f.match.systemMessage !== "string") {
+      results.push({
+        severity: "error",
+        fixtureIndex: i,
+        message: `match.systemMessage must be a string, got ${typeof f.match.systemMessage}`,
+      });
+    }
 
     // --- Warning checks ---
 
@@ -644,6 +652,7 @@ export function validateFixtures(fixtures: Fixture[]): ValidationResult[] {
     const hasDiscriminator =
       match.endpoint !== undefined ||
       match.userMessage !== undefined ||
+      match.systemMessage !== undefined ||
       match.inputText !== undefined ||
       match.responseFormat !== undefined ||
       match.toolCallId !== undefined ||

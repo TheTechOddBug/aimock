@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { matchFixture, getLastMessageByRole, getTextContent } from "../router.js";
+import { matchFixture, getLastMessageByRole, getSystemText, getTextContent } from "../router.js";
 import type { ChatCompletionRequest, ChatMessage, ContentPart, Fixture } from "../types.js";
 
 // ---------------------------------------------------------------------------
@@ -231,6 +231,164 @@ describe("matchFixture — userMessage (RegExp)", () => {
       messages: [
         { role: "user", content: "first message" },
         { role: "user", content: "second message" },
+      ],
+    });
+    expect(matchFixture([fixture], req)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getSystemText
+// ---------------------------------------------------------------------------
+
+describe("getSystemText", () => {
+  it("returns empty string when there are no system messages", () => {
+    expect(getSystemText([{ role: "user", content: "hi" }])).toBe("");
+  });
+
+  it("returns the single system message text", () => {
+    expect(
+      getSystemText([
+        { role: "system", content: "You are helpful." },
+        { role: "user", content: "hi" },
+      ]),
+    ).toBe("You are helpful.");
+  });
+
+  it("joins multiple system messages with newlines in order", () => {
+    expect(
+      getSystemText([
+        { role: "system", content: "first" },
+        { role: "user", content: "ignored" },
+        { role: "system", content: "second" },
+      ]),
+    ).toBe("first\nsecond");
+  });
+
+  it("extracts text from array-of-parts system content", () => {
+    expect(
+      getSystemText([{ role: "system", content: [{ type: "text", text: "from parts" }] }]),
+    ).toBe("from parts");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// matchFixture — systemMessage
+// ---------------------------------------------------------------------------
+
+describe("matchFixture — systemMessage (string)", () => {
+  it("matches when a system message contains the substring", () => {
+    const fixture = makeFixture({ systemMessage: "Atai" });
+    const req = makeReq({
+      messages: [
+        { role: "system", content: "User name is Atai. Timezone America/Los_Angeles." },
+        { role: "user", content: "Who am I?" },
+      ],
+    });
+    expect(matchFixture([fixture], req)).toBe(fixture);
+  });
+
+  it("does not match when no system message contains the substring", () => {
+    const fixture = makeFixture({ systemMessage: "Atai" });
+    const req = makeReq({
+      messages: [
+        { role: "system", content: "User name is Alem." },
+        { role: "user", content: "Who am I?" },
+      ],
+    });
+    expect(matchFixture([fixture], req)).toBeNull();
+  });
+
+  it("does not match when there are no system messages", () => {
+    const fixture = makeFixture({ systemMessage: "anything" });
+    const req = makeReq({ messages: [{ role: "user", content: "hi" }] });
+    expect(matchFixture([fixture], req)).toBeNull();
+  });
+
+  it("matches across the joined text of multiple system messages", () => {
+    const fixture = makeFixture({ systemMessage: "Atai" });
+    const req = makeReq({
+      messages: [
+        { role: "system", content: "Persona: helpful." },
+        { role: "system", content: "Context: name=Atai" },
+        { role: "user", content: "Who am I?" },
+      ],
+    });
+    expect(matchFixture([fixture], req)).toBe(fixture);
+  });
+
+  it("matches when system content is array-of-parts", () => {
+    const fixture = makeFixture({ systemMessage: "Atai" });
+    const req = makeReq({
+      messages: [
+        { role: "system", content: [{ type: "text", text: "name=Atai" }] },
+        { role: "user", content: "Who am I?" },
+      ],
+    });
+    expect(matchFixture([fixture], req)).toBe(fixture);
+  });
+
+  it("combines with userMessage — both must match", () => {
+    const fixture = makeFixture({ userMessage: "Who am I", systemMessage: "Atai" });
+    const matching = makeReq({
+      messages: [
+        { role: "system", content: "name=Atai" },
+        { role: "user", content: "Who am I?" },
+      ],
+    });
+    expect(matchFixture([fixture], matching)).toBe(fixture);
+
+    const userOnly = makeReq({
+      messages: [
+        { role: "system", content: "name=Alem" },
+        { role: "user", content: "Who am I?" },
+      ],
+    });
+    expect(matchFixture([fixture], userOnly)).toBeNull();
+
+    const systemOnly = makeReq({
+      messages: [
+        { role: "system", content: "name=Atai" },
+        { role: "user", content: "Different prompt" },
+      ],
+    });
+    expect(matchFixture([fixture], systemOnly)).toBeNull();
+  });
+
+  it("falls through to the next fixture on systemMessage miss", () => {
+    const specific = makeFixture(
+      { userMessage: "Who am I", systemMessage: "Atai" },
+      { content: "Hi Atai" },
+    );
+    const fallback = makeFixture({ userMessage: "Who am I" }, { content: "Hi user" });
+    const req = makeReq({
+      messages: [
+        { role: "system", content: "name=Alem" },
+        { role: "user", content: "Who am I?" },
+      ],
+    });
+    expect(matchFixture([specific, fallback], req)).toBe(fallback);
+  });
+});
+
+describe("matchFixture — systemMessage (RegExp)", () => {
+  it("matches when the joined system text satisfies the regexp", () => {
+    const fixture = makeFixture({ systemMessage: /name=Atai/ });
+    const req = makeReq({
+      messages: [
+        { role: "system", content: "ctx: name=Atai, tz=PST" },
+        { role: "user", content: "Who am I?" },
+      ],
+    });
+    expect(matchFixture([fixture], req)).toBe(fixture);
+  });
+
+  it("does not match when the regexp misses", () => {
+    const fixture = makeFixture({ systemMessage: /name=Atai/ });
+    const req = makeReq({
+      messages: [
+        { role: "system", content: "ctx: name=Alem" },
+        { role: "user", content: "Who am I?" },
       ],
     });
     expect(matchFixture([fixture], req)).toBeNull();

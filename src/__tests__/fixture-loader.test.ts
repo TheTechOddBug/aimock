@@ -940,6 +940,22 @@ describe("validateFixtures", () => {
     expect(results.filter((r) => r.message.includes("hasToolResult"))).toHaveLength(0);
   });
 
+  // --- match.systemMessage type checks ---
+
+  it("error: systemMessage is a number", () => {
+    const fixtures = [makeFixture({ match: { userMessage: "test", systemMessage: 42 as never } })];
+    const results = validateFixtures(fixtures);
+    expect(results.some((r) => r.severity === "error" && r.message.includes("systemMessage"))).toBe(
+      true,
+    );
+  });
+
+  it("no error: systemMessage is a string", () => {
+    const fixtures = [makeFixture({ match: { userMessage: "test", systemMessage: "Atai" } })];
+    const results = validateFixtures(fixtures);
+    expect(results.filter((r) => r.message.includes("systemMessage"))).toHaveLength(0);
+  });
+
   // --- Warning checks ---
 
   it("warning: duplicate userMessage", () => {
@@ -1477,6 +1493,15 @@ describe("auto-stringify JSON objects in fixture entries", () => {
     };
     const fixture = entryToFixture(entry);
     expect((fixture.response as TextResponse).content).toBe("Hello, world!");
+  });
+
+  it("passes systemMessage through entryToFixture", () => {
+    const entry: FixtureFileEntry = {
+      match: { userMessage: "test", systemMessage: "name=Atai" },
+      response: { content: "ok" },
+    };
+    const fixture = entryToFixture(entry);
+    expect(fixture.match.systemMessage).toBe("name=Atai");
   });
 
   it("stringifies nested objects in arguments", () => {

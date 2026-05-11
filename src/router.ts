@@ -16,6 +16,23 @@ export function getLastMessageByRole(messages: ChatMessage[], role: string): Cha
 }
 
 /**
+ * Concatenate the text content of every `system` role message in order.
+ * Hosts that build a system context from multiple sources (persona, agent
+ * context entries, tool guidance) often emit several system messages in one
+ * request; this joins them with newlines so a substring matcher sees the
+ * whole context as one body.
+ */
+export function getSystemText(messages: ChatMessage[]): string {
+  const parts: string[] = [];
+  for (const m of messages) {
+    if (m.role !== "system") continue;
+    const text = getTextContent(m.content);
+    if (text) parts.push(text);
+  }
+  return parts.join("\n");
+}
+
+/**
  * Extract the text content from a message's content field.
  * Handles both plain string content and array-of-parts content
  * (e.g. `[{type: "text", text: "..."}]` as sent by some SDKs).
@@ -93,6 +110,26 @@ export function matchFixture(
       } else {
         match.userMessage.lastIndex = 0;
         if (!match.userMessage.test(text)) continue;
+      }
+    }
+
+    // systemMessage — case-sensitive substring (or regexp) match against the
+    // joined text of every system message in the request. Use to gate a
+    // fixture on host-supplied context (e.g. agent-context entries) so that
+    // when the calling app changes that context the fixture stops matching
+    // and the request falls through to the next fixture or upstream proxy.
+    if (match.systemMessage !== undefined) {
+      const text = getSystemText(effective.messages);
+      if (!text) continue;
+      if (typeof match.systemMessage === "string") {
+        if (useExactMatch) {
+          if (text !== match.systemMessage) continue;
+        } else {
+          if (!text.includes(match.systemMessage)) continue;
+        }
+      } else {
+        match.systemMessage.lastIndex = 0;
+        if (!match.systemMessage.test(text)) continue;
       }
     }
 
