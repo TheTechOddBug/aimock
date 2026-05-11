@@ -165,7 +165,7 @@ export async function proxyAndRecord(
   let streamedToClient = false;
   let clientDisconnected = false;
   try {
-    const result = await makeUpstreamRequest(target, forwardHeaders, requestBody, res);
+    const result = await makeUpstreamRequest(target, forwardHeaders, requestBody, res, req.method);
     upstreamStatus = result.status;
     upstreamHeaders = result.headers;
     upstreamBody = result.body;
@@ -247,15 +247,20 @@ export async function proxyAndRecord(
     } else {
       const reasoningSpread = collapsed.reasoning ? { reasoning: collapsed.reasoning } : {};
       if (collapsed.toolCalls && collapsed.toolCalls.length > 0) {
+        const sanitizedToolCalls = collapsed.toolCalls.map((tc) => ({
+          ...tc,
+          name: tc.name ?? "",
+          arguments: tc.arguments ?? "{}",
+        }));
         if (collapsed.content) {
           // Both content and toolCalls present — save as ContentWithToolCallsResponse
           fixtureResponse = {
             content: collapsed.content,
-            toolCalls: collapsed.toolCalls,
+            toolCalls: sanitizedToolCalls,
             ...reasoningSpread,
           };
         } else {
-          fixtureResponse = { toolCalls: collapsed.toolCalls, ...reasoningSpread };
+          fixtureResponse = { toolCalls: sanitizedToolCalls, ...reasoningSpread };
         }
       } else {
         fixtureResponse = { content: collapsed.content ?? "", ...reasoningSpread };
@@ -373,6 +378,9 @@ export async function proxyAndRecord(
     try {
       // Create the target directory (must be inside try/catch so filesystem
       // errors don't prevent the upstream response from being relayed).
+      // Keep synchronous: for streamed responses the HTTP reply is already on
+      // the wire, so any async yield lets callers observe the filesystem before
+      // the fixture is written.
       if (isSnapshotMode) {
         fs.mkdirSync(path.dirname(filepath), { recursive: true });
       } else {
@@ -412,7 +420,12 @@ export async function proxyAndRecord(
         fileContent._warning = warnings.join("; ");
       }
 
-      fs.writeFileSync(filepath, JSON.stringify(fileContent, null, 2), "utf-8");
+      // Atomic write: write to temp file then rename to avoid read-modify-write races
+      // Keep synchronous — for streamed responses the HTTP response is already on the
+      // wire, so async writes would race with callers checking the filesystem.
+      const tmpPath = filepath + ".tmp." + process.pid;
+      fs.writeFileSync(tmpPath, JSON.stringify(fileContent, null, 2), "utf-8");
+      fs.renameSync(tmpPath, filepath);
       writtenToDisk = true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Unknown filesystem error";
@@ -450,31 +463,50 @@ export async function proxyAndRecord(
         : ctString.toLowerCase().includes("application/x-ndjson")
           ? "ndjson_streamed"
           : "sse_streamed";
-      options.onHookBypassed(bypassReason);
+      try {
+        options.onHookBypassed(bypassReason);
+      } catch (err) {
+        defaults.logger.warn(
+          `onHookBypassed callback threw: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
   } else {
     // Give the caller a chance to mutate or replace the response before relay.
     // Used by the chaos layer to turn a successful proxy into a malformed body.
     // `body` is the raw upstream bytes so binary payloads survive round-tripping.
     if (options?.beforeWriteResponse) {
-      const handled = await options.beforeWriteResponse({
-        status: upstreamStatus,
-        contentType: ctString,
-        body: rawBuffer,
-      });
+      let handled: boolean | undefined;
+      try {
+        handled = await options.beforeWriteResponse({
+          status: upstreamStatus,
+          contentType: ctString,
+          body: rawBuffer,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(`beforeWriteResponse hook failed for ${providerKey}: ${msg}`);
+      }
       if (handled) return "handled_by_hook";
     }
 
-    const relayHeaders: Record<string, string> = {};
-    if (ctString) {
-      relayHeaders["Content-Type"] = ctString;
-    }
     // Normalize status codes for the client: aimock acts as a gateway, so
     // upstream provider details (429 rate-limits, 503 outages, etc.) should
     // not leak. Successes → 200, errors → 502 (Bad Gateway).
     const clientStatus = upstreamStatus >= 200 && upstreamStatus < 300 ? 200 : 502;
-    res.writeHead(clientStatus, relayHeaders);
     const isAudioRelay = ctString.toLowerCase().startsWith("audio/");
+    // When an upstream error (non-2xx) is relayed for an audio endpoint, the
+    // body is typically a JSON error object — override the content-type so
+    // clients don't try to decode JSON as audio.
+    const relayHeaders: Record<string, string> = {};
+    const clientCt =
+      (clientStatus >= 200 && clientStatus < 300) || !isAudioRelay
+        ? (ctString ?? "application/json")
+        : "application/json";
+    if (clientCt) {
+      relayHeaders["Content-Type"] = clientCt;
+    }
+    res.writeHead(clientStatus, relayHeaders);
     res.end(isBinaryStream || isAudioRelay ? rawBuffer : upstreamBody);
   }
 
@@ -490,6 +522,7 @@ function makeUpstreamRequest(
   headers: Record<string, string>,
   body: string,
   clientRes?: http.ServerResponse,
+  method: string = "POST",
 ): Promise<{
   status: number;
   headers: http.IncomingHttpHeaders;
@@ -505,7 +538,7 @@ function makeUpstreamRequest(
     const req = transport.request(
       target,
       {
-        method: "POST",
+        method,
         timeout: UPSTREAM_TIMEOUT_MS,
         headers: {
           ...headers,
@@ -548,10 +581,14 @@ function makeUpstreamRequest(
           // before the first data chunk arrives.
           if (typeof clientRes.flushHeaders === "function") clientRes.flushHeaders();
           streamedToClient = true;
-          // Stop relaying if the client disconnects mid-stream
+          // Stop relaying if the client disconnects mid-stream.
+          // Check writableFinished to distinguish normal completion (where
+          // "close" also fires) from premature client disconnects.
           clientRes.on("close", () => {
-            clientDisconnected = true;
-            req.destroy();
+            if (!clientRes.writableFinished) {
+              clientDisconnected = true;
+              req.destroy();
+            }
           });
         }
         const chunks: Buffer[] = [];
@@ -574,6 +611,7 @@ function makeUpstreamRequest(
         });
         res.on("error", reject);
         res.on("end", () => {
+          if (res.socket) res.setTimeout(0);
           const rawBuffer = Buffer.concat(chunks);
           if (
             streamedToClient &&
@@ -661,8 +699,10 @@ function buildFixtureResponse(
         // Malformed embedding — return a zero-dimension embedding fixture
         return { embedding: [] };
       }
-      const aligned = new Uint8Array(buf).buffer; // Always offset 0
-      const floats = new Float32Array(aligned, 0, buf.byteLength / 4);
+      // Uint8Array constructor copies Buffer data to a fresh ArrayBuffer at offset 0,
+      // guaranteeing the alignment Float32Array requires.
+      const copied = new Uint8Array(buf);
+      const floats = new Float32Array(copied.buffer, 0, buf.byteLength / 4);
       return { embedding: Array.from(floats) };
     }
     // OpenAI image generation: { created, data: [{ url, b64_json, revised_prompt }] }
@@ -748,7 +788,12 @@ function buildFixtureResponse(
     !("message" in obj) &&
     !("data" in obj) &&
     !("object" in obj) &&
-    !("outputs" in obj)
+    !("outputs" in obj) &&
+    !("model" in obj) &&
+    !("response" in obj) &&
+    !("done" in obj) &&
+    !("usage" in obj) &&
+    !("error" in obj)
   ) {
     if (obj.status === "completed" && obj.url) {
       return {
