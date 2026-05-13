@@ -101,192 +101,201 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Realtime API drift", () => {
     expect(unknown).toEqual([]);
   });
 
-  it("WS text event sequence and shapes match (GA)", async () => {
-    const sdkEvents = openaiRealtimeTextEventShapes();
+  it.skipIf(!process.env.OPENAI_REALTIME_KEY)(
+    "WS text event sequence and shapes match (GA)",
+    async () => {
+      const sdkEvents = openaiRealtimeTextEventShapes();
 
-    // Real API — GA mode (no Beta header)
-    const realResult = await openaiRealtimeWS(config, "Say hello", undefined, false);
+      // Real API — GA mode (no Beta header)
+      const realResult = await openaiRealtimeWS(config, "Say hello", undefined, false);
 
-    // Mock — replicate the Realtime protocol sequence (GA mode)
-    const mockWs = await connectWebSocket(instance.url, "/v1/realtime");
+      // Mock — replicate the Realtime protocol sequence (GA mode)
+      const mockWs = await connectWebSocket(instance.url, "/v1/realtime");
 
-    // session.created is sent automatically on connect
-    const sessionCreatedMsgs = await mockWs.waitForMessages(1);
-    const allMockRaw: unknown[] = [JSON.parse(sessionCreatedMsgs[0])];
+      // session.created is sent automatically on connect
+      const sessionCreatedMsgs = await mockWs.waitForMessages(1);
+      const allMockRaw: unknown[] = [JSON.parse(sessionCreatedMsgs[0])];
 
-    // session.update
-    mockWs.send(
-      JSON.stringify({
-        type: "session.update",
-        session: { model: "gpt-4o-mini", modalities: ["text"] },
-      }),
-    );
-    const sessionUpdatedMsgs = await mockWs.waitForMessages(2);
-    allMockRaw.push(JSON.parse(sessionUpdatedMsgs[1]));
+      // session.update
+      mockWs.send(
+        JSON.stringify({
+          type: "session.update",
+          session: { model: "gpt-4o-mini", modalities: ["text"] },
+        }),
+      );
+      const sessionUpdatedMsgs = await mockWs.waitForMessages(2);
+      allMockRaw.push(JSON.parse(sessionUpdatedMsgs[1]));
 
-    // conversation.item.create
-    mockWs.send(
-      JSON.stringify({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text: "Say hello" }],
+      // conversation.item.create
+      mockWs.send(
+        JSON.stringify({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Say hello" }],
+          },
+        }),
+      );
+      const itemCreatedMsgs = await mockWs.waitForMessages(3);
+      allMockRaw.push(JSON.parse(itemCreatedMsgs[2]));
+
+      // response.create — triggers the response
+      mockWs.send(JSON.stringify({ type: "response.create" }));
+
+      // Collect remaining messages until response.done
+      const responseMsgs = await collectMockWSMessages(
+        mockWs,
+        (msg) => (msg as Record<string, unknown>).type === "response.done",
+        15000,
+        3, // skip the 3 messages already consumed
+      );
+      allMockRaw.push(...responseMsgs.rawMessages);
+      mockWs.close();
+
+      // Build mock events from all collected messages
+      const mockEvents = allMockRaw.map((msg) => {
+        const m = msg as Record<string, unknown>;
+        return {
+          type: m.type as string,
+          dataShape: extractShape(msg),
+        };
+      });
+
+      expect(realResult.rawMessages.length, "Real API returned no WS messages").toBeGreaterThan(0);
+      expect(mockEvents.length, "Mock returned no WS messages").toBeGreaterThan(0);
+
+      const diffs = compareSSESequences(sdkEvents, realResult.events, mockEvents);
+      const report = formatDriftReport("OpenAI Realtime WS (GA text events)", diffs);
+
+      expect(
+        diffs.filter((d) => d.severity === "critical"),
+        report,
+      ).toEqual([]);
+    },
+  );
+
+  it.skipIf(!process.env.OPENAI_REALTIME_KEY)(
+    "WS tool call event sequence matches (GA)",
+    async () => {
+      const sdkEvents = [
+        ...openaiRealtimeTextEventShapes().filter(
+          (e) =>
+            e.type === "session.created" ||
+            e.type === "session.updated" ||
+            e.type === "conversation.item.added" ||
+            e.type === "response.created" ||
+            e.type === "response.done",
+        ),
+        ...openaiRealtimeToolCallEventShapes(),
+      ];
+
+      const tools = [
+        {
+          type: "function",
+          name: "get_weather",
+          description: "Get weather",
+          parameters: {
+            type: "object",
+            properties: { city: { type: "string" } },
+            required: ["city"],
+          },
         },
-      }),
-    );
-    const itemCreatedMsgs = await mockWs.waitForMessages(3);
-    allMockRaw.push(JSON.parse(itemCreatedMsgs[2]));
+      ];
 
-    // response.create — triggers the response
-    mockWs.send(JSON.stringify({ type: "response.create" }));
+      // Real API — GA mode
+      const realResult = await openaiRealtimeWS(config, "Weather in Paris", tools, false);
 
-    // Collect remaining messages until response.done
-    const responseMsgs = await collectMockWSMessages(
-      mockWs,
-      (msg) => (msg as Record<string, unknown>).type === "response.done",
-      15000,
-      3, // skip the 3 messages already consumed
-    );
-    allMockRaw.push(...responseMsgs.rawMessages);
-    mockWs.close();
+      // Mock — replicate the Realtime protocol sequence
+      const mockWs = await connectWebSocket(instance.url, "/v1/realtime");
 
-    // Build mock events from all collected messages
-    const mockEvents = allMockRaw.map((msg) => {
-      const m = msg as Record<string, unknown>;
-      return {
-        type: m.type as string,
-        dataShape: extractShape(msg),
-      };
-    });
+      // session.created
+      const sessionCreatedMsgs = await mockWs.waitForMessages(1);
+      const allMockRaw: unknown[] = [JSON.parse(sessionCreatedMsgs[0])];
 
-    expect(realResult.rawMessages.length, "Real API returned no WS messages").toBeGreaterThan(0);
-    expect(mockEvents.length, "Mock returned no WS messages").toBeGreaterThan(0);
+      // session.update with tools
+      mockWs.send(
+        JSON.stringify({
+          type: "session.update",
+          session: { model: "gpt-4o-mini", modalities: ["text"], tools },
+        }),
+      );
+      const sessionUpdatedMsgs = await mockWs.waitForMessages(2);
+      allMockRaw.push(JSON.parse(sessionUpdatedMsgs[1]));
 
-    const diffs = compareSSESequences(sdkEvents, realResult.events, mockEvents);
-    const report = formatDriftReport("OpenAI Realtime WS (GA text events)", diffs);
+      // conversation.item.create
+      mockWs.send(
+        JSON.stringify({
+          type: "conversation.item.create",
+          item: {
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: "Weather in Paris" }],
+          },
+        }),
+      );
+      const itemCreatedMsgs = await mockWs.waitForMessages(3);
+      allMockRaw.push(JSON.parse(itemCreatedMsgs[2]));
 
-    expect(
-      diffs.filter((d) => d.severity === "critical"),
-      report,
-    ).toEqual([]);
-  });
+      // response.create
+      mockWs.send(JSON.stringify({ type: "response.create" }));
 
-  it("WS tool call event sequence matches (GA)", async () => {
-    const sdkEvents = [
-      ...openaiRealtimeTextEventShapes().filter(
-        (e) =>
-          e.type === "session.created" ||
-          e.type === "session.updated" ||
-          e.type === "conversation.item.added" ||
-          e.type === "response.created" ||
-          e.type === "response.done",
-      ),
-      ...openaiRealtimeToolCallEventShapes(),
-    ];
+      // Collect remaining messages until response.done
+      const responseMsgs = await collectMockWSMessages(
+        mockWs,
+        (msg) => (msg as Record<string, unknown>).type === "response.done",
+        15000,
+        3,
+      );
+      allMockRaw.push(...responseMsgs.rawMessages);
+      mockWs.close();
 
-    const tools = [
-      {
-        type: "function",
-        name: "get_weather",
-        description: "Get weather",
-        parameters: {
-          type: "object",
-          properties: { city: { type: "string" } },
-          required: ["city"],
-        },
-      },
-    ];
+      // Build mock events
+      const mockEvents = allMockRaw.map((msg) => {
+        const m = msg as Record<string, unknown>;
+        return {
+          type: m.type as string,
+          dataShape: extractShape(msg),
+        };
+      });
 
-    // Real API — GA mode
-    const realResult = await openaiRealtimeWS(config, "Weather in Paris", tools, false);
+      expect(realResult.rawMessages.length, "Real API returned no WS messages").toBeGreaterThan(0);
+      expect(mockEvents.length, "Mock returned no WS messages").toBeGreaterThan(0);
 
-    // Mock — replicate the Realtime protocol sequence
-    const mockWs = await connectWebSocket(instance.url, "/v1/realtime");
+      const diffs = compareSSESequences(sdkEvents, realResult.events, mockEvents);
+      const report = formatDriftReport("OpenAI Realtime WS (GA tool call events)", diffs);
 
-    // session.created
-    const sessionCreatedMsgs = await mockWs.waitForMessages(1);
-    const allMockRaw: unknown[] = [JSON.parse(sessionCreatedMsgs[0])];
+      expect(
+        diffs.filter((d) => d.severity === "critical"),
+        report,
+      ).toEqual([]);
+    },
+  );
 
-    // session.update with tools
-    mockWs.send(
-      JSON.stringify({
-        type: "session.update",
-        session: { model: "gpt-4o-mini", modalities: ["text"], tools },
-      }),
-    );
-    const sessionUpdatedMsgs = await mockWs.waitForMessages(2);
-    allMockRaw.push(JSON.parse(sessionUpdatedMsgs[1]));
+  it.skipIf(!process.env.OPENAI_REALTIME_KEY)(
+    "GA and Beta event sequences are consistent after normalization",
+    async () => {
+      // GA connection (no Beta header)
+      const gaResult = await openaiRealtimeWS(config, "Say hello in one word.", undefined, false);
 
-    // conversation.item.create
-    mockWs.send(
-      JSON.stringify({
-        type: "conversation.item.create",
-        item: {
-          type: "message",
-          role: "user",
-          content: [{ type: "input_text", text: "Weather in Paris" }],
-        },
-      }),
-    );
-    const itemCreatedMsgs = await mockWs.waitForMessages(3);
-    allMockRaw.push(JSON.parse(itemCreatedMsgs[2]));
+      // Beta connection
+      const betaResult = await openaiRealtimeWS(config, "Say hello in one word.", undefined, true);
 
-    // response.create
-    mockWs.send(JSON.stringify({ type: "response.create" }));
+      // Normalize GA events to Beta names for comparison
+      const gaToComparable = (type: string) => GA_TO_BETA_EVENT[type] ?? type;
 
-    // Collect remaining messages until response.done
-    const responseMsgs = await collectMockWSMessages(
-      mockWs,
-      (msg) => (msg as Record<string, unknown>).type === "response.done",
-      15000,
-      3,
-    );
-    allMockRaw.push(...responseMsgs.rawMessages);
-    mockWs.close();
+      const gaTypes = gaResult.events
+        .map((e) => e.type)
+        .filter((t) => !BETA_SUPPRESSED_EVENTS.has(t))
+        .map(gaToComparable);
+      const betaTypes = betaResult.events.map((e) => e.type);
 
-    // Build mock events
-    const mockEvents = allMockRaw.map((msg) => {
-      const m = msg as Record<string, unknown>;
-      return {
-        type: m.type as string,
-        dataShape: extractShape(msg),
-      };
-    });
-
-    expect(realResult.rawMessages.length, "Real API returned no WS messages").toBeGreaterThan(0);
-    expect(mockEvents.length, "Mock returned no WS messages").toBeGreaterThan(0);
-
-    const diffs = compareSSESequences(sdkEvents, realResult.events, mockEvents);
-    const report = formatDriftReport("OpenAI Realtime WS (GA tool call events)", diffs);
-
-    expect(
-      diffs.filter((d) => d.severity === "critical"),
-      report,
-    ).toEqual([]);
-  });
-
-  it("GA and Beta event sequences are consistent after normalization", async () => {
-    // GA connection (no Beta header)
-    const gaResult = await openaiRealtimeWS(config, "Say hello in one word.", undefined, false);
-
-    // Beta connection
-    const betaResult = await openaiRealtimeWS(config, "Say hello in one word.", undefined, true);
-
-    // Normalize GA events to Beta names for comparison
-    const gaToComparable = (type: string) => GA_TO_BETA_EVENT[type] ?? type;
-
-    const gaTypes = gaResult.events
-      .map((e) => e.type)
-      .filter((t) => !BETA_SUPPRESSED_EVENTS.has(t))
-      .map(gaToComparable);
-    const betaTypes = betaResult.events.map((e) => e.type);
-
-    // Deduplicate consecutive repeated types so that differences in delta
-    // count (non-deterministic LLM output length) don't cause false failures.
-    function dedupeConsecutive(types: string[]): string[] {
-      return types.filter((t, i) => i === 0 || t !== types[i - 1]);
-    }
-    expect(dedupeConsecutive(gaTypes)).toEqual(dedupeConsecutive(betaTypes));
-  });
+      // Deduplicate consecutive repeated types so that differences in delta
+      // count (non-deterministic LLM output length) don't cause false failures.
+      function dedupeConsecutive(types: string[]): string[] {
+        return types.filter((t, i) => i === 0 || t !== types[i - 1]);
+      }
+      expect(dedupeConsecutive(gaTypes)).toEqual(dedupeConsecutive(betaTypes));
+    },
+  );
 });
