@@ -172,6 +172,7 @@ export function serializeErrorResponse(response: ErrorResponse): string {
     error: {
       message: response.error.message,
       type: response.error.type ?? "server_error",
+      param: response.error.param ?? null,
       code: response.error.code ?? null,
     },
   });

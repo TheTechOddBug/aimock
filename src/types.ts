@@ -165,7 +165,7 @@ export interface ContentWithToolCallsResponse extends ResponseOverrides {
 }
 
 export interface ErrorResponse {
-  error: { message: string; type?: string; code?: string };
+  error: { message: string; type?: string; param?: string | null; code?: string };
   status?: number;
 }
 
