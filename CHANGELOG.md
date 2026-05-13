@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.22.1] - 2026-05-12
+
 ### Fixed
 
 - **Strict mode checked before proxy attempt** — in `--proxy-only` mode, the `X-AIMock-Strict` header had no effect because `proxyAndRecord()` returned before the strict check. Now all 17 handlers check strict mode first: when strict + no fixture → 503 immediately, no proxy attempt
