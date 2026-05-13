@@ -22,7 +22,7 @@ Options:
   -l, --latency <ms>        Latency in ms between SSE chunks (default: 0)
   -c, --chunk-size <chars>  Chunk size in characters (default: 20)
   -w, --watch               Watch fixture path for changes and reload
-      --log-level <level>   Log verbosity: silent, info, debug (default: info)
+      --log-level <level>   Log verbosity: silent, warn, info, debug (default: info)
       --validate-on-load    Validate fixture schemas at startup
       --metrics             Enable Prometheus metrics at GET /metrics
       --record              Record mode: proxy unmatched requests and save fixtures
