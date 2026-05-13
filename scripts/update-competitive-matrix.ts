@@ -183,7 +183,13 @@ const FEATURE_RULES: FeatureRule[] = [
   },
   {
     rowLabel: "Drift detection",
-    keywords: ["drift", "conformance", "schema validation"],
+    keywords: [
+      "drift detection",
+      "drift test",
+      "api drift",
+      "conformance test",
+      "schema validation",
+    ],
   },
   {
     rowLabel: "Request journal",
