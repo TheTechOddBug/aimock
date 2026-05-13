@@ -180,8 +180,12 @@ function buildBedrockStreamContentWithToolCallsEvents(
 ): Array<{ eventType: string; payload: object }> {
   const events = buildBedrockStreamTextEvents(content, chunkSize, reasoning, overrides);
   // Remove trailing metadata + messageStop events — we re-emit them after tool blocks
-  events.pop(); // metadata
-  events.pop(); // messageStop
+  for (let i = events.length - 1; i >= 0; i--) {
+    const et = (events[i] as { eventType: string }).eventType;
+    if (et === "metadata" || et === "messageStop") {
+      events.splice(i, 1);
+    }
+  }
   let blockIndex = reasoning ? 2 : 1;
 
   for (const tc of toolCalls) {
@@ -336,7 +340,7 @@ export function converseToCompletionRequest(
       if (toolUseBlocks.length > 0) {
         messages.push({
           role: "assistant",
-          content: textContent ?? null,
+          content: textContent || null,
           tool_calls: toolUseBlocks.map((b) => ({
             id: b.toolUse!.toolUseId,
             type: "function" as const,
@@ -347,7 +351,7 @@ export function converseToCompletionRequest(
           })),
         });
       } else {
-        messages.push({ role: "assistant", content: textContent ?? null });
+        messages.push({ role: "assistant", content: textContent || null });
       }
     } else {
       const warnMsg = `Unexpected message role "${msg.role}" in Converse request — skipping`;
@@ -607,6 +611,7 @@ export async function handleConverse(
         defaults,
         raw,
       );
+      if (outcome === "handled_by_hook") return;
       if (outcome !== "not_configured") {
         journal.add({
           method: req.method ?? "POST",
@@ -723,7 +728,7 @@ export async function handleConverse(
 
   // Tool call response
   if (isToolCallResponse(response)) {
-    if ("webSearches" in response) {
+    if (response.webSearches?.length) {
       logger.warn(
         "webSearches in fixture response are not supported for Bedrock Converse API — ignoring",
       );
@@ -877,6 +882,7 @@ export async function handleConverseStream(
         defaults,
         raw,
       );
+      if (outcome === "handled_by_hook") return;
       if (outcome !== "not_configured") {
         journal.add({
           method: req.method ?? "POST",
@@ -1023,7 +1029,7 @@ export async function handleConverseStream(
 
   // Tool call response — stream as Event Stream
   if (isToolCallResponse(response)) {
-    if ("webSearches" in response) {
+    if (response.webSearches?.length) {
       logger.warn(
         "webSearches in fixture response are not supported for Bedrock Converse API — ignoring",
       );

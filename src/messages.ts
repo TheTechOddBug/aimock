@@ -190,7 +190,9 @@ export function claudeToCompletionRequest(req: ClaudeRequest): ChatCompletionReq
     messages,
     stream: req.stream,
     temperature: req.temperature,
+    max_tokens: req.max_tokens,
     tools,
+    _endpointType: "chat",
   };
 }
 
@@ -210,8 +212,8 @@ function claudeUsage(overrides?: ResponseOverrides): {
 } {
   if (!overrides?.usage) return { input_tokens: 0, output_tokens: 0 };
   return {
-    input_tokens: overrides.usage.input_tokens ?? 0,
-    output_tokens: overrides.usage.output_tokens ?? 0,
+    input_tokens: overrides.usage.input_tokens ?? overrides.usage.prompt_tokens ?? 0,
+    output_tokens: overrides.usage.output_tokens ?? overrides.usage.completion_tokens ?? 0,
   };
 }
 
@@ -741,7 +743,6 @@ export async function handleMessages(
 
   // Convert to ChatCompletionRequest for fixture matching
   const completionReq = claudeToCompletionRequest(claudeReq);
-  completionReq._endpointType = "chat";
 
   const testId = getTestId(req);
   const fixture = matchFixture(
@@ -795,6 +796,7 @@ export async function handleMessages(
         defaults,
         raw,
       );
+      if (outcome === "handled_by_hook") return;
       if (outcome !== "not_configured") {
         journal.add({
           method: req.method ?? "POST",
@@ -970,6 +972,11 @@ export async function handleMessages(
 
   // Tool call response
   if (isToolCallResponse(response)) {
+    if (response.webSearches?.length) {
+      logger.warn(
+        "webSearches in fixture response are not supported for Claude Messages API — ignoring",
+      );
+    }
     const overrides = extractOverrides(response);
     const journalEntry = journal.add({
       method: req.method ?? "POST",

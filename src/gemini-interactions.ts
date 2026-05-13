@@ -713,7 +713,7 @@ export async function handleGeminiInteractions(
         raw,
       );
       if (outcome === "handled_by_hook") return;
-      if (outcome === "relayed") {
+      if (outcome !== "not_configured") {
         journal.add({
           method: req.method ?? "POST",
           path: urlPath,

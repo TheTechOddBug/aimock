@@ -26,6 +26,7 @@ import {
   isToolCallResponse,
   isContentWithToolCallsResponse,
   isErrorResponse,
+  serializeErrorResponse,
   flattenHeaders,
   getTestId,
   resolveResponse,
@@ -583,6 +584,7 @@ export async function handleOllama(
         defaults,
         raw,
       );
+      if (outcome === "handled_by_hook") return;
       if (outcome !== "not_configured") {
         journal.add({
           method: req.method ?? "POST",
@@ -643,12 +645,15 @@ export async function handleOllama(
       body: completionReq,
       response: { status, fixture },
     });
-    writeErrorResponse(res, status, JSON.stringify(response));
+    writeErrorResponse(res, status, serializeErrorResponse(response));
     return;
   }
 
   // Content + tool calls response (must be checked before text/tool-only branches)
   if (isContentWithToolCallsResponse(response)) {
+    if (response.webSearches?.length) {
+      logger.warn("webSearches in fixture response are not supported for Ollama API -- ignoring");
+    }
     const journalEntry = journal.add({
       method: req.method ?? "POST",
       path: urlPath,
@@ -692,6 +697,9 @@ export async function handleOllama(
 
   // Text response
   if (isTextResponse(response)) {
+    if (response.webSearches?.length) {
+      logger.warn("webSearches in fixture response are not supported for Ollama API -- ignoring");
+    }
     const journalEntry = journal.add({
       method: req.method ?? "POST",
       path: urlPath,
@@ -733,6 +741,9 @@ export async function handleOllama(
 
   // Tool call response
   if (isToolCallResponse(response)) {
+    if (response.webSearches?.length) {
+      logger.warn("webSearches in fixture response are not supported for Ollama API — ignoring");
+    }
     const journalEntry = journal.add({
       method: req.method ?? "POST",
       path: urlPath,
@@ -895,6 +906,7 @@ export async function handleOllamaGenerate(
         defaults,
         raw,
       );
+      if (outcome === "handled_by_hook") return;
       if (outcome !== "not_configured") {
         journal.add({
           method: req.method ?? "POST",
@@ -955,7 +967,7 @@ export async function handleOllamaGenerate(
       body: completionReq,
       response: { status, fixture },
     });
-    writeErrorResponse(res, status, JSON.stringify(response));
+    writeErrorResponse(res, status, serializeErrorResponse(response));
     return;
   }
 

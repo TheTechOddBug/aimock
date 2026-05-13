@@ -17,6 +17,7 @@ import { collapseStreamingResponse } from "./stream-collapse.js";
 import { writeErrorResponse } from "./sse-writer.js";
 import { resolveUpstreamUrl } from "./url.js";
 import { getTestId, slugifyTestId } from "./helpers.js";
+import { DEFAULT_TEST_ID } from "./constants.js";
 
 /** Headers to strip when proxying — hop-by-hop (RFC 2616 §13.5.1) + client-set. */
 const STRIP_HEADERS = new Set([
@@ -165,7 +166,14 @@ export async function proxyAndRecord(
   let streamedToClient = false;
   let clientDisconnected = false;
   try {
-    const result = await makeUpstreamRequest(target, forwardHeaders, requestBody, res, req.method);
+    const result = await makeUpstreamRequest(
+      target,
+      forwardHeaders,
+      requestBody,
+      res,
+      req.method,
+      defaults.logger,
+    );
     upstreamStatus = result.status;
     upstreamHeaders = result.headers;
     upstreamBody = result.body;
@@ -350,7 +358,7 @@ export async function proxyAndRecord(
   if (!defaults.record?.proxyOnly) {
     // Determine file path: snapshot-style (by testId) or legacy timestamp
     const testId = getTestId(req);
-    let isSnapshotMode = testId !== "__default__";
+    let isSnapshotMode = testId !== DEFAULT_TEST_ID;
 
     let filepath!: string;
     let mergeExisting = false;
@@ -431,9 +439,9 @@ export async function proxyAndRecord(
       const msg = err instanceof Error ? err.message : "Unknown filesystem error";
       defaults.logger.error(`Failed to save fixture to disk: ${msg}`);
       if (!res.headersSent) {
-        res.setHeader("X-LLMock-Record-Error", msg);
+        res.setHeader("X-AIMock-Record-Error", msg);
       } else {
-        defaults.logger.warn(`Cannot set X-LLMock-Record-Error header — headers already sent`);
+        defaults.logger.warn(`Cannot set X-AIMock-Record-Error header — headers already sent`);
       }
     }
 
@@ -523,6 +531,7 @@ function makeUpstreamRequest(
   body: string,
   clientRes?: http.ServerResponse,
   method: string = "POST",
+  logger?: Logger,
 ): Promise<{
   status: number;
   headers: http.IncomingHttpHeaders;
@@ -603,8 +612,10 @@ function makeUpstreamRequest(
           ) {
             try {
               clientRes.write(chunk);
-            } catch {
-              // Client socket errored (disconnect, reset, etc.) — stop relaying.
+            } catch (writeErr) {
+              logger?.debug(
+                `Failed to relay chunk to client: ${writeErr instanceof Error ? writeErr.message : "unknown"}`,
+              );
               clientDisconnected = true;
             }
           }
@@ -622,8 +633,10 @@ function makeUpstreamRequest(
           ) {
             try {
               clientRes.end();
-            } catch {
-              /* client already gone */
+            } catch (endErr) {
+              logger?.debug(
+                `Failed to end client response: ${endErr instanceof Error ? endErr.message : "unknown"}`,
+              );
             }
           }
           resolve({

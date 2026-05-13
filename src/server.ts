@@ -25,9 +25,11 @@ import {
   isToolCallResponse,
   isContentWithToolCallsResponse,
   isErrorResponse,
+  serializeErrorResponse,
   isAudioResponse,
   flattenHeaders,
   getTestId,
+  readBody,
   resolveResponse,
   resolveStrictMode,
   strictOverrideField,
@@ -37,7 +39,11 @@ import { handleMessages } from "./messages.js";
 import { handleGemini } from "./gemini.js";
 import { handleBedrock, handleBedrockStream } from "./bedrock.js";
 import { handleConverse, handleConverseStream } from "./bedrock-converse.js";
-import { handleGeminiInteractions } from "./gemini-interactions.js";
+import {
+  handleGeminiInteractions,
+  resetInteractionCounter,
+  resetEventIdCounter,
+} from "./gemini-interactions.js";
 import { handleEmbeddings } from "./embeddings.js";
 import { handleImages } from "./images.js";
 import { handleSpeech } from "./speech.js";
@@ -172,26 +178,6 @@ function setCorsHeaders(res: http.ServerResponse): void {
   }
 }
 
-const DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024; // 10 MB
-
-async function readBody(
-  req: http.IncomingMessage,
-  maxBytes: number = DEFAULT_MAX_BODY_BYTES,
-): Promise<string> {
-  const buffers: Buffer[] = [];
-  let totalBytes = 0;
-  for await (const chunk of req) {
-    const buf = chunk as Buffer;
-    totalBytes += buf.length;
-    if (totalBytes > maxBytes) {
-      req.destroy();
-      throw new Error(`Request body exceeded size limit of ${maxBytes} bytes`);
-    }
-    buffers.push(buf);
-  }
-  return Buffer.concat(buffers).toString();
-}
-
 function handleOptions(res: http.ServerResponse): void {
   setCorsHeaders(res);
   res.writeHead(204);
@@ -309,6 +295,8 @@ async function handleControlAPI(
     videoStates.clear();
     falJobs.clear();
     falQueueStates.clear();
+    resetInteractionCounter();
+    resetEventIdCounter();
     if (defaults.registry) {
       defaults.registry.setGauge("aimock_fixtures_loaded", {}, fixtures.length);
     }
@@ -600,7 +588,7 @@ async function handleCompletions(
         hookOptions,
       );
       if (outcome === "handled_by_hook") return;
-      if (outcome === "relayed") {
+      if (outcome !== "not_configured") {
         journal.add({
           method: req.method ?? "POST",
           path: req.url ?? COMPLETIONS_PATH,
@@ -664,17 +652,7 @@ async function handleCompletions(
       body,
       response: { status, fixture },
     });
-    // Serialize only the error envelope (strip internal-only fields like `status`)
-    // and ensure `param` is present per OpenAI spec
-    const errorBody = {
-      error: {
-        message: response.error.message,
-        type: response.error.type ?? "server_error",
-        param: null,
-        code: response.error.code ?? null,
-      },
-    };
-    writeErrorResponse(res, status, JSON.stringify(errorBody));
+    writeErrorResponse(res, status, serializeErrorResponse(response));
     return;
   }
 
@@ -803,6 +781,11 @@ async function handleCompletions(
 
   // Tool call response
   if (isToolCallResponse(response)) {
+    if (response.webSearches?.length) {
+      defaults.logger.warn(
+        "webSearches in fixture response are not supported for Chat Completions API — ignoring",
+      );
+    }
     const overrides = extractOverrides(response);
     const journalEntry = journal.add({
       method: req.method ?? "POST",
@@ -1748,48 +1731,6 @@ export async function createServer(
       setCorsHeaders(res);
       try {
         const raw = await readBody(req);
-        // Try to match a fixture so chaos evaluation can use fixture-level overrides
-        let elSoundFixture: Fixture | null = null;
-        try {
-          const parsed = JSON.parse(raw) as Record<string, unknown>;
-          const syntheticReq: ChatCompletionRequest = {
-            model: (parsed.model_id as string) ?? "eleven_text_to_sound_v2",
-            messages: [{ role: "user", content: (parsed.text as string) ?? "" }],
-            _endpointType: "audio-gen",
-          };
-          const testId = getTestId(req);
-          elSoundFixture = matchFixture(
-            fixtures,
-            syntheticReq,
-            journal.getFixtureMatchCountsForTest(testId),
-            defaults.requestTransform,
-          );
-        } catch {
-          // JSON parse failure — fixture matching not possible, handler will report the error
-        }
-        const chaosAction = evaluateChaos(
-          elSoundFixture,
-          defaults.chaos,
-          req.headers,
-          defaults.logger,
-        );
-        if (chaosAction) {
-          applyChaosAction(
-            chaosAction,
-            res,
-            elSoundFixture,
-            journal,
-            {
-              method: req.method ?? "POST",
-              path: pathname,
-              headers: flattenHeaders(req.headers),
-              body: { model: "", messages: [] },
-            },
-            "fixture",
-            defaults.registry,
-          );
-          return;
-        }
         await handleElevenLabsAudio(req, res, raw, fixtures, defaults, journal, "sound-generation");
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Internal error";
@@ -1813,55 +1754,6 @@ export async function createServer(
       const musicSubType = musicMatch[1] ?? "music";
       try {
         const raw = await readBody(req);
-        // Try to match a fixture so chaos evaluation can use fixture-level overrides
-        let elMusicFixture: Fixture | null = null;
-        try {
-          const parsed = JSON.parse(raw) as Record<string, unknown>;
-          const prompt =
-            (typeof parsed.prompt === "string" ? parsed.prompt : null) ??
-            (parsed.composition_plan != null
-              ? typeof parsed.composition_plan === "string"
-                ? parsed.composition_plan
-                : JSON.stringify(parsed.composition_plan)
-              : "");
-          const syntheticReq: ChatCompletionRequest = {
-            model: (parsed.model_id as string) ?? "music_v1",
-            messages: [{ role: "user", content: prompt }],
-            _endpointType: "audio-gen",
-          };
-          const testId = getTestId(req);
-          elMusicFixture = matchFixture(
-            fixtures,
-            syntheticReq,
-            journal.getFixtureMatchCountsForTest(testId),
-            defaults.requestTransform,
-          );
-        } catch {
-          // JSON parse failure — fixture matching not possible, handler will report the error
-        }
-        const chaosAction = evaluateChaos(
-          elMusicFixture,
-          defaults.chaos,
-          req.headers,
-          defaults.logger,
-        );
-        if (chaosAction) {
-          applyChaosAction(
-            chaosAction,
-            res,
-            elMusicFixture,
-            journal,
-            {
-              method: req.method ?? "POST",
-              path: pathname,
-              headers: flattenHeaders(req.headers),
-              body: { model: "", messages: [] },
-            },
-            "fixture",
-            defaults.registry,
-          );
-          return;
-        }
         await handleElevenLabsAudio(req, res, raw, fixtures, defaults, journal, musicSubType);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Internal error";
@@ -1933,52 +1825,6 @@ export async function createServer(
       setCorsHeaders(res);
       try {
         const raw = falBody ?? (await readBody(req));
-        // Try to match a fixture so chaos evaluation can use fixture-level overrides
-        let falSubmitFixture: Fixture | null = null;
-        try {
-          const parsed = raw.trim() ? (JSON.parse(raw) as Record<string, unknown>) : {};
-          const prompt =
-            (typeof parsed.prompt === "string" ? parsed.prompt : null) ??
-            (typeof parsed.text === "string" ? parsed.text : null) ??
-            "";
-          const syntheticReq: ChatCompletionRequest = {
-            model: falQueueSubmitMatch[1],
-            messages: [{ role: "user", content: prompt }],
-            _endpointType: "fal-audio",
-          };
-          const testId = getTestId(req);
-          falSubmitFixture = matchFixture(
-            fixtures,
-            syntheticReq,
-            journal.getFixtureMatchCountsForTest(testId),
-            defaults.requestTransform,
-          );
-        } catch {
-          // JSON parse failure — fixture matching not possible, handler will report the error
-        }
-        const chaosAction = evaluateChaos(
-          falSubmitFixture,
-          defaults.chaos,
-          req.headers,
-          defaults.logger,
-        );
-        if (chaosAction) {
-          applyChaosAction(
-            chaosAction,
-            res,
-            falSubmitFixture,
-            journal,
-            {
-              method: req.method ?? "POST",
-              path: pathname,
-              headers: flattenHeaders(req.headers),
-              body: { model: "", messages: [] },
-            },
-            "fixture",
-            defaults.registry,
-          );
-          return;
-        }
         await handleFalQueue(req, res, raw, pathname, fixtures, defaults, journal);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Internal error";
@@ -2045,52 +1891,6 @@ export async function createServer(
       setCorsHeaders(res);
       try {
         const raw = falBody ?? (await readBody(req));
-        // Try to match a fixture so chaos evaluation can use fixture-level overrides
-        let falRunFixture: Fixture | null = null;
-        try {
-          const parsed = raw.trim() ? (JSON.parse(raw) as Record<string, unknown>) : {};
-          const prompt =
-            (typeof parsed.prompt === "string" ? parsed.prompt : null) ??
-            (typeof parsed.text === "string" ? parsed.text : null) ??
-            "";
-          const syntheticReq: ChatCompletionRequest = {
-            model: falRunMatch[1],
-            messages: [{ role: "user", content: prompt }],
-            _endpointType: "fal-audio",
-          };
-          const testId = getTestId(req);
-          falRunFixture = matchFixture(
-            fixtures,
-            syntheticReq,
-            journal.getFixtureMatchCountsForTest(testId),
-            defaults.requestTransform,
-          );
-        } catch {
-          // JSON parse failure — fixture matching not possible, handler will report the error
-        }
-        const chaosAction = evaluateChaos(
-          falRunFixture,
-          defaults.chaos,
-          req.headers,
-          defaults.logger,
-        );
-        if (chaosAction) {
-          applyChaosAction(
-            chaosAction,
-            res,
-            falRunFixture,
-            journal,
-            {
-              method: req.method ?? "POST",
-              path: pathname,
-              headers: flattenHeaders(req.headers),
-              body: { model: "", messages: [] },
-            },
-            "fixture",
-            defaults.registry,
-          );
-          return;
-        }
         await handleFalQueue(req, res, raw, pathname, fixtures, defaults, journal);
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : "Internal error";

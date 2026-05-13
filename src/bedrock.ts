@@ -207,7 +207,7 @@ export function bedrockToCompletionRequest(
         if (toolUseBlocks.length > 0) {
           messages.push({
             role: "assistant",
-            content: textContent ?? null,
+            content: textContent || null,
             tool_calls: toolUseBlocks.map((b, index) => {
               if (!b.id && logger) {
                 logger.warn(
@@ -225,7 +225,7 @@ export function bedrockToCompletionRequest(
             }),
           });
         } else {
-          messages.push({ role: "assistant", content: textContent ?? null });
+          messages.push({ role: "assistant", content: textContent || null });
         }
       } else {
         messages.push({ role: "assistant", content: null });
@@ -257,6 +257,7 @@ export function bedrockToCompletionRequest(
     messages,
     stream: false,
     temperature: req.temperature,
+    max_tokens: req.max_tokens,
     tools,
   };
 }
@@ -438,6 +439,7 @@ export async function handleBedrock(
         defaults,
         raw,
       );
+      if (outcome === "handled_by_hook") return;
       if (outcome !== "not_configured") {
         journal.add({
           method: req.method ?? "POST",
@@ -571,7 +573,7 @@ export async function handleBedrock(
 
   // Tool call response
   if (isToolCallResponse(response)) {
-    if ("webSearches" in response) {
+    if (response.webSearches?.length) {
       logger.warn("webSearches in fixture response are not supported for Bedrock API — ignoring");
     }
     const overrides = extractOverrides(response);
@@ -1058,6 +1060,7 @@ export async function handleBedrockStream(
         defaults,
         raw,
       );
+      if (outcome === "handled_by_hook") return;
       if (outcome !== "not_configured") {
         journal.add({
           method: req.method ?? "POST",
@@ -1204,7 +1207,7 @@ export async function handleBedrockStream(
 
   // Tool call response — stream as Event Stream
   if (isToolCallResponse(response)) {
-    if ("webSearches" in response) {
+    if (response.webSearches?.length) {
       logger.warn("webSearches in fixture response are not supported for Bedrock API — ignoring");
     }
     const overrides = extractOverrides(response);

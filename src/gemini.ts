@@ -109,15 +109,26 @@ export function geminiToCompletionRequest(
         const textParts = content.parts.filter((p) => p.text !== undefined && !p.thought);
 
         if (funcResponses.length > 0) {
-          // functionResponse → tool message
+          // functionResponse → tool message; match IDs from the preceding assistant's tool_calls
+          const lastAssistant = [...messages]
+            .reverse()
+            .find((m) => m.role === "assistant" && m.tool_calls);
+          const matchedToolCallIds = new Set<string>();
           for (const part of funcResponses) {
+            const matchingCall = lastAssistant?.tool_calls?.find(
+              (tc) =>
+                tc.function.name === part.functionResponse!.name && !matchedToolCallIds.has(tc.id),
+            );
+            if (matchingCall) matchedToolCallIds.add(matchingCall.id);
+            const toolCallId =
+              matchingCall?.id ?? `call_gemini_${part.functionResponse!.name}_${callCounter++}`;
             messages.push({
               role: "tool",
               content:
                 typeof part.functionResponse!.response === "string"
                   ? part.functionResponse!.response
                   : JSON.stringify(part.functionResponse!.response),
-              tool_call_id: `call_gemini_${part.functionResponse!.name}_${callCounter++}`,
+              tool_call_id: toolCallId,
             });
           }
           // Any text parts alongside → user message
@@ -142,8 +153,8 @@ export function geminiToCompletionRequest(
           messages.push({
             role: "assistant",
             content: text || null,
-            tool_calls: funcCalls.map((fc) => ({
-              id: `call_gemini_${fc.functionCall!.name}_${callCounter++}`,
+            tool_calls: funcCalls.map((fc, i) => ({
+              id: `call_gemini_${fc.functionCall!.name}_${i}`,
               type: "function" as const,
               function: {
                 name: fc.functionCall!.name,
@@ -209,8 +220,16 @@ function geminiUsageMetadata(overrides?: ResponseOverrides): {
 } {
   if (!overrides?.usage)
     return { promptTokenCount: 0, candidatesTokenCount: 0, totalTokenCount: 0 };
-  const prompt = overrides.usage.promptTokenCount ?? 0;
-  const candidates = overrides.usage.candidatesTokenCount ?? 0;
+  const prompt =
+    overrides.usage.promptTokenCount ??
+    overrides.usage.prompt_tokens ??
+    overrides.usage.input_tokens ??
+    0;
+  const candidates =
+    overrides.usage.candidatesTokenCount ??
+    overrides.usage.completion_tokens ??
+    overrides.usage.output_tokens ??
+    0;
   const total = overrides.usage.totalTokenCount ?? prompt + candidates;
   return {
     promptTokenCount: prompt,
@@ -643,6 +662,7 @@ export async function handleGemini(
         defaults,
         raw,
       );
+      if (outcome === "handled_by_hook") return;
       if (outcome !== "not_configured") {
         journal.add({
           method: req.method ?? "POST",
@@ -837,6 +857,9 @@ export async function handleGemini(
 
   // Tool call response
   if (isToolCallResponse(response)) {
+    if (response.webSearches?.length) {
+      logger.warn("webSearches in fixture response are not supported for Gemini API — ignoring");
+    }
     const overrides = extractOverrides(response);
     const journalEntry = journal.add({
       method: req.method ?? "POST",

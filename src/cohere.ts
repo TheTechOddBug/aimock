@@ -28,6 +28,7 @@ import {
   isToolCallResponse,
   isContentWithToolCallsResponse,
   isErrorResponse,
+  serializeErrorResponse,
   flattenHeaders,
   getTestId,
   resolveResponse,
@@ -874,6 +875,7 @@ export async function handleCohere(
         defaults,
         raw,
       );
+      if (outcome === "handled_by_hook") return;
       if (outcome !== "not_configured") {
         journal.add({
           method: req.method ?? "POST",
@@ -933,7 +935,7 @@ export async function handleCohere(
       body: completionReq,
       response: { status, fixture },
     });
-    writeErrorResponse(res, status, JSON.stringify(response));
+    writeErrorResponse(res, status, serializeErrorResponse(response));
     return;
   }
 
@@ -1033,6 +1035,11 @@ export async function handleCohere(
 
   // Tool call response
   if (isToolCallResponse(response)) {
+    if (response.webSearches?.length) {
+      logger.warn(
+        "webSearches in fixture response are not supported for Cohere v2 Chat API — ignoring",
+      );
+    }
     const overrides = extractOverrides(response);
     const journalEntry = journal.add({
       method: req.method ?? "POST",
