@@ -219,4 +219,19 @@ describe("X-AIMock-Strict header integration", () => {
     expect(entries.length).toBe(1);
     expect(entries[0].response.strictOverride).toBe(false);
   });
+
+  it("strict header prevents proxy in record mode", async () => {
+    server = await createServer([], {
+      port: 0,
+      record: {
+        providers: { openai: "https://api.openai.com" },
+      },
+    });
+    const res = await httpPost(`${server.url}/v1/chat/completions`, chatRequest("anything"), {
+      "X-AIMock-Strict": "true",
+    });
+    expect(res.status).toBe(503);
+    const body = JSON.parse(res.body);
+    expect(body.error.message).toBe("Strict mode: no fixture matched");
+  });
 });

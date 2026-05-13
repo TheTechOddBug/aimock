@@ -692,7 +692,7 @@ describe("recorder strict mode", () => {
     expect(body.error.message).toBe("Strict mode: no fixture matched");
   });
 
-  it("record + strict: proxy succeeds when upstream is available", async () => {
+  it("record + strict: strict blocks proxy even when upstream is available", async () => {
     await setupUpstreamAndRecorder([
       {
         match: { userMessage: "hello" },
@@ -714,14 +714,15 @@ describe("recorder strict mode", () => {
       record: { providers: { openai: upstream!.url }, fixturePath: tmpDir },
     });
 
+    // Strict mode now takes precedence over proxy — returns 503
     const resp = await post(`${recorder.url}/v1/chat/completions`, {
       model: "gpt-4",
       messages: [{ role: "user", content: "hello" }],
     });
 
-    expect(resp.status).toBe(200);
+    expect(resp.status).toBe(503);
     const body = JSON.parse(resp.body);
-    expect(body.choices[0].message.content).toBe("world");
+    expect(body.error.message).toBe("Strict mode: no fixture matched");
   });
 });
 

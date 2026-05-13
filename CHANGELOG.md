@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- **Strict mode checked before proxy attempt** — in `--proxy-only` mode, the `X-AIMock-Strict` header had no effect because `proxyAndRecord()` returned before the strict check. Now all 17 handlers check strict mode first: when strict + no fixture → 503 immediately, no proxy attempt
 - **Helper utilities and error serialization** — hardened helper functions and error serialization paths for correctness and robustness
 - **Journal and fixture-loader correctness** — fixed journal entry handling and fixture-loader edge cases
 - **WebSocket handler consistency and strict-mode journal** — aligned WebSocket handler behavior and ensured strict-mode journal entries are recorded correctly
