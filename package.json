@@ -170,7 +170,7 @@
     "lint": "eslint .",
     "format:check": "prettier --check .",
     "release": "pnpm build && pnpm test && pnpm lint && npm publish",
-    "prepare": "husky"
+    "prepare": "husky || true"
   },
   "lint-staged": {
     "*.{ts,mts,js,mjs,cjs,json,html,css,md}": "prettier --write",
