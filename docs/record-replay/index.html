@@ -258,6 +258,23 @@
               <td>Upstream URL for Cohere</td>
             </tr>
             <tr>
+              <td><code>--upstream-timeout-ms &lt;ms&gt;</code></td>
+              <td>
+                Connection idle timeout (ms) on the upstream request socket before the response body
+                begins (default: <code>30000</code>). Increase for upstreams with slow initial
+                responses (reasoning models, queue-backed providers).
+              </td>
+            </tr>
+            <tr>
+              <td><code>--body-timeout-ms &lt;ms&gt;</code></td>
+              <td>
+                Inter-chunk idle timeout (ms) on the upstream response body &mdash; fires if no
+                bytes arrive for this duration after the response has started streaming (default:
+                <code>30000</code>). Reasoning models under concurrent load can leave 30s+ gaps
+                between chunks; increase to e.g. <code>180000</code> in those setups.
+              </td>
+            </tr>
+            <tr>
               <td><code>--agui-record</code></td>
               <td>Enable AG-UI recording (proxy unmatched AG-UI requests)</td>
             </tr>
@@ -538,6 +555,30 @@
   <span class="prop">recordFullModelVersion</span>: <span class="kw">true</span>,
 });</code></pre>
         </div>
+
+        <h2 id="upstream-timeouts">Upstream Timeouts</h2>
+
+        <p>
+          By default, aimock aborts a proxied request if the upstream socket is idle for 30 seconds
+          (before the response body) or if no bytes arrive for 30 seconds during streaming.
+          Reasoning models under concurrent load can exceed these limits during the thinking phase.
+          Override with <code>upstreamTimeoutMs</code> and <code>bodyTimeoutMs</code>:
+        </p>
+
+        <div class="code-block">
+          <div class="code-block-header">Custom timeouts <span class="lang-tag">ts</span></div>
+          <pre><code><span class="op">mock</span>.<span class="fn">enableRecording</span>({
+  <span class="prop">providers</span>: { <span class="prop">openai</span>: <span class="str">"https://api.openai.com"</span> },
+  <span class="prop">fixturePath</span>: <span class="str">"./fixtures/recorded"</span>,
+  <span class="prop">bodyTimeoutMs</span>: <span class="num">180_000</span>,
+});</code></pre>
+        </div>
+
+        <p>
+          Or via CLI: <code>--body-timeout-ms 180000</code>. Values must be positive finite numbers;
+          zero, negative, <code>NaN</code>, and <code>Infinity</code> are rejected (CLI exits
+          non-zero; programmatic API falls back to the 30s default).
+        </p>
 
         <h2>Drift Detection Metadata</h2>
         <p>

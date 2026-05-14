@@ -95,6 +95,10 @@ npx @copilotkit/aimock --config aimock.json
 # Record mode: proxy to real APIs, save fixtures
 npx -p @copilotkit/aimock llmock --record --provider-openai https://api.openai.com
 
+# Record with extended timeout for reasoning models
+npx -p @copilotkit/aimock llmock --record --provider-openai https://api.openai.com \
+  --body-timeout-ms 180000
+
 # Convert fixtures from other tools
 npx @copilotkit/aimock convert vidaimock ./templates/ ./fixtures/
 npx @copilotkit/aimock convert mockllm ./config.yaml ./fixtures/

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Configurable proxy timeouts** — `RecordConfig` now accepts `upstreamTimeoutMs` (default 30s) and `bodyTimeoutMs` (default 30s). The body-idle timeout is the Node socket inactivity timer that fires `req.destroy()` mid-stream; under concurrent load against reasoning models (e.g. Grok 4.3 + structured output), token-emission gaps can routinely exceed 30s during the thinking phase, causing record-mode runs to truncate SSE responses mid-stream with no `[DONE]` and no `finish_reason`. Lift to e.g. `bodyTimeoutMs: 180_000` to record cleanly under that workload.
+
 ## [1.24.1] - 2026-05-14
 
 ### Fixed
