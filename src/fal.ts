@@ -166,12 +166,20 @@ function resolveProgression(config: FalQueueConfig | undefined): {
   pollsBeforeCompleted: number;
 } {
   const pollsBeforeInProgress = config?.pollsBeforeInProgress ?? 0;
+  const explicitCompleted = config?.pollsBeforeCompleted;
   // When only pollsBeforeInProgress is set, default pollsBeforeCompleted to one
-  // poll later so the job actually passes through IN_PROGRESS. When neither is
-  // configured, both stay 0 (no progression — completes on submit).
-  const pollsBeforeCompleted =
-    config?.pollsBeforeCompleted ??
-    (config?.pollsBeforeInProgress != null ? pollsBeforeInProgress + 1 : 0);
+  // poll later so the job actually passes through IN_PROGRESS. When the caller
+  // sets both explicitly, clamp completed >= inProgress so a misconfigured
+  // pair (e.g. completed < inProgress) can't silently skip the IN_PROGRESS
+  // transition. When neither is set, both stay 0 (completes on submit).
+  let pollsBeforeCompleted: number;
+  if (explicitCompleted != null) {
+    pollsBeforeCompleted = Math.max(pollsBeforeInProgress, explicitCompleted);
+  } else if (config?.pollsBeforeInProgress != null) {
+    pollsBeforeCompleted = pollsBeforeInProgress + 1;
+  } else {
+    pollsBeforeCompleted = 0;
+  }
   return { pollsBeforeInProgress, pollsBeforeCompleted };
 }
 

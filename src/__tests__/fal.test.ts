@@ -727,6 +727,63 @@ describe("fal.ai general handler — typed helpers + polling progression", () =>
     expect(poll3.status).toBe("COMPLETED");
   });
 
+  test("equal pollsBeforeInProgress and pollsBeforeCompleted still routes through IN_PROGRESS", async () => {
+    // Pins the advanceJob if/else reorder: with equal thresholds, the IN_QUEUE
+    // branch must fire first so a single poll emits IN_PROGRESS rather than
+    // jumping straight to COMPLETED.
+    mock = new LLMock({
+      port: 0,
+      falQueue: { pollsBeforeInProgress: 1, pollsBeforeCompleted: 1 },
+    });
+    mock.onFalImage(/flux/, { images: [{ url: "https://mock.fal.media/x.png" }] });
+    await mock.start();
+
+    const submit = await fetch(`${mock.url}/fal/fal-ai/flux/dev`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-fal-target-host": "queue.fal.run" },
+      body: JSON.stringify({ input: { prompt: "p" } }),
+    });
+    const envelope = await submit.json();
+    const jobPath = `${mock.url}/fal/fal-ai/flux/dev/requests/${envelope.request_id}`;
+    const headers = { "x-fal-target-host": "queue.fal.run" };
+
+    const poll1 = await (await fetch(`${jobPath}/status`, { headers })).json();
+    expect(poll1.status).toBe("IN_PROGRESS");
+    const poll2 = await (await fetch(`${jobPath}/status`, { headers })).json();
+    expect(poll2.status).toBe("COMPLETED");
+  });
+
+  test("misconfigured pollsBeforeCompleted < pollsBeforeInProgress clamps up", async () => {
+    // Caller misorders thresholds — resolveProgression must clamp so the job
+    // still passes through IN_PROGRESS instead of skipping straight to COMPLETED.
+    mock = new LLMock({
+      port: 0,
+      falQueue: { pollsBeforeInProgress: 3, pollsBeforeCompleted: 1 },
+    });
+    mock.onFalImage(/flux/, { images: [{ url: "https://mock.fal.media/x.png" }] });
+    await mock.start();
+
+    const submit = await fetch(`${mock.url}/fal/fal-ai/flux/dev`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-fal-target-host": "queue.fal.run" },
+      body: JSON.stringify({ input: { prompt: "p" } }),
+    });
+    const envelope = await submit.json();
+    const jobPath = `${mock.url}/fal/fal-ai/flux/dev/requests/${envelope.request_id}`;
+    const headers = { "x-fal-target-host": "queue.fal.run" };
+
+    // pollsBeforeCompleted clamped to 3. Poll 1+2 stay IN_QUEUE, poll 3 →
+    // IN_PROGRESS, poll 4 → COMPLETED.
+    const poll1 = await (await fetch(`${jobPath}/status`, { headers })).json();
+    expect(poll1.status).toBe("IN_QUEUE");
+    const poll2 = await (await fetch(`${jobPath}/status`, { headers })).json();
+    expect(poll2.status).toBe("IN_QUEUE");
+    const poll3 = await (await fetch(`${jobPath}/status`, { headers })).json();
+    expect(poll3.status).toBe("IN_PROGRESS");
+    const poll4 = await (await fetch(`${jobPath}/status`, { headers })).json();
+    expect(poll4.status).toBe("COMPLETED");
+  });
+
   test("image URL without an extension produces a valid content_type", async () => {
     mock = new LLMock({ port: 0 });
     mock.onFalImage(/flux/, { images: [{ url: "https://example.com/image" }] });
@@ -745,10 +802,12 @@ describe("fal.ai general handler — typed helpers + polling progression", () =>
     expect(data.images[0].content_type).toBe("image/png");
   });
 
-  test("image URL with fragment + query strips them when deriving extension", async () => {
+  test("image URL with fragment strips it when deriving extension", async () => {
     mock = new LLMock({ port: 0 });
+    // Fragment-only — old code returned "image/png#section" because the
+    // split("?") guard didn't strip the trailing fragment.
     mock.onFalImage(/flux/, {
-      images: [{ url: "https://example.com/path/to/pic.jpeg?token=abc#frag" }],
+      images: [{ url: "https://example.com/path/to/pic.png#section" }],
     });
     await mock.start();
 
@@ -762,7 +821,51 @@ describe("fal.ai general handler — typed helpers + polling progression", () =>
       headers: { "x-fal-target-host": "queue.fal.run" },
     });
     const data = await result.json();
-    expect(data.images[0].content_type).toBe("image/jpeg");
+    expect(data.images[0].content_type).toBe("image/png");
+  });
+
+  test("video URL without an extension falls back to mp4 content_type", async () => {
+    mock = new LLMock({ port: 0 });
+    mock.onFalVideo(/kling/, {
+      video: { id: "v", status: "completed", url: "https://example.com/clip" },
+    });
+    await mock.start();
+
+    const submit = await fetch(`${mock.url}/fal/fal-ai/kling-video/v2/master`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-fal-target-host": "queue.fal.run" },
+      body: JSON.stringify({ input: { prompt: "p" } }),
+    });
+    const envelope = await submit.json();
+    const result = await fetch(
+      `${mock.url}/fal/fal-ai/kling-video/v2/master/requests/${envelope.request_id}`,
+      { headers: { "x-fal-target-host": "queue.fal.run" } },
+    );
+    const data = await result.json();
+    expect(data.video.content_type).toBe("video/mp4");
+    expect(data.video.file_name).toBe("clip");
+  });
+
+  test("video URL with fragment strips it when deriving extension", async () => {
+    mock = new LLMock({ port: 0 });
+    mock.onFalVideo(/kling/, {
+      video: { id: "v", status: "completed", url: "https://example.com/clip.webm#t=10" },
+    });
+    await mock.start();
+
+    const submit = await fetch(`${mock.url}/fal/fal-ai/kling-video/v2/master`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-fal-target-host": "queue.fal.run" },
+      body: JSON.stringify({ input: { prompt: "p" } }),
+    });
+    const envelope = await submit.json();
+    const result = await fetch(
+      `${mock.url}/fal/fal-ai/kling-video/v2/master/requests/${envelope.request_id}`,
+      { headers: { "x-fal-target-host": "queue.fal.run" } },
+    );
+    const data = await result.json();
+    expect(data.video.content_type).toBe("video/webm");
+    expect(data.video.file_name).toBe("clip.webm");
   });
 
   test("double cancel does not push duplicate log entries", async () => {
