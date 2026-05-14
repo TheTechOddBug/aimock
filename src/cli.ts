@@ -39,6 +39,8 @@ Options:
       --provider-azure <url>      Upstream URL for Azure OpenAI
       --provider-ollama <url>     Upstream URL for Ollama
       --provider-cohere <url>     Upstream URL for Cohere
+      --upstream-timeout-ms <ms>  Idle timeout (ms) on upstream socket before response (default: 30000)
+      --body-timeout-ms <ms>      Idle timeout (ms) on upstream response body between chunks (default: 30000)
       --agui-record              Enable AG-UI recording (proxy unmatched AG-UI requests)
       --agui-upstream <url>      Upstream AG-UI agent URL (used with --agui-record)
       --agui-proxy-only          AG-UI proxy mode: forward without saving
@@ -71,6 +73,8 @@ const { values } = parseArgs({
     "provider-azure": { type: "string" },
     "provider-ollama": { type: "string" },
     "provider-cohere": { type: "string" },
+    "upstream-timeout-ms": { type: "string" },
+    "body-timeout-ms": { type: "string" },
     "agui-record": { type: "boolean", default: false },
     "agui-upstream": { type: "string" },
     "agui-proxy-only": { type: "boolean", default: false },
@@ -135,6 +139,30 @@ if (Number.isNaN(fixtureCountsMax) || !Number.isInteger(fixtureCountsMax) || fix
     `Invalid fixture-counts-max: ${fixtureCountsMaxStr} (must be a non-negative integer; 0 = unbounded)`,
   );
   process.exit(1);
+}
+
+const upstreamTimeoutMsStr = values["upstream-timeout-ms"];
+let upstreamTimeoutMs: number | undefined;
+if (upstreamTimeoutMsStr !== undefined) {
+  upstreamTimeoutMs = Number(upstreamTimeoutMsStr);
+  if (!Number.isFinite(upstreamTimeoutMs) || upstreamTimeoutMs <= 0) {
+    console.error(
+      `Invalid upstream-timeout-ms: ${upstreamTimeoutMsStr} (must be a positive finite number)`,
+    );
+    process.exit(1);
+  }
+}
+
+const bodyTimeoutMsStr = values["body-timeout-ms"];
+let bodyTimeoutMs: number | undefined;
+if (bodyTimeoutMsStr !== undefined) {
+  bodyTimeoutMs = Number(bodyTimeoutMsStr);
+  if (!Number.isFinite(bodyTimeoutMs) || bodyTimeoutMs <= 0) {
+    console.error(
+      `Invalid body-timeout-ms: ${bodyTimeoutMsStr} (must be a positive finite number)`,
+    );
+    process.exit(1);
+  }
 }
 
 const logger = new Logger(logLevel);
@@ -215,6 +243,8 @@ if (values.record || values["proxy-only"]) {
     fixturePath: recordBaseIsUrl ? undefined : resolve(recordBase, "recorded"),
     proxyOnly: values["proxy-only"],
     recordFullModelVersion: values["record-full-model-version"],
+    upstreamTimeoutMs,
+    bodyTimeoutMs,
   };
 }
 
