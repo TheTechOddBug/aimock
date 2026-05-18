@@ -49,6 +49,7 @@ Run them all on one port with `npx @copilotkit/aimock --config aimock.json`, or 
 ## Features
 
 - **[Record & Replay](https://aimock.copilotkit.dev/record-replay)** — Proxy real APIs, save as fixtures, replay deterministically forever
+- **Timing-aware recording and replay** — Recorded fixtures capture per-frame arrival timestamps; replay uses recorded timings for approximate timing reproduction based on recorded TTFT and inter-frame cadence (replay chunk count may differ from recording — TTFT and average pace are preserved, not per-token fidelity) with configurable `--replay-speed` multiplier
 - **[Multi-turn Conversations](https://aimock.copilotkit.dev/multi-turn)** — Record and replay multi-turn traces with tool rounds; match distinct turns via `turnIndex`, `hasToolResult`, `toolCallId`, `sequenceIndex`, `systemMessage` (gate on host-supplied agent context), or custom predicates
 - **[14 LLM Providers](https://aimock.copilotkit.dev/docs)** — OpenAI Chat, OpenAI Responses, OpenAI Realtime (GA + Beta shim), Claude, Gemini (REST + embedContent), Gemini Live, Gemini Interactions, Azure, Bedrock, Vertex AI, Ollama (chat + embeddings), Cohere (chat + embed), ElevenLabs TTS — full streaming support
 - **Multimedia APIs** — [image generation](https://aimock.copilotkit.dev/images) (DALL-E, Imagen), [image editing](https://aimock.copilotkit.dev/images) (/v1/images/edit), [text-to-speech](https://aimock.copilotkit.dev/speech) (OpenAI + ElevenLabs), [audio transcription](https://aimock.copilotkit.dev/transcription), [audio translation](https://aimock.copilotkit.dev/transcription) (/v1/audio/translations), [video generation](https://aimock.copilotkit.dev/video), [fal.ai](https://aimock.copilotkit.dev/fal-ai) (image / video / audio with queue lifecycle)
@@ -100,6 +101,9 @@ npx -p @copilotkit/aimock llmock --record --provider-openai https://api.openai.c
 # Record with extended timeout for reasoning models
 npx -p @copilotkit/aimock llmock --record --provider-openai https://api.openai.com \
   --body-timeout-ms 180000
+
+# Replay recorded fixtures at 2× speed
+npx -p @copilotkit/aimock llmock -p 4010 -f ./fixtures --replay-speed 2
 
 # Convert fixtures from other tools
 npx @copilotkit/aimock convert vidaimock ./templates/ ./fixtures/

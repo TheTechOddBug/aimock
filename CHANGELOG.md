@@ -4,6 +4,15 @@
 
 ### Added
 
+- **Timing-aware recording and replay** — proxy recording captures per-frame
+  arrival timestamps as `recordedTimings` on fixtures. Replay uses recorded
+  timings for approximate timing reproduction based on recorded TTFT and
+  inter-frame cadence instead of the synthetic model. Replay chunk count may
+  differ from recording chunk count — TTFT and average pace are preserved,
+  not per-token fidelity. `--replay-speed N` multiplier applies to all delay
+  sources (recorded timings, streaming profiles, global latency). Per-fixture
+  `replaySpeed` override. Covers SSE, NDJSON, Bedrock EventStream, and
+  WebSocket protocols.
 - **Gemini `embedContent` endpoint** — `POST /v1beta/models/{model}:embedContent`
   with deterministic fallback embeddings and fixture matching
 - **`/v1/images/edit` and `/v1/images/variations` endpoints** — multipart
