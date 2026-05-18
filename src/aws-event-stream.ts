@@ -17,7 +17,7 @@
 
 import { crc32 } from "node:zlib";
 import type * as http from "node:http";
-import type { StreamingProfile } from "./types.js";
+import type { StreamingProfile, RecordedTimings } from "./types.js";
 import { delay, calculateDelay } from "./sse-writer.js";
 
 // ─── Header encoding ────────────────────────────────────────────────────────
@@ -121,6 +121,8 @@ export async function writeEventStream(
   options?: {
     latency?: number;
     streamingProfile?: StreamingProfile;
+    recordedTimings?: RecordedTimings;
+    replaySpeed?: number;
     signal?: AbortSignal;
     onChunkSent?: () => void;
   },
@@ -128,6 +130,7 @@ export async function writeEventStream(
   const opts = options ?? {};
   const latency = opts.latency ?? 0;
   const profile = opts.streamingProfile;
+  const { recordedTimings, replaySpeed } = opts;
   const signal = opts.signal;
   const onChunkSent = opts.onChunkSent;
 
@@ -137,7 +140,7 @@ export async function writeEventStream(
 
   let chunkIndex = 0;
   for (const event of events) {
-    const chunkDelay = calculateDelay(chunkIndex, profile, latency);
+    const chunkDelay = calculateDelay(chunkIndex, profile, latency, recordedTimings, replaySpeed);
     if (chunkDelay > 0) {
       await delay(chunkDelay, signal);
     }

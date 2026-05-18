@@ -81,7 +81,7 @@ export class LLMock {
    */
   addFixturesFromJSON(input: string | FixtureFileEntry[]): this {
     const entries: FixtureFileEntry[] = typeof input === "string" ? JSON.parse(input) : input;
-    const converted = entries.map(entryToFixture);
+    const converted = entries.map((e) => entryToFixture(e));
     const issues = validateFixtures(converted);
     const errors = issues.filter((i) => i.severity === "error");
     if (errors.length > 0) {

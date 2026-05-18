@@ -13,6 +13,7 @@ import type {
   ChatMessage,
   Fixture,
   HandlerDefaults,
+  RecordedTimings,
   RecordProviderKey,
   ResponseOverrides,
   StreamingProfile,
@@ -542,6 +543,8 @@ function buildGeminiAudioStreamChunks(audio: AudioResponse): GeminiResponseChunk
 interface GeminiStreamOptions {
   latency?: number;
   streamingProfile?: StreamingProfile;
+  recordedTimings?: RecordedTimings;
+  replaySpeed?: number;
   signal?: AbortSignal;
   onChunkSent?: () => void;
 }
@@ -555,6 +558,7 @@ async function writeGeminiSSEStream(
     typeof optionsOrLatency === "number" ? { latency: optionsOrLatency } : (optionsOrLatency ?? {});
   const latency = opts.latency ?? 0;
   const profile = opts.streamingProfile;
+  const { recordedTimings, replaySpeed } = opts;
   const signal = opts.signal;
   const onChunkSent = opts.onChunkSent;
 
@@ -565,7 +569,7 @@ async function writeGeminiSSEStream(
 
   let chunkIndex = 0;
   for (const chunk of chunks) {
-    const chunkDelay = calculateDelay(chunkIndex, profile, latency);
+    const chunkDelay = calculateDelay(chunkIndex, profile, latency, recordedTimings, replaySpeed);
     if (chunkDelay > 0) await delay(chunkDelay, signal);
     if (signal?.aborted) return false;
     if (res.writableEnded) return true;
@@ -748,6 +752,7 @@ export async function handleGemini(
   const response = await resolveResponse(fixture, completionReq);
   const latency = fixture.latency ?? defaults.latency;
   const chunkSize = Math.max(1, fixture.chunkSize ?? defaults.chunkSize);
+  const replaySpeed = fixture.replaySpeed ?? defaults.replaySpeed;
 
   // Error response
   if (isErrorResponse(response)) {
@@ -792,6 +797,8 @@ export async function handleGemini(
       const completed = await writeGeminiSSEStream(res, chunks, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });
@@ -841,6 +848,8 @@ export async function handleGemini(
       const completed = await writeGeminiSSEStream(res, chunks, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });
@@ -882,6 +891,8 @@ export async function handleGemini(
       const completed = await writeGeminiSSEStream(res, chunks, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });
@@ -918,6 +929,8 @@ export async function handleGemini(
       const completed = await writeGeminiSSEStream(res, chunks, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });

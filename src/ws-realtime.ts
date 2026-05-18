@@ -21,7 +21,7 @@ import {
   strictOverrideField,
 } from "./helpers.js";
 import { createInterruptionSignal } from "./interruption.js";
-import { delay } from "./sse-writer.js";
+import { delay, calculateDelay } from "./sse-writer.js";
 import { DEFAULT_TEST_ID, type Journal } from "./journal.js";
 import type { Logger } from "./logger.js";
 import type { WebSocketConnection } from "./ws-framing.js";
@@ -293,6 +293,7 @@ export function handleWebSocketRealtime(
   defaults: {
     latency: number;
     chunkSize: number;
+    replaySpeed?: number;
     model: string;
     logger: Logger;
     strict?: boolean;
@@ -393,6 +394,7 @@ async function processMessage(
   defaults: {
     latency: number;
     chunkSize: number;
+    replaySpeed?: number;
     model: string;
     logger: Logger;
     strict?: boolean;
@@ -655,6 +657,7 @@ async function handleResponseCreate(
   defaults: {
     latency: number;
     chunkSize: number;
+    replaySpeed?: number;
     model: string;
     logger: Logger;
     strict?: boolean;
@@ -902,9 +905,19 @@ async function handleResponseCreate(
 
     // response.output_text.delta (chunked) — GA name
     const content = response.content;
+    const replaySpeed = fixture.replaySpeed ?? defaults.replaySpeed;
+    const { recordedTimings } = fixture;
+    let eventIndex = 0;
     for (let i = 0; i < content.length; i += chunkSize) {
       if (ws.isClosed) break;
-      if (latency > 0) await delay(latency, interruption?.signal);
+      const chunkDelay = calculateDelay(
+        eventIndex,
+        undefined,
+        latency,
+        recordedTimings,
+        replaySpeed,
+      );
+      if (chunkDelay > 0) await delay(chunkDelay, interruption?.signal);
       if (interruption?.signal.aborted) {
         interrupted = true;
         break;
@@ -923,6 +936,7 @@ async function handleResponseCreate(
         },
         isBeta,
       );
+      eventIndex++;
       interruption?.tick();
       if (interruption?.signal.aborted) {
         interrupted = true;
@@ -1054,10 +1068,18 @@ async function handleResponseCreate(
       );
 
       // response.function_call_arguments.delta (chunked)
+      // Continue eventIndex from content chunks to avoid re-triggering TTFT
       const args = tc.arguments;
       for (let i = 0; i < args.length; i += chunkSize) {
         if (ws.isClosed) break;
-        if (latency > 0) await delay(latency, interruption?.signal);
+        const chunkDelay = calculateDelay(
+          eventIndex,
+          undefined,
+          latency,
+          recordedTimings,
+          replaySpeed,
+        );
+        if (chunkDelay > 0) await delay(chunkDelay, interruption?.signal);
         if (interruption?.signal.aborted) {
           interrupted = true;
           break;
@@ -1076,6 +1098,7 @@ async function handleResponseCreate(
           },
           isBeta,
         );
+        eventIndex++;
         interruption?.tick();
         if (interruption?.signal.aborted) {
           interrupted = true;
@@ -1253,12 +1276,22 @@ async function handleResponseCreate(
 
     // response.output_text.delta (chunked) — GA name
     const content = response.content;
+    const replaySpeed = fixture.replaySpeed ?? defaults.replaySpeed;
+    const { recordedTimings } = fixture;
     const interruption = createInterruptionSignal(fixture);
     let interrupted = false;
+    let eventIndex = 0;
 
     for (let i = 0; i < content.length; i += chunkSize) {
       if (ws.isClosed) break;
-      if (latency > 0) await delay(latency, interruption?.signal);
+      const chunkDelay = calculateDelay(
+        eventIndex,
+        undefined,
+        latency,
+        recordedTimings,
+        replaySpeed,
+      );
+      if (chunkDelay > 0) await delay(chunkDelay, interruption?.signal);
       if (interruption?.signal.aborted) {
         interrupted = true;
         break;
@@ -1277,6 +1310,7 @@ async function handleResponseCreate(
         },
         isBeta,
       );
+      eventIndex++;
       interruption?.tick();
       if (interruption?.signal.aborted) {
         interrupted = true;
@@ -1408,7 +1442,10 @@ async function handleResponseCreate(
 
     const outputItems: unknown[] = [];
     const interruption = createInterruptionSignal(fixture);
+    const replaySpeed = fixture.replaySpeed ?? defaults.replaySpeed;
+    const { recordedTimings } = fixture;
     let interrupted = false;
+    let eventIndex = 0;
 
     for (let tcIdx = 0; tcIdx < response.toolCalls.length; tcIdx++) {
       const tc = response.toolCalls[tcIdx];
@@ -1445,10 +1482,18 @@ async function handleResponseCreate(
       );
 
       // response.function_call_arguments.delta (chunked)
+      // eventIndex is continuous across all tool calls to avoid re-triggering TTFT
       const args = tc.arguments;
       for (let i = 0; i < args.length; i += chunkSize) {
         if (ws.isClosed) break;
-        if (latency > 0) await delay(latency, interruption?.signal);
+        const chunkDelay = calculateDelay(
+          eventIndex,
+          undefined,
+          latency,
+          recordedTimings,
+          replaySpeed,
+        );
+        if (chunkDelay > 0) await delay(chunkDelay, interruption?.signal);
         if (interruption?.signal.aborted) {
           interrupted = true;
           break;
@@ -1467,6 +1512,7 @@ async function handleResponseCreate(
           },
           isBeta,
         );
+        eventIndex++;
         interruption?.tick();
         if (interruption?.signal.aborted) {
           interrupted = true;

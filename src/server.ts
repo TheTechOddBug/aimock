@@ -273,7 +273,7 @@ async function handleControlAPI(
       return true;
     }
 
-    const converted = parsed.fixtures.map(entryToFixture);
+    const converted = parsed.fixtures.map((e) => entryToFixture(e));
     const issues = validateFixtures(converted);
     const errors = issues.filter((i) => i.severity === "error");
     if (errors.length > 0) {
@@ -785,6 +785,8 @@ async function handleCompletions(
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
         usageChunk,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
       });
       if (!completed) {
         if (!res.writableEnded) res.destroy();
@@ -858,6 +860,8 @@ async function handleCompletions(
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
         usageChunk,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
       });
       if (!completed) {
         if (!res.writableEnded) res.destroy();
@@ -925,6 +929,8 @@ async function handleCompletions(
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
         usageChunk,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
       });
       if (!completed) {
         if (!res.writableEnded) res.destroy();
@@ -979,6 +985,7 @@ export async function createServer(
   const defaults = {
     latency: serverOptions.latency ?? 0,
     chunkSize: Math.max(1, serverOptions.chunkSize ?? DEFAULT_CHUNK_SIZE),
+    replaySpeed: serverOptions.replaySpeed ?? 1.0,
     logger,
     get chaos() {
       return serverOptions.chaos;

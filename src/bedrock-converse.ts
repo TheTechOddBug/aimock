@@ -1022,6 +1022,8 @@ export async function handleConverseStream(
     const completed = await writeEventStream(res, events, {
       latency,
       streamingProfile: fixture.streamingProfile,
+      recordedTimings: fixture.recordedTimings,
+      replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
       signal: interruption?.signal,
       onChunkSent: interruption?.tick,
     });
@@ -1059,6 +1061,8 @@ export async function handleConverseStream(
     const completed = await writeEventStream(res, events, {
       latency,
       streamingProfile: fixture.streamingProfile,
+      recordedTimings: fixture.recordedTimings,
+      replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
       signal: interruption?.signal,
       onChunkSent: interruption?.tick,
     });
@@ -1096,6 +1100,8 @@ export async function handleConverseStream(
     const completed = await writeEventStream(res, events, {
       latency,
       streamingProfile: fixture.streamingProfile,
+      recordedTimings: fixture.recordedTimings,
+      replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
       signal: interruption?.signal,
       onChunkSent: interruption?.tick,
     });
