@@ -56,6 +56,7 @@ Run them all on one port with `npx @copilotkit/aimock --config aimock.json`, or 
 - **[MCP](https://aimock.copilotkit.dev/mcp-mock) / [A2A](https://aimock.copilotkit.dev/a2a-mock) / [AG-UI](https://aimock.copilotkit.dev/agui-mock) / [Vector](https://aimock.copilotkit.dev/vector-mock)** — Mock every protocol your AI agents use
 - **[Chaos Testing](https://aimock.copilotkit.dev/chaos-testing)** — 500 errors, malformed JSON, mid-stream disconnects at any probability
 - **Per-Request Strict Mode** — `X-AIMock-Strict` header overrides the server-level `--strict` flag per request (`true`/`1` = strict, `false`/`0` = lenient)
+- **Context-Based Fixture Routing** — `X-AIMock-Context` header scopes fixtures per integration; fixtures with `match.context` only match requests carrying that context, fixtures without it remain shared
 - **[Drift Detection](https://aimock.copilotkit.dev/drift-detection)** — Daily CI validation against real APIs
 - **[Streaming Physics](https://aimock.copilotkit.dev/streaming-physics)** — Configurable `ttft`, `tps`, and `jitter`
 - **[WebSocket APIs](https://aimock.copilotkit.dev/websocket)** — OpenAI Realtime (GA protocol with models: gpt-realtime, gpt-realtime-2, gpt-realtime-1.5, gpt-realtime-mini; transcription/translation via gpt-4o-transcribe, gpt-4o-mini-transcribe, whisper-1; image input; commentary phase), Responses WS, Gemini Live

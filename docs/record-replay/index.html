@@ -556,6 +556,49 @@
 });</code></pre>
         </div>
 
+        <h2 id="context-aware-recording">Context-Aware Recording</h2>
+        <p>
+          When a request carries an <code>X-AIMock-Context</code> header, the recorder automatically
+          captures the context value in <code>match.context</code>. On replay, fixtures with
+          <code>context</code> only match requests carrying that exact header value &mdash; fixtures
+          without <code>context</code> remain shared across all callers.
+        </p>
+
+        <h3>Directory routing</h3>
+        <p>
+          Without snapshot-style recording (<code>X-Test-Id</code>), recorded fixtures for a given
+          context are written to a <code>&lt;fixturePath&gt;/&lt;context&gt;/</code> subdirectory:
+        </p>
+
+        <div class="code-block">
+          <div class="code-block-header">
+            Context directory layout <span class="lang-tag">text</span>
+          </div>
+          <pre><code>fixtures/recorded/
+  openai-2026-05-18T10-30-00-000Z-a1b2c3d4.json     # no context (shared)
+  langgraph-python/
+    openai-2026-05-18T10-30-01-000Z-e5f6a7b8.json   # context = langgraph-python
+  crewai/
+    openai-2026-05-18T10-30-02-000Z-c9d0e1f2.json   # context = crewai</code></pre>
+        </div>
+
+        <p>
+          When <code>X-Test-Id</code> is also present, snapshot-style paths take precedence and the
+          context is captured only in <code>match.context</code> within the fixture file, not in the
+          directory structure.
+        </p>
+
+        <h3>Sending <code>X-AIMock-Context</code></h3>
+        <div class="code-block">
+          <div class="code-block-header">Header example <span class="lang-tag">ts</span></div>
+          <pre><code><span class="cm">// Set as a default header on your LLM client</span>
+<span class="kw">const</span> <span class="op">client</span> = <span class="kw">new</span> <span class="fn">OpenAI</span>({
+  <span class="prop">baseURL</span>: <span class="str">"http://localhost:4010/v1"</span>,
+  <span class="prop">apiKey</span>: <span class="str">"mock"</span>,
+  <span class="prop">defaultHeaders</span>: { <span class="str">"X-AIMock-Context"</span>: <span class="str">"langgraph-python"</span> },
+});</code></pre>
+        </div>
+
         <h2 id="upstream-timeouts">Upstream Timeouts</h2>
 
         <p>
@@ -858,7 +901,10 @@ await mock.start();</code></pre>
   }
   <span class="cm">// Chat/multimedia — key on the LAST user message only</span>
   <span class="kw">const</span> lastUser = <span class="fn">getLastMessageByRole</span>(request.messages, <span class="str">"user"</span>);
-  <span class="kw">return</span> { <span class="prop">userMessage</span>: <span class="fn">getTextContent</span>(lastUser.content) };
+  <span class="kw">const</span> match = { <span class="prop">userMessage</span>: <span class="fn">getTextContent</span>(lastUser.content) };
+  <span class="cm">// Capture context from X-AIMock-Context header if present</span>
+  <span class="kw">if</span> (request._context) match.<span class="prop">context</span> = request._context;
+  <span class="kw">return</span> match;
 }</code></pre>
         </div>
 

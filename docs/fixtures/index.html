@@ -161,6 +161,16 @@
               </td>
             </tr>
             <tr>
+              <td>context</td>
+              <td>string</td>
+              <td>
+                Restrict to a named context via <code>X-AIMock-Context</code> header. Fixtures with
+                <code>context</code> only match requests carrying that exact value; fixtures without
+                <code>context</code> match any request. Same opt-in semantics as
+                <code>endpoint</code>
+              </td>
+            </tr>
+            <tr>
               <td>predicate</td>
               <td>function</td>
               <td>Custom function: (req) => boolean (programmatic only)</td>
@@ -242,14 +252,15 @@
             <code>duplicate userMessage 'hello' — shadows fixture 0</code>, where
             <code>'hello'</code> is the duplicated message and <code>0</code> is the zero-based
             index of the earlier fixture being shadowed. This is advisory, not a hard error: the
-            check now factors in <code>turnIndex</code>, <code>hasToolResult</code>, and
-            <code>sequenceIndex</code> when deciding whether two fixtures truly collide, but it does
-            <em>not</em> consider <code>toolCallId</code>, <code>model</code>, or
-            <code>predicate</code>, so the warning may still fire when those discriminators are
-            present. Treat it as advisory: if a runtime differentiator is in place, the fixtures
-            won't actually shadow each other at match time. Only fixtures with no differentiator at
-            all will truly shadow on match &mdash; that's the case where the second is never reached
-            because the first wins. Safe to ignore in the former case; investigate in the latter.
+            check now factors in <code>turnIndex</code>, <code>hasToolResult</code>,
+            <code>context</code>, and <code>sequenceIndex</code> when deciding whether two fixtures
+            truly collide, but it does <em>not</em> consider <code>toolCallId</code>,
+            <code>model</code>, or <code>predicate</code>, so the warning may still fire when those
+            discriminators are present. Treat it as advisory: if a runtime differentiator is in
+            place, the fixtures won't actually shadow each other at match time. Only fixtures with
+            no differentiator at all will truly shadow on match &mdash; that's the case where the
+            second is never reached because the first wins. Safe to ignore in the former case;
+            investigate in the latter.
           </li>
           <li>
             <strong>Catch-all not last</strong> &mdash; a fixture with an empty <code>match</code>
@@ -510,6 +521,29 @@
             details.
           </p>
         </div>
+
+        <h3 id="context">Context-scoped fixtures</h3>
+        <div class="code-block">
+          <div class="code-block-header">
+            fixtures/context-example.json <span class="lang-tag">json</span>
+          </div>
+          <pre><code>{
+  <span class="key">"fixtures"</span>: [
+    {
+      <span class="key">"match"</span>: { <span class="key">"userMessage"</span>: <span class="str">"hello"</span>, <span class="key">"context"</span>: <span class="str">"langgraph-python"</span> },
+      <span class="key">"response"</span>: { <span class="key">"content"</span>: <span class="str">"Hi from LangGraph!"</span> }
+    },
+    {
+      <span class="key">"match"</span>: { <span class="key">"userMessage"</span>: <span class="str">"hello"</span> },
+      <span class="key">"response"</span>: { <span class="key">"content"</span>: <span class="str">"Hi from the shared fallback!"</span> }
+    }
+  ]
+}</code></pre>
+        </div>
+        <p>
+          Requests with <code>X-AIMock-Context: langgraph-python</code> match the first fixture; all
+          other requests fall through to the shared fixture.
+        </p>
 
         <h3>Programmatically</h3>
         <div class="code-block">
