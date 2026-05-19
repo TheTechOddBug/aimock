@@ -131,6 +131,16 @@ const PROVIDER_MAP: Record<string, ProviderMapping> = {
     typesFile: null,
     sdkShapesFile: "src/__tests__/drift/sdk-shapes.ts",
   },
+  "Gemini Interactions": {
+    builderFile: "src/gemini-interactions.ts",
+    builderFunctions: [
+      "buildInteractionsTextResponse",
+      "buildInteractionsToolCallResponse",
+      "buildInteractionsTextSSEEvents",
+      "buildInteractionsToolCallSSEEvents",
+    ],
+    typesFile: null,
+  },
 };
 
 const SDK_SHAPES_FILE = "src/__tests__/drift/sdk-shapes.ts";

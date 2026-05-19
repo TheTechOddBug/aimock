@@ -681,12 +681,51 @@ describe("geminiInteractionsToCompletionRequest", () => {
     ]);
   });
 
+  it.each([
+    "url_context_result",
+    "google_search_result",
+    "google_maps_result",
+    "mcp_server_tool_result",
+    "file_search_result",
+  ])("handles Step[] %s as a tool message", (stepType) => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [
+        {
+          type: stepType,
+          call_id: `call_${stepType}`,
+          result: { data: "test" },
+        },
+      ],
+    });
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].role).toBe("tool");
+    expect(result.messages[0].content).toBe('{"data":"test"}');
+    expect(result.messages[0].tool_call_id).toBe(`call_${stepType}`);
+  });
+
   it("handles Step[] user_input with empty content", () => {
     const result = geminiInteractionsToCompletionRequest({
       model: "gemini-2.5-flash",
       input: [{ type: "user_input", content: [] }],
     });
     expect(result.messages).toEqual([{ role: "user", content: "" }]);
+  });
+
+  it("handles Step[] model_output with undefined content", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [{ type: "model_output" }],
+    });
+    expect(result.messages).toEqual([{ role: "assistant", content: "" }]);
+  });
+
+  it("handles Step[] model_output with empty content array", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [{ type: "model_output", content: [] }],
+    });
+    expect(result.messages).toEqual([{ role: "assistant", content: "" }]);
   });
 });
 
