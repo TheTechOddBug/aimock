@@ -707,6 +707,8 @@ export async function handleOllama(
       const completed = await writeNDJSONStream(res, chunks, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });
@@ -751,6 +753,8 @@ export async function handleOllama(
       const completed = await writeNDJSONStream(res, chunks, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });
@@ -786,6 +790,8 @@ export async function handleOllama(
       const completed = await writeNDJSONStream(res, chunks, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });
@@ -1046,6 +1052,8 @@ export async function handleOllamaGenerate(
       const completed = await writeNDJSONStream(res, chunks, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });

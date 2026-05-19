@@ -27,7 +27,7 @@ import {
   flattenHeaders,
 } from "./helpers.js";
 import { createInterruptionSignal } from "./interruption.js";
-import { delay } from "./sse-writer.js";
+import { delay, calculateDelay } from "./sse-writer.js";
 import { DEFAULT_TEST_ID, type Journal } from "./journal.js";
 import type { Logger } from "./logger.js";
 import type { WebSocketConnection } from "./ws-framing.js";
@@ -71,6 +71,7 @@ export function handleWebSocketResponses(
   defaults: {
     latency: number;
     chunkSize: number;
+    replaySpeed?: number;
     model: string;
     logger: Logger;
     strict?: boolean;
@@ -107,6 +108,7 @@ async function processMessage(
   defaults: {
     latency: number;
     chunkSize: number;
+    replaySpeed?: number;
     model: string;
     logger: Logger;
     strict?: boolean;
@@ -268,6 +270,8 @@ async function processMessage(
       latency,
       interruption?.signal,
       interruption?.tick,
+      fixture.recordedTimings,
+      fixture.replaySpeed ?? defaults.replaySpeed,
     );
     if (!completed) {
       ws.destroy();
@@ -303,6 +307,8 @@ async function processMessage(
       latency,
       interruption?.signal,
       interruption?.tick,
+      fixture.recordedTimings,
+      fixture.replaySpeed ?? defaults.replaySpeed,
     );
     if (!completed) {
       ws.destroy();
@@ -336,6 +342,8 @@ async function processMessage(
       latency,
       interruption?.signal,
       interruption?.tick,
+      fixture.recordedTimings,
+      fixture.replaySpeed ?? defaults.replaySpeed,
     );
     if (!completed) {
       ws.destroy();
@@ -367,13 +375,18 @@ async function sendEvents(
   latency: number,
   signal?: AbortSignal,
   onChunkSent?: () => void,
+  recordedTimings?: import("./types.js").RecordedTimings,
+  replaySpeed?: number,
 ): Promise<boolean> {
+  let eventIndex = 0;
   for (const event of events) {
     if (ws.isClosed) return false;
-    if (latency > 0) await delay(latency, signal);
+    const chunkDelay = calculateDelay(eventIndex, undefined, latency, recordedTimings, replaySpeed);
+    if (chunkDelay > 0) await delay(chunkDelay, signal);
     if (signal?.aborted) return false;
     if (ws.isClosed) return false;
     ws.send(JSON.stringify(event));
+    eventIndex++;
     onChunkSent?.();
     if (signal?.aborted) return false;
   }

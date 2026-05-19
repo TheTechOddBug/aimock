@@ -35,6 +35,7 @@ import {
 import { matchFixture } from "./router.js";
 import { writeErrorResponse, delay, calculateDelay } from "./sse-writer.js";
 import { createInterruptionSignal } from "./interruption.js";
+import type { RecordedTimings } from "./types.js";
 import type { Journal } from "./journal.js";
 import { applyChaos } from "./chaos.js";
 import { proxyAndRecord } from "./recorder.js";
@@ -861,6 +862,8 @@ function buildContentWithToolCallsResponse(
 interface ResponsesStreamOptions {
   latency?: number;
   streamingProfile?: StreamingProfile;
+  recordedTimings?: RecordedTimings;
+  replaySpeed?: number;
   signal?: AbortSignal;
   onChunkSent?: () => void;
 }
@@ -874,6 +877,7 @@ async function writeResponsesSSEStream(
     typeof optionsOrLatency === "number" ? { latency: optionsOrLatency } : (optionsOrLatency ?? {});
   const latency = opts.latency ?? 0;
   const profile = opts.streamingProfile;
+  const { recordedTimings, replaySpeed } = opts;
   const signal = opts.signal;
   const onChunkSent = opts.onChunkSent;
 
@@ -884,7 +888,7 @@ async function writeResponsesSSEStream(
 
   let chunkIndex = 0;
   for (const event of events) {
-    const chunkDelay = calculateDelay(chunkIndex, profile, latency);
+    const chunkDelay = calculateDelay(chunkIndex, profile, latency, recordedTimings, replaySpeed);
     if (chunkDelay > 0) await delay(chunkDelay, signal);
     if (signal?.aborted) return false;
     if (res.writableEnded) return true;
@@ -1065,6 +1069,8 @@ export async function handleResponses(
   const response = await resolveResponse(fixture, completionReq);
   const latency = fixture.latency ?? defaults.latency;
   const chunkSize = Math.max(1, fixture.chunkSize ?? defaults.chunkSize);
+  const fixtureTimings = fixture.recordedTimings;
+  const effectiveReplaySpeed = fixture.replaySpeed ?? defaults.replaySpeed;
 
   // Error response
   if (isErrorResponse(response)) {
@@ -1117,6 +1123,8 @@ export async function handleResponses(
       const completed = await writeResponsesSSEStream(res, events, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixtureTimings,
+        replaySpeed: effectiveReplaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });
@@ -1163,6 +1171,8 @@ export async function handleResponses(
       const completed = await writeResponsesSSEStream(res, events, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixtureTimings,
+        replaySpeed: effectiveReplaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });
@@ -1207,6 +1217,8 @@ export async function handleResponses(
       const completed = await writeResponsesSSEStream(res, events, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixtureTimings,
+        replaySpeed: effectiveReplaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });

@@ -28,7 +28,7 @@ import {
   strictOverrideField,
 } from "./helpers.js";
 import { createInterruptionSignal } from "./interruption.js";
-import { delay } from "./sse-writer.js";
+import { delay, calculateDelay } from "./sse-writer.js";
 import { DEFAULT_TEST_ID, type Journal } from "./journal.js";
 import type { Logger } from "./logger.js";
 import type { WebSocketConnection } from "./ws-framing.js";
@@ -225,6 +225,7 @@ export function handleWebSocketGeminiLive(
   defaults: {
     latency: number;
     chunkSize: number;
+    replaySpeed?: number;
     model: string;
     logger: Logger;
     strict?: boolean;
@@ -271,6 +272,7 @@ async function processMessage(
   defaults: {
     latency: number;
     chunkSize: number;
+    replaySpeed?: number;
     model: string;
     logger: Logger;
     strict?: boolean;
@@ -504,6 +506,8 @@ async function processMessage(
     }
 
     const interruption = createInterruptionSignal(fixture);
+    const replaySpeed = fixture.replaySpeed ?? defaults.replaySpeed;
+    const { recordedTimings } = fixture;
     let interrupted = false;
 
     // Stream text content chunks (turnComplete omitted — sent as a separate message later)
@@ -520,7 +524,8 @@ async function processMessage(
     } else {
       for (let i = 0; i < chunkList.length; i++) {
         if (ws.isClosed) break;
-        if (latency > 0) await delay(latency, interruption?.signal);
+        const chunkDelay = calculateDelay(i, undefined, latency, recordedTimings, replaySpeed);
+        if (chunkDelay > 0) await delay(chunkDelay, interruption?.signal);
         if (interruption?.signal.aborted) {
           interrupted = true;
           break;
@@ -558,7 +563,14 @@ async function processMessage(
 
     // Send tool calls
     if (!ws.isClosed) {
-      if (latency > 0) await delay(latency, interruption?.signal);
+      const tcDelay = calculateDelay(
+        chunkList.length,
+        undefined,
+        latency,
+        recordedTimings,
+        replaySpeed,
+      );
+      if (tcDelay > 0) await delay(tcDelay, interruption?.signal);
       if (interruption?.signal.aborted) {
         ws.destroy();
         journalEntry.response.interrupted = true;
@@ -660,12 +672,15 @@ async function processMessage(
     }
 
     const interruption = createInterruptionSignal(fixture);
+    const replaySpeed = fixture.replaySpeed ?? defaults.replaySpeed;
+    const { recordedTimings } = fixture;
     let interrupted = false;
 
     // Stream content chunks without turnComplete (sent separately after)
     for (let i = 0; i < chunks.length; i++) {
       if (ws.isClosed) break;
-      if (latency > 0) await delay(latency, interruption?.signal);
+      const chunkDelay = calculateDelay(i, undefined, latency, recordedTimings, replaySpeed);
+      if (chunkDelay > 0) await delay(chunkDelay, interruption?.signal);
       if (interruption?.signal.aborted) {
         interrupted = true;
         break;
@@ -721,12 +736,15 @@ async function processMessage(
     });
 
     const interruption = createInterruptionSignal(fixture);
+    const replaySpeed = fixture.replaySpeed ?? defaults.replaySpeed;
+    const { recordedTimings } = fixture;
 
     if (ws.isClosed) {
       interruption?.cleanup();
       return;
     }
-    if (latency > 0) await delay(latency, interruption?.signal);
+    const tcDelay = calculateDelay(0, undefined, latency, recordedTimings, replaySpeed);
+    if (tcDelay > 0) await delay(tcDelay, interruption?.signal);
     if (interruption?.signal.aborted) {
       ws.destroy();
       journalEntry.response.interrupted = true;

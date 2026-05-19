@@ -15,6 +15,7 @@ import type {
   ChatMessage,
   Fixture,
   HandlerDefaults,
+  RecordedTimings,
   ResponseOverrides,
   StreamingProfile,
   ToolCall,
@@ -705,6 +706,8 @@ function buildCohereContentWithToolCallsStreamEvents(
 interface CohereStreamOptions {
   latency?: number;
   streamingProfile?: StreamingProfile;
+  recordedTimings?: RecordedTimings;
+  replaySpeed?: number;
   signal?: AbortSignal;
   onChunkSent?: () => void;
 }
@@ -718,6 +721,7 @@ async function writeCohereSSEStream(
     typeof optionsOrLatency === "number" ? { latency: optionsOrLatency } : (optionsOrLatency ?? {});
   const latency = opts.latency ?? 0;
   const profile = opts.streamingProfile;
+  const { recordedTimings, replaySpeed } = opts;
   const signal = opts.signal;
   const onChunkSent = opts.onChunkSent;
 
@@ -728,7 +732,7 @@ async function writeCohereSSEStream(
 
   let chunkIndex = 0;
   for (const event of events) {
-    const chunkDelay = calculateDelay(chunkIndex, profile, latency);
+    const chunkDelay = calculateDelay(chunkIndex, profile, latency, recordedTimings, replaySpeed);
     if (chunkDelay > 0) await delay(chunkDelay, signal);
     if (signal?.aborted) return false;
     if (res.writableEnded) return true;
@@ -1001,6 +1005,8 @@ export async function handleCohere(
       const completed = await writeCohereSSEStream(res, events, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });
@@ -1044,6 +1050,8 @@ export async function handleCohere(
       const completed = await writeCohereSSEStream(res, events, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });
@@ -1087,6 +1095,8 @@ export async function handleCohere(
       const completed = await writeCohereSSEStream(res, events, {
         latency,
         streamingProfile: fixture.streamingProfile,
+        recordedTimings: fixture.recordedTimings,
+        replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
         signal: interruption?.signal,
         onChunkSent: interruption?.tick,
       });
