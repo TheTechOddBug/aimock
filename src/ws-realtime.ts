@@ -680,10 +680,19 @@ async function handleResponseCreate(
   };
   const endpointType = endpointTypeMap[session.type] ?? "realtime";
 
+  const realtimeContextHeader = defaults.upgradeHeaders?.["x-aimock-context"];
+  const realtimeContext =
+    typeof realtimeContextHeader === "string"
+      ? realtimeContextHeader
+      : Array.isArray(realtimeContextHeader) && realtimeContextHeader.length > 0
+        ? realtimeContextHeader[0]
+        : undefined;
+
   const completionReq: ChatCompletionRequest = {
     model: session.model,
     messages,
     _endpointType: endpointType,
+    _context: realtimeContext,
   };
 
   const testId = defaults.testId ?? DEFAULT_TEST_ID;

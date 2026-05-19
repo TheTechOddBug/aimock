@@ -28,6 +28,7 @@ import {
   generateToolCallId,
   flattenHeaders,
   getTestId,
+  getContext,
   resolveResponse,
   resolveStrictMode,
   strictOverrideField,
@@ -668,6 +669,7 @@ export async function handleGeminiInteractions(
   // Convert to ChatCompletionRequest for fixture matching
   const completionReq = geminiInteractionsToCompletionRequest(interactionsReq);
   completionReq._endpointType = "chat";
+  completionReq._context = getContext(req);
 
   const streaming = interactionsReq.stream !== false; // default true
   const model = completionReq.model;

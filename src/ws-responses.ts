@@ -173,6 +173,13 @@ async function processMessage(
 
   const completionReq = responsesToCompletionRequest(responsesReq);
   completionReq._endpointType = "chat";
+  const contextHeader = defaults.upgradeHeaders?.["x-aimock-context"];
+  completionReq._context =
+    typeof contextHeader === "string"
+      ? contextHeader
+      : Array.isArray(contextHeader) && contextHeader.length > 0
+        ? contextHeader[0]
+        : undefined;
   const testId = defaults.testId ?? DEFAULT_TEST_ID;
   const fixture = matchFixture(
     fixtures,

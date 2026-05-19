@@ -7,6 +7,7 @@ import {
   serializeErrorResponse,
   flattenHeaders,
   FORMAT_TO_CONTENT_TYPE,
+  getContext,
   getTestId,
   resolveResponse,
   resolveStrictMode,
@@ -65,6 +66,7 @@ export async function handleElevenLabsTTS(
     model: (parsed.model_id as string) ?? "eleven_multilingual_v2",
     messages: [{ role: "user", content: promptText ?? "" }],
     _endpointType: "elevenlabs-tts",
+    _context: getContext(req),
   };
 
   // Validate required field
@@ -316,6 +318,7 @@ export async function handleElevenLabsAudio(
       (subType === "sound-generation" ? "eleven_text_to_sound_v2" : "music_v1"),
     messages: [{ role: "user", content: promptText ?? "" }],
     _endpointType: "audio-gen",
+    _context: getContext(req),
   };
 
   // Validate required field

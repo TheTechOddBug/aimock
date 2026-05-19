@@ -37,6 +37,7 @@ import {
   resolveResponse,
   resolveStrictMode,
   strictOverrideField,
+  getContext,
 } from "./helpers.js";
 import { matchFixture } from "./router.js";
 import { writeErrorResponse, delay, calculateDelay } from "./sse-writer.js";
@@ -833,6 +834,7 @@ export async function handleCohere(
   // Convert to ChatCompletionRequest for fixture matching
   const completionReq = cohereToCompletionRequest(cohereReq);
   completionReq._endpointType = "chat";
+  completionReq._context = getContext(req);
 
   const testId = getTestId(req);
   const fixture = matchFixture(
@@ -1238,6 +1240,7 @@ export async function handleCohereEmbed(
     messages: [],
     embeddingInput: combinedInput,
     _endpointType: "embedding",
+    _context: getContext(req),
   };
 
   const testId = getTestId(req);

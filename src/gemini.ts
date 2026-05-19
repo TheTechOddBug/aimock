@@ -29,6 +29,7 @@ import {
   extractOverrides,
   formatToMime,
   flattenHeaders,
+  getContext,
   getTestId,
   resolveResponse,
   resolveStrictMode,
@@ -632,6 +633,7 @@ export async function handleGemini(
   // Convert to ChatCompletionRequest for fixture matching
   const completionReq = geminiToCompletionRequest(geminiReq, model, streaming);
   completionReq._endpointType = "chat";
+  completionReq._context = getContext(req);
 
   const testId = getTestId(req);
   const fixture = matchFixture(

@@ -10,6 +10,7 @@ import {
   resolveResponse,
   resolveStrictMode,
   strictOverrideField,
+  getContext,
 } from "./helpers.js";
 import { matchFixture } from "./router.js";
 import { writeErrorResponse } from "./sse-writer.js";
@@ -87,6 +88,7 @@ export async function handleSpeech(
     model: speechReq.model ?? "tts-1",
     messages: [{ role: "user", content: speechReq.input }],
     _endpointType: "speech",
+    _context: getContext(req),
   };
 
   const testId = getTestId(req);

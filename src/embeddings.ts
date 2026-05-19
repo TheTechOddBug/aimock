@@ -24,6 +24,7 @@ import {
   resolveResponse,
   resolveStrictMode,
   strictOverrideField,
+  getContext,
 } from "./helpers.js";
 import { matchFixture } from "./router.js";
 import { writeErrorResponse } from "./sse-writer.js";
@@ -119,6 +120,7 @@ export async function handleEmbeddings(
     messages: [],
     embeddingInput: combinedInput,
     _endpointType: "embedding",
+    _context: getContext(req),
   };
 
   const testId = getTestId(req);

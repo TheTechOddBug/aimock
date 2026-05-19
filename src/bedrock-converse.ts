@@ -25,6 +25,7 @@ import {
   isContentWithToolCallsResponse,
   isErrorResponse,
   flattenHeaders,
+  getContext,
   getTestId,
   resolveResponse,
   resolveStrictMode,
@@ -560,6 +561,7 @@ export async function handleConverse(
 
   const completionReq = converseToCompletionRequest(converseReq, modelId, logger);
   completionReq._endpointType = "chat";
+  completionReq._context = getContext(req);
 
   const testId = getTestId(req);
   const fixture = matchFixture(
@@ -853,6 +855,7 @@ export async function handleConverseStream(
   const completionReq = converseToCompletionRequest(converseReq, modelId, logger);
   completionReq.stream = true;
   completionReq._endpointType = "chat";
+  completionReq._context = getContext(req);
 
   const testId = getTestId(req);
   const fixture = matchFixture(

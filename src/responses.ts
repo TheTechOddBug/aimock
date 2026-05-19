@@ -31,6 +31,7 @@ import {
   resolveResponse,
   resolveStrictMode,
   strictOverrideField,
+  getContext,
 } from "./helpers.js";
 import { matchFixture } from "./router.js";
 import { writeErrorResponse, delay, calculateDelay } from "./sse-writer.js";
@@ -946,6 +947,7 @@ export async function handleResponses(
   // Convert to ChatCompletionRequest for fixture matching
   const completionReq = responsesToCompletionRequest(responsesReq);
   completionReq._endpointType = "chat";
+  completionReq._context = getContext(req);
 
   const testId = getTestId(req);
   const fixture = matchFixture(
