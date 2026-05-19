@@ -220,6 +220,28 @@ describe("X-AIMock-Strict header integration", () => {
     expect(entries[0].response.strictOverride).toBe(false);
   });
 
+  it("strict mode 503 fires when context filtering removes all matches", async () => {
+    const contextFixture: Fixture = {
+      match: { context: "foo", userMessage: "hello" },
+      response: { content: "Hello from foo context" },
+    };
+    server = await createServer([contextFixture], { port: 0, strict: true });
+
+    // Context "bar" filters out the only fixture → strict 503
+    const mismatched = await httpPost(`${server.url}/v1/chat/completions`, chatRequest("hello"), {
+      "X-AIMock-Context": "bar",
+    });
+    expect(mismatched.status).toBe(503);
+    const body503 = JSON.parse(mismatched.body);
+    expect(body503.error.message).toBe("Strict mode: no fixture matched");
+
+    // Context "foo" matches → 200
+    const matched = await httpPost(`${server.url}/v1/chat/completions`, chatRequest("hello"), {
+      "X-AIMock-Context": "foo",
+    });
+    expect(matched.status).toBe(200);
+  });
+
   it("strict header prevents proxy in record mode", async () => {
     server = await createServer([], {
       port: 0,

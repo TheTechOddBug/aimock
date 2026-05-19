@@ -53,6 +53,8 @@ export interface ChatCompletionRequest {
   embeddingInput?: string;
   /** Endpoint type, set by handlers for fixture endpoint filtering. */
   _endpointType?: string;
+  /** Context identifier, set by handlers for fixture context routing. */
+  _context?: string;
   [key: string]: unknown;
 }
 
@@ -105,6 +107,7 @@ export interface FixtureMatch {
     | "realtime"
     | "realtime-transcription"
     | "realtime-translation";
+  context?: string;
 }
 
 // Fixture response types
@@ -406,6 +409,7 @@ export interface FixtureFileEntry {
       | "realtime"
       | "realtime-transcription"
       | "realtime-translation";
+    context?: string;
     // predicate not supported in JSON files
   };
   response: FixtureFileResponse;

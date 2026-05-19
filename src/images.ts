@@ -5,6 +5,7 @@ import {
   isErrorResponse,
   serializeErrorResponse,
   flattenHeaders,
+  getContext,
   getTestId,
   resolveResponse,
   resolveStrictMode,
@@ -32,11 +33,16 @@ interface GeminiPredictRequest {
   [key: string]: unknown;
 }
 
-function buildSyntheticRequest(model: string, prompt: string): ChatCompletionRequest {
+function buildSyntheticRequest(
+  model: string,
+  prompt: string,
+  context?: string,
+): ChatCompletionRequest {
   return {
     model,
     messages: [{ role: "user", content: prompt }],
     _endpointType: "image",
+    ...(context !== undefined && { _context: context }),
   };
 }
 
@@ -110,7 +116,7 @@ export async function handleImages(
     return;
   }
 
-  const syntheticReq = buildSyntheticRequest(model, prompt);
+  const syntheticReq = buildSyntheticRequest(model, prompt, getContext(req));
   const testId = getTestId(req);
   const fixture = matchFixture(
     fixtures,
@@ -342,7 +348,7 @@ export async function handleImageEdit(
     return;
   }
 
-  const syntheticReq = buildSyntheticRequest(model, prompt);
+  const syntheticReq = buildSyntheticRequest(model, prompt, getContext(req));
   const testId = getTestId(req);
   const fixture = matchFixture(
     fixtures,
@@ -526,7 +532,7 @@ export async function handleImageVariations(
   const model = extractFormField(raw, "model", boundary) ?? "dall-e-2";
 
   // Variations don't have a prompt — use a synthetic placeholder for fixture matching
-  const syntheticReq = buildSyntheticRequest(model, "[variation]");
+  const syntheticReq = buildSyntheticRequest(model, "[variation]", getContext(req));
   const testId = getTestId(req);
   const fixture = matchFixture(
     fixtures,

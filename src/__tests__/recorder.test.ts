@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Fixture, FixtureFile } from "../types.js";
 import { createServer, type ServerInstance } from "../server.js";
-import { proxyAndRecord, type ProxyCapturedResponse } from "../recorder.js";
+import { proxyAndRecord, buildFixtureMatch, type ProxyCapturedResponse } from "../recorder.js";
 import type { RecordConfig } from "../types.js";
 import { Logger } from "../logger.js";
 import { LLMock } from "../llmock.js";
@@ -4102,6 +4102,29 @@ describe("buildFixtureMatch model recording", () => {
     expect(files.length).toBe(1);
     const fixture = JSON.parse(fs.readFileSync(path.join(localTmpDir, files[0]), "utf-8"));
     expect(fixture.fixtures[0].match.model).toBe("claude-opus-4-20250514");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildFixtureMatch context
+// ---------------------------------------------------------------------------
+
+describe("buildFixtureMatch context", () => {
+  it("captures _context in match criteria", () => {
+    const match = buildFixtureMatch({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "hello" }],
+      _context: "langgraph-python",
+    });
+    expect(match.context).toBe("langgraph-python");
+  });
+
+  it("omits context when _context is absent", () => {
+    const match = buildFixtureMatch({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(match.context).toBeUndefined();
   });
 });
 

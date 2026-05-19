@@ -861,6 +861,16 @@ export function getTestId(req: http.IncomingMessage): string {
   return DEFAULT_TEST_ID;
 }
 
+export function getContext(req: http.IncomingMessage): string | undefined {
+  const headerValue = req.headers["x-aimock-context"];
+  if (Array.isArray(headerValue)) {
+    if (headerValue.length > 0 && headerValue[0]) return headerValue[0];
+  } else if (typeof headerValue === "string" && headerValue) {
+    return headerValue;
+  }
+  return undefined;
+}
+
 // ─── Snapshot recording helpers ──────────────────────────────────────────────
 
 /**

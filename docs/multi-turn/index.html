@@ -291,7 +291,10 @@
           </p>
         </div>
 
-        <h2>Choosing between sequenceIndex, toolCallId, turnIndex, hasToolResult, and predicate</h2>
+        <h2>
+          Choosing between sequenceIndex, toolCallId, turnIndex, hasToolResult, context, and
+          predicate
+        </h2>
         <p>Five mechanisms handle different shapes of &ldquo;the same prompt twice&rdquo;:</p>
 
         <table class="endpoint-table">
@@ -339,6 +342,15 @@
               <td>
                 Boolean check for <code>role: "tool"</code> presence. Stateless. Does not require
                 pinning a specific <code>tool_call_id</code>.
+              </td>
+            </tr>
+            <tr>
+              <td>Same user prompt, different response per integration or caller identity</td>
+              <td><code>context</code></td>
+              <td>
+                Exact match on the <code>X-AIMock-Context</code> header. Fixtures with
+                <code>context</code> only match requests carrying that value; fixtures without it
+                remain shared. Stateless.
               </td>
             </tr>
             <tr>
@@ -441,6 +453,15 @@
             server-side counter that drifts when multiple test runners share a single aimock
             instance. See <a href="/sequential-responses">Sequential Responses</a> for when
             <code>sequenceIndex</code> is the right tool.
+          </li>
+          <li>
+            <strong><code>context</code> is an additional discriminator, not a replacement.</strong>
+            <code>context</code> scopes fixtures by integration identity (<code
+              >X-AIMock-Context</code
+            >
+            header). It combines with all other match fields via AND. Two fixtures with the same
+            <code>userMessage</code> but different <code>context</code>
+            values are not duplicates &mdash; the validator accounts for this.
           </li>
         </ul>
       </main>

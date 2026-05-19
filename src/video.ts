@@ -9,6 +9,7 @@ import {
   resolveResponse,
   resolveStrictMode,
   strictOverrideField,
+  getContext,
 } from "./helpers.js";
 import { matchFixture } from "./router.js";
 import { writeErrorResponse } from "./sse-writer.js";
@@ -166,6 +167,7 @@ export async function handleVideoCreate(
     model: videoReq.model ?? "sora-2",
     messages: [{ role: "user", content: videoReq.prompt }],
     _endpointType: "video",
+    _context: getContext(req),
   };
 
   const testId = getTestId(req);

@@ -1108,6 +1108,43 @@ describe("matchFixture — hasToolResult", () => {
 });
 
 // ---------------------------------------------------------------------------
+// matchFixture — context matching
+// ---------------------------------------------------------------------------
+
+describe("matchFixture — context matching", () => {
+  it("matches fixture with matching context", () => {
+    const fixture = makeFixture({ context: "foo" });
+    const req = makeReq({ _context: "foo" });
+    expect(matchFixture([fixture], req)).toBe(fixture);
+  });
+
+  it("skips fixture with non-matching context", () => {
+    const fixture = makeFixture({ context: "foo" });
+    const req = makeReq({ _context: "bar" });
+    expect(matchFixture([fixture], req)).toBeNull();
+  });
+
+  it("matches fixture without context regardless of request context", () => {
+    const fixture = makeFixture({});
+    const req = makeReq({ _context: "bar" });
+    expect(matchFixture([fixture], req)).toBe(fixture);
+  });
+
+  it("skips context fixture when request has no context", () => {
+    const fixture = makeFixture({ context: "foo" });
+    const req = makeReq();
+    expect(matchFixture([fixture], req)).toBeNull();
+  });
+
+  it("context fixture wins over shared when listed first", () => {
+    const contextual = makeFixture({ context: "foo" }, { content: "contextual" });
+    const shared = makeFixture({}, { content: "shared" });
+    const req = makeReq({ _context: "foo" });
+    expect(matchFixture([contextual, shared], req)).toBe(contextual);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // matchFixture — first-match-wins
 // ---------------------------------------------------------------------------
 

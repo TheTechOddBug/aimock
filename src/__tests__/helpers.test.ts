@@ -1,3 +1,4 @@
+import http from "node:http";
 import { describe, it, expect } from "vitest";
 import {
   generateId,
@@ -11,6 +12,7 @@ import {
   buildToolCallChunks,
   buildTextCompletion,
   buildToolCallCompletion,
+  getContext,
 } from "../helpers.js";
 
 describe("generateId", () => {
@@ -289,6 +291,32 @@ describe("buildToolCallChunks", () => {
     );
     expect(argChunks.length).toBe(1);
     expect(argChunks[0].choices[0].delta.tool_calls![0].function!.arguments).toBe('{"x":1}');
+  });
+});
+
+describe("getContext", () => {
+  it("returns header value", () => {
+    const req = {
+      headers: { "x-aimock-context": "langgraph-python" },
+    } as unknown as http.IncomingMessage;
+    expect(getContext(req)).toBe("langgraph-python");
+  });
+
+  it("returns undefined when header absent", () => {
+    const req = { headers: {} } as unknown as http.IncomingMessage;
+    expect(getContext(req)).toBeUndefined();
+  });
+
+  it("returns first value from array header", () => {
+    const req = {
+      headers: { "x-aimock-context": ["first", "second"] },
+    } as unknown as http.IncomingMessage;
+    expect(getContext(req)).toBe("first");
+  });
+
+  it("returns undefined for empty string", () => {
+    const req = { headers: { "x-aimock-context": "" } } as unknown as http.IncomingMessage;
+    expect(getContext(req)).toBeUndefined();
   });
 });
 

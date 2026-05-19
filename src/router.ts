@@ -97,6 +97,13 @@ export function matchFixture(
       }
     }
 
+    // context — opt-in exact match against the request's _context field.
+    // If fixture specifies a context, only match requests with that exact context.
+    // If fixture omits context, match any request regardless of _context.
+    if (match.context !== undefined) {
+      if (effective._context !== match.context) continue;
+    }
+
     // userMessage — case-sensitive match against the last user message content.
     // String matching is intentionally case-sensitive so fixture authors can
     // rely on exact string values. This differs from the case-insensitive

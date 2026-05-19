@@ -16,6 +16,7 @@ import {
   serializeErrorResponse,
   isJSONResponse,
   flattenHeaders,
+  getContext,
   getTestId,
   resolveResponse,
   resolveStrictMode,
@@ -522,6 +523,7 @@ export async function handleFal(
         model: modelId,
         messages: [{ role: "user", content: prompt || JSON.stringify(parsedBody ?? {}) }],
         _endpointType: "fal",
+        _context: getContext(req),
       };
 
       const matchCounts = journal.getFixtureMatchCountsForTest(testId);

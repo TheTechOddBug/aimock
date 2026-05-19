@@ -163,10 +163,10 @@ export function persistFixture(opts: {
     }
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    filepath = path.join(
-      fixturePath,
-      `${providerKey}-${timestamp}-${crypto.randomUUID().slice(0, 8)}.json`,
-    );
+    const timestampFile = `${providerKey}-${timestamp}-${crypto.randomUUID().slice(0, 8)}.json`;
+    filepath = fixture.match.context
+      ? path.join(fixturePath, fixture.match.context, timestampFile)
+      : path.join(fixturePath, timestampFile);
   }
 
   const fileWarnings = [
@@ -175,7 +175,7 @@ export function persistFixture(opts: {
   ];
 
   try {
-    fs.mkdirSync(isSnapshotMode ? path.dirname(filepath) : fixturePath, { recursive: true });
+    fs.mkdirSync(path.dirname(filepath), { recursive: true });
 
     // Auth headers are forwarded to upstream but excluded from saved fixtures.
     // The persisted fixture is always the real upstream response, even when
@@ -1274,6 +1274,7 @@ export function buildFixtureMatch(
   endpoint?: EndpointType;
   turnIndex?: number;
   hasToolResult?: boolean;
+  context?: string;
 } {
   const match: {
     userMessage?: string;
@@ -1282,6 +1283,7 @@ export function buildFixtureMatch(
     endpoint?: EndpointType;
     turnIndex?: number;
     hasToolResult?: boolean;
+    context?: string;
   } = {};
 
   // Include endpoint type for multimedia fixtures
@@ -1319,6 +1321,10 @@ export function buildFixtureMatch(
   if (messages.length > 0) {
     match.turnIndex = messages.filter((m) => m.role === "assistant").length;
     match.hasToolResult = messages.some((m) => m.role === "tool");
+  }
+
+  if (request._context) {
+    match.context = request._context;
   }
 
   return match;

@@ -36,6 +36,7 @@ import {
   resolveResponse,
   resolveStrictMode,
   strictOverrideField,
+  getContext,
 } from "./helpers.js";
 import { handleResponses } from "./responses.js";
 import { handleMessages } from "./messages.js";
@@ -486,6 +487,7 @@ async function handleCompletions(
 
   // Set endpoint type once early so router/recorder and journal see it
   body._endpointType = "chat";
+  body._context = getContext(req);
 
   // Match fixture first — chaos resolution depends on fixture-level overrides
   // (headers > fixture.chaos > server defaults), so the fixture has to be

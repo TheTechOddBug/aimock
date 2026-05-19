@@ -67,6 +67,7 @@ export function entryToFixture(entry: FixtureFileEntry, logger?: Logger): Fixtur
       ...(entry.match.hasToolResult !== undefined && {
         hasToolResult: entry.match.hasToolResult,
       }),
+      ...(entry.match.context !== undefined && { context: entry.match.context }),
     },
     response: normalizeResponse(entry.response),
     ...(entry.latency !== undefined && { latency: entry.latency }),
@@ -682,6 +683,13 @@ export function validateFixtures(fixtures: Fixture[]): ValidationResult[] {
         });
       }
     }
+    if (f.match.context !== undefined && typeof f.match.context !== "string") {
+      results.push({
+        severity: "error",
+        fixtureIndex: i,
+        message: `match.context must be a string, got ${typeof f.match.context}`,
+      });
+    }
 
     // --- Warning checks ---
 
@@ -690,7 +698,7 @@ export function validateFixtures(fixtures: Fixture[]): ValidationResult[] {
     // but differ on those fields are NOT considered duplicates.
     const um = f.match.userMessage;
     if (typeof um === "string" && um) {
-      const dedupKey = `${um}|${f.match.turnIndex}|${f.match.hasToolResult}|${f.match.sequenceIndex}`;
+      const dedupKey = `${um}|${f.match.turnIndex}|${f.match.hasToolResult}|${f.match.sequenceIndex}|${f.match.context}`;
       const prev = seenUserMessages.get(dedupKey);
       if (prev !== undefined) {
         results.push({
@@ -707,6 +715,7 @@ export function validateFixtures(fixtures: Fixture[]): ValidationResult[] {
     const match = f.match;
     const hasDiscriminator =
       match.endpoint !== undefined ||
+      match.context !== undefined ||
       match.userMessage !== undefined ||
       match.systemMessage !== undefined ||
       match.inputText !== undefined ||

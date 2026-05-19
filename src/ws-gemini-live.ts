@@ -363,12 +363,21 @@ async function processMessage(
   }
 
   // Build completion request for fixture matching (include new messages speculatively)
+  const geminiContextHeader = defaults.upgradeHeaders?.["x-aimock-context"];
+  const geminiContext =
+    typeof geminiContextHeader === "string"
+      ? geminiContextHeader
+      : Array.isArray(geminiContextHeader) && geminiContextHeader.length > 0
+        ? geminiContextHeader[0]
+        : undefined;
+
   const completionReq: ChatCompletionRequest = {
     model: session.model,
     messages: [...session.conversationHistory, ...newMessages],
     stream: true,
     tools: session.tools.length > 0 ? session.tools : undefined,
     _endpointType: "chat",
+    _context: geminiContext,
   };
 
   const testId = defaults.testId ?? DEFAULT_TEST_ID;

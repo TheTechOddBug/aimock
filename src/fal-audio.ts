@@ -14,6 +14,7 @@ import {
   serializeErrorResponse,
   flattenHeaders,
   FORMAT_TO_CONTENT_TYPE,
+  getContext,
   getTestId,
   resolveResponse,
   resolveStrictMode,
@@ -297,6 +298,7 @@ async function handleQueueSubmit(
     model: modelId,
     messages: [{ role: "user", content: prompt }],
     _endpointType: "fal-audio",
+    _context: getContext(req),
   };
 
   const fixture = matchFixture(fixtures, syntheticReq, matchCounts, defaults.requestTransform);
@@ -824,6 +826,7 @@ async function handleSyncRun(
     model: modelId,
     messages: [{ role: "user", content: prompt }],
     _endpointType: "fal-audio",
+    _context: getContext(req),
   };
 
   const fixture = matchFixture(fixtures, syntheticReq, matchCounts, defaults.requestTransform);

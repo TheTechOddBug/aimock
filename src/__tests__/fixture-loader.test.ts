@@ -1006,6 +1006,30 @@ describe("validateFixtures", () => {
     ).toBe(true);
   });
 
+  // --- match.context type checks ---
+
+  it("validateFixtures reports error for non-string context", () => {
+    const fixtures = [
+      makeFixture({ match: { userMessage: "test", context: 42 as unknown as string } }),
+    ];
+    const results = validateFixtures(fixtures);
+    expect(
+      results.some((r) => r.severity === "error" && r.message.includes("must be a string")),
+    ).toBe(true);
+  });
+
+  it("context is a valid discriminator", () => {
+    const fixtures = [
+      makeFixture({ match: { context: "x" } }),
+      makeFixture({ match: { userMessage: "hello" } }),
+    ];
+    const results = validateFixtures(fixtures);
+    const catchAllWarnings = results.filter(
+      (r) => r.severity === "warning" && r.message.includes("catch-all"),
+    );
+    expect(catchAllWarnings).toHaveLength(0);
+  });
+
   // --- Warning checks ---
 
   it("warning: duplicate userMessage", () => {
@@ -1543,6 +1567,15 @@ describe("auto-stringify JSON objects in fixture entries", () => {
     };
     const fixture = entryToFixture(entry);
     expect((fixture.response as TextResponse).content).toBe("Hello, world!");
+  });
+
+  it("entryToFixture preserves context field", () => {
+    const entry: FixtureFileEntry = {
+      match: { context: "my-ctx", userMessage: "hi" },
+      response: { content: "ok" },
+    };
+    const fixture = entryToFixture(entry);
+    expect(fixture.match.context).toBe("my-ctx");
   });
 
   it("passes systemMessage through entryToFixture", () => {

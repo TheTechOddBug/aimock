@@ -35,6 +35,7 @@ import {
   resolveResponse,
   resolveStrictMode,
   strictOverrideField,
+  getContext,
 } from "./helpers.js";
 import { matchFixture } from "./router.js";
 import { writeErrorResponse } from "./sse-writer.js";
@@ -539,6 +540,7 @@ export async function handleOllama(
   // Convert to ChatCompletionRequest for fixture matching
   const completionReq = ollamaToCompletionRequest(ollamaReq);
   completionReq._endpointType = "chat";
+  completionReq._context = getContext(req);
 
   const testId = getTestId(req);
   const fixture = matchFixture(
@@ -889,6 +891,7 @@ export async function handleOllamaGenerate(
   // Convert to ChatCompletionRequest for fixture matching
   const completionReq = ollamaGenerateToCompletionRequest(generateReq);
   completionReq._endpointType = "chat";
+  completionReq._context = getContext(req);
 
   const testId = getTestId(req);
   const fixture = matchFixture(
@@ -1212,6 +1215,7 @@ export async function handleOllamaEmbeddings(
     messages: [],
     embeddingInput: inputText,
     _endpointType: "embedding",
+    _context: getContext(req),
   };
 
   const testId = getTestId(req);
