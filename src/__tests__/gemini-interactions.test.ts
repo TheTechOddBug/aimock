@@ -540,6 +540,193 @@ describe("geminiInteractionsToCompletionRequest", () => {
     expect(result.messages).toHaveLength(1);
     expect(result.messages[0].content).toBe("from-content");
   });
+
+  // ─── Step[] envelope (live API wire contract) ─────────────────────────
+
+  it("converts Step[] user_input step to a user message", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [{ type: "user_input", content: [{ type: "text", text: "hi" }] }],
+    });
+    expect(result.messages).toEqual([{ role: "user", content: "hi" }]);
+  });
+
+  it("converts Step[] user_input with multiple text parts (concatenates)", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [
+        {
+          type: "user_input",
+          content: [
+            { type: "text", text: "part one " },
+            { type: "text", text: "part two" },
+          ],
+        },
+      ],
+    });
+    expect(result.messages).toEqual([{ role: "user", content: "part one part two" }]);
+  });
+
+  it("converts Step[] function_result step to a tool message", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [
+        {
+          type: "function_result",
+          call_id: "call_abc",
+          name: "get_weather",
+          result: { temperature: 72 },
+        },
+      ],
+    });
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].role).toBe("tool");
+    expect(result.messages[0].content).toBe('{"temperature":72}');
+    expect(result.messages[0].tool_call_id).toBe("call_abc");
+  });
+
+  it("passes through Step[] function_result with string result", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [{ type: "function_result", call_id: "call_x", result: "ok" }],
+    });
+    expect(result.messages).toEqual([{ role: "tool", content: "ok", tool_call_id: "call_x" }]);
+  });
+
+  it("converts Step[] model_output text step to an assistant message", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [
+        { type: "user_input", content: [{ type: "text", text: "hi" }] },
+        { type: "model_output", content: [{ type: "text", text: "hello" }] },
+      ],
+    });
+    expect(result.messages).toEqual([
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ]);
+  });
+
+  it("converts Step[] model_output with function_call into assistant tool_calls", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [
+        {
+          type: "model_output",
+          content: [
+            { type: "text", text: "Calling tool..." },
+            {
+              type: "function_call",
+              name: "search",
+              id: "call_x",
+              arguments: { query: "test" },
+            },
+          ],
+        },
+      ],
+    });
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].role).toBe("assistant");
+    expect(result.messages[0].content).toBe("Calling tool...");
+    expect(result.messages[0].tool_calls).toHaveLength(1);
+    expect(result.messages[0].tool_calls![0].function.name).toBe("search");
+    expect(result.messages[0].tool_calls![0].id).toBe("call_x");
+  });
+
+  it("converts a multi-step Step[] agent loop in order", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [
+        { type: "user_input", content: [{ type: "text", text: "what's the weather?" }] },
+        {
+          type: "model_output",
+          content: [
+            {
+              type: "function_call",
+              name: "get_weather",
+              id: "call_w",
+              arguments: { city: "NYC" },
+            },
+          ],
+        },
+        { type: "function_result", call_id: "call_w", result: { temp: 72 } },
+        { type: "user_input", content: [{ type: "text", text: "thanks" }] },
+      ],
+    });
+    expect(result.messages).toHaveLength(4);
+    expect(result.messages[0]).toEqual({ role: "user", content: "what's the weather?" });
+    expect(result.messages[1].role).toBe("assistant");
+    expect(result.messages[1].tool_calls![0].function.name).toBe("get_weather");
+    expect(result.messages[2]).toEqual({
+      role: "tool",
+      content: '{"temp":72}',
+      tool_call_id: "call_w",
+    });
+    expect(result.messages[3]).toEqual({ role: "user", content: "thanks" });
+  });
+
+  it("handles other *_result Step types as tool messages", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [
+        {
+          type: "code_execution_result",
+          call_id: "call_code",
+          result: "stdout: 42\n",
+        },
+      ],
+    });
+    expect(result.messages).toEqual([
+      { role: "tool", content: "stdout: 42\n", tool_call_id: "call_code" },
+    ]);
+  });
+
+  it.each([
+    "url_context_result",
+    "google_search_result",
+    "google_maps_result",
+    "mcp_server_tool_result",
+    "file_search_result",
+  ])("handles Step[] %s as a tool message", (stepType) => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [
+        {
+          type: stepType,
+          call_id: `call_${stepType}`,
+          result: { data: "test" },
+        },
+      ],
+    });
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].role).toBe("tool");
+    expect(result.messages[0].content).toBe('{"data":"test"}');
+    expect(result.messages[0].tool_call_id).toBe(`call_${stepType}`);
+  });
+
+  it("handles Step[] user_input with empty content", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [{ type: "user_input", content: [] }],
+    });
+    expect(result.messages).toEqual([{ role: "user", content: "" }]);
+  });
+
+  it("handles Step[] model_output with undefined content", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [{ type: "model_output" }],
+    });
+    expect(result.messages).toEqual([{ role: "assistant", content: "" }]);
+  });
+
+  it("handles Step[] model_output with empty content array", () => {
+    const result = geminiInteractionsToCompletionRequest({
+      model: "gemini-2.5-flash",
+      input: [{ type: "model_output", content: [] }],
+    });
+    expect(result.messages).toEqual([{ role: "assistant", content: "" }]);
+  });
 });
 
 // ─── Unit tests: response builders ──────────────────────────────────────
@@ -807,6 +994,22 @@ describe("Gemini Interactions — non-streaming", () => {
     expect(res.status).toBe(503);
     const body = JSON.parse(res.body);
     expect(body.error.code).toBe("UNAVAILABLE");
+  });
+
+  it("matches userMessage fixture when input is Step[] envelope (issue #228)", async () => {
+    // Reproduces the live wire contract that Google's /v1beta/interactions accepts:
+    // a top-level Array<Step> where each step is { type: "user_input", content: [...] }.
+    // Pre-fix this fell through to the Content[] branch and produced an empty user
+    // message, so userMessage-based fixtures never matched.
+    instance = await createServer([textFixture]);
+    const res = await post(`${instance.url}/v1beta/interactions`, {
+      model: "gemini-2.5-flash",
+      stream: false,
+      input: [{ type: "user_input", content: [{ type: "text", text: "hello" }] }],
+    });
+    expect(res.status).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.outputs).toEqual([{ type: "text", text: "Hi there!" }]);
   });
 
   it("handles sequenceIndex for multi-turn", async () => {

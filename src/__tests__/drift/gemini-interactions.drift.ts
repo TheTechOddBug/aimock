@@ -16,7 +16,11 @@ import {
   geminiInteractionsStreamEventShapes,
   geminiInteractionsToolCallStreamEventShapes,
 } from "./sdk-shapes.js";
-import { geminiInteractionsNonStreaming, geminiInteractionsStreaming } from "./providers.js";
+import {
+  geminiInteractionsNonStreaming,
+  geminiInteractionsNonStreamingSteps,
+  geminiInteractionsStreaming,
+} from "./providers.js";
 import { httpPost, parseInteractionsSSE, startDriftServer, stopDriftServer } from "./helpers.js";
 
 // ---------------------------------------------------------------------------
@@ -74,6 +78,49 @@ describe.skipIf(!GOOGLE_API_KEY)("Gemini Interactions API drift", () => {
 
     const diffs = triangulate(sdkShape, realShape, mockShape);
     const report = formatDriftReport("Gemini Interactions (non-streaming text)", diffs);
+
+    expect(
+      diffs.filter((d) => d.severity === "critical"),
+      report,
+    ).toEqual([]);
+  });
+
+  it("non-streaming text shape matches (Step[] input)", async () => {
+    const sdkShape = geminiInteractionsResponseShape();
+
+    let realRes;
+    try {
+      realRes = await geminiInteractionsNonStreamingSteps(config, "Say hello");
+    } catch (err) {
+      console.warn(
+        "Gemini Interactions API unavailable:",
+        err instanceof Error ? err.message : String(err),
+      );
+      return;
+    }
+
+    if (
+      !realRes.body ||
+      (typeof realRes.body === "object" && Object.keys(realRes.body).length === 0)
+    ) {
+      console.warn("Gemini Interactions non-streaming API returned empty body — skipping");
+      return;
+    }
+
+    const mockRes = await httpPost(`${instance.url}/v1beta/interactions`, {
+      model: "gemini-2.5-flash",
+      input: [{ type: "user_input", content: [{ type: "text", text: "Say hello" }] }],
+      stream: false,
+    });
+
+    const realShape = extractShape(realRes.body);
+    const mockShape = extractShape(JSON.parse(mockRes.body));
+
+    const diffs = triangulate(sdkShape, realShape, mockShape);
+    const report = formatDriftReport(
+      "Gemini Interactions (non-streaming text, Step[] input)",
+      diffs,
+    );
 
     expect(
       diffs.filter((d) => d.severity === "critical"),

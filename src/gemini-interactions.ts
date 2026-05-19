@@ -60,6 +60,38 @@ interface InteractionsTurn {
   parts?: InteractionsContentBlock[];
 }
 
+/**
+ * Top-level Step envelope accepted by the live Gemini Interactions API.
+ * The SDK's TypeScript union does not include Step[], but the wire contract
+ * does — clients following the live API send these at the top level of `input`.
+ * Discriminated by `type`; no `role` field (distinguishes from Turn[]).
+ */
+interface InteractionsStep {
+  type: string;
+  content?: InteractionsContentBlock[];
+  call_id?: string;
+  id?: string;
+  name?: string;
+  result?: unknown;
+  output?: unknown;
+  is_error?: boolean;
+  signature?: string;
+}
+
+/** Step types whose payload is a tool/agent result keyed by call_id. */
+const STEP_RESULT_TYPES = new Set<string>([
+  "function_result",
+  "code_execution_result",
+  "url_context_result",
+  "google_search_result",
+  "google_maps_result",
+  "mcp_server_tool_result",
+  "file_search_result",
+]);
+
+/** All recognized top-level Step types (used as the Step[] discriminator). */
+const STEP_TYPES = new Set<string>(["user_input", "model_output", ...STEP_RESULT_TYPES]);
+
 interface InteractionsFunctionTool {
   type: "function";
   name: string;
@@ -69,7 +101,7 @@ interface InteractionsFunctionTool {
 
 interface InteractionsRequest {
   model?: string;
-  input?: string | InteractionsTurn[] | InteractionsContentBlock[];
+  input?: string | InteractionsTurn[] | InteractionsStep[] | InteractionsContentBlock[];
   system_instruction?: string;
   tools?: InteractionsFunctionTool[];
   generation_config?: {
@@ -101,8 +133,18 @@ export function geminiInteractionsToCompletionRequest(
       // Simple string input → single user message
       messages.push({ role: "user", content: req.input });
     } else if (Array.isArray(req.input)) {
-      // Could be Turn[] or Content[]
-      const firstItem = req.input[0];
+      // Could be Turn[], Step[], or Content[]
+      const firstItem = req.input[0] as
+        | InteractionsTurn
+        | InteractionsStep
+        | InteractionsContentBlock
+        | undefined;
+      const isStepArray =
+        !!firstItem &&
+        !("role" in firstItem) &&
+        typeof firstItem.type === "string" &&
+        STEP_TYPES.has(firstItem.type);
+
       if (firstItem && "role" in firstItem) {
         // Turn[] format
         for (const turn of req.input as InteractionsTurn[]) {
@@ -162,6 +204,47 @@ export function geminiInteractionsToCompletionRequest(
                 content: text,
               });
             }
+          }
+        }
+      } else if (isStepArray) {
+        // Step[] format — the wire contract Google's /v1beta/interactions accepts.
+        for (const step of req.input as InteractionsStep[]) {
+          if (step.type === "user_input") {
+            const text = (step.content ?? [])
+              .filter((p) => p.type === "text")
+              .map((p) => p.text ?? "")
+              .join("");
+            messages.push({ role: "user", content: text });
+          } else if (step.type === "model_output") {
+            const blocks = step.content ?? [];
+            const funcCallParts = blocks.filter((p) => p.type === "function_call");
+            const textParts = blocks.filter((p) => p.type === "text");
+            const textContent = textParts.map((p) => p.text ?? "").join("");
+
+            if (funcCallParts.length > 0) {
+              messages.push({
+                role: "assistant",
+                content: textContent || null,
+                tool_calls: funcCallParts.map((p) => ({
+                  id: p.id ?? p.call_id ?? generateToolCallId(),
+                  type: "function" as const,
+                  function: {
+                    name: p.name ?? "",
+                    arguments: JSON.stringify(p.arguments ?? {}),
+                  },
+                })),
+              });
+            } else {
+              messages.push({ role: "assistant", content: textContent });
+            }
+          } else if (STEP_RESULT_TYPES.has(step.type)) {
+            const resultValue = step.result ?? step.output;
+            messages.push({
+              role: "tool",
+              content:
+                typeof resultValue === "string" ? resultValue : JSON.stringify(resultValue ?? ""),
+              tool_call_id: step.call_id ?? step.id ?? "",
+            });
           }
         }
       } else {
