@@ -137,8 +137,10 @@ const PROVIDER_MAP: Record<string, ProviderMapping> = {
     builderFunctions: [
       "buildInteractionsTextResponse",
       "buildInteractionsToolCallResponse",
+      "buildInteractionsContentWithToolCallsResponse",
       "buildInteractionsTextSSEEvents",
       "buildInteractionsToolCallSSEEvents",
+      "buildInteractionsContentWithToolCallsSSEEvents",
     ],
     typesFile: null,
   },
