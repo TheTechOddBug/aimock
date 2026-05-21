@@ -40,8 +40,10 @@ export function extractFormField(
 ): string | undefined {
   if (!boundary) {
     // Fallback: no boundary available, use simple regex (best-effort)
+    console.warn("extractFormField: no multipart boundary found, using best-effort regex fallback");
+    const escaped = fieldName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const pattern = new RegExp(
-      `Content-Disposition:\\s*form-data;[^\\r\\n]*name="${fieldName}"[^\\r\\n]*\\r\\n\\r\\n([^\\r\\n]*)`,
+      `Content-Disposition:\\s*form-data;[^\\r\\n]*name="${escaped}"[^\\r\\n]*\\r\\n\\r\\n([^\\r\\n]*)`,
       "i",
     );
     const match = raw.match(pattern);

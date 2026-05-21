@@ -4,7 +4,7 @@ import type { Journal } from "./journal.js";
 import type { Logger } from "./logger.js";
 import type { MetricsRegistry } from "./metrics.js";
 
-// LLMock type definitions — shared across all provider adapters and the fixture router.
+// aimock type definitions — shared across all provider adapters and the fixture router.
 
 export interface Mountable {
   handleRequest(

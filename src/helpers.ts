@@ -91,7 +91,7 @@ export async function resolveResponse(
       return normalizeFactoryResponse(raw);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(`Response factory threw: ${msg}`);
+      throw new Error(`Response factory threw: ${msg}`, { cause: err });
     }
   }
   return fixture.response;
@@ -288,12 +288,12 @@ function resolveUsage(
 ): { prompt_tokens: number; completion_tokens: number; total_tokens: number } {
   if (overrides?.usage) {
     const u = overrides.usage;
-    const prompt = u.prompt_tokens ?? 0;
-    const completion = u.completion_tokens ?? 0;
+    const prompt = u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? 0;
+    const completion = u.completion_tokens ?? u.output_tokens ?? u.candidatesTokenCount ?? 0;
     return {
       prompt_tokens: prompt,
       completion_tokens: completion,
-      total_tokens: u.total_tokens ?? prompt + completion,
+      total_tokens: u.total_tokens ?? u.totalTokenCount ?? prompt + completion,
     };
   }
   const prompt = estimateTokens(promptText || "x");
@@ -925,6 +925,7 @@ export interface EmbeddingAPIResponse {
 export function buildEmbeddingResponse(
   embeddings: number[][],
   model: string,
+  usage?: { prompt_tokens?: number; total_tokens?: number },
 ): EmbeddingAPIResponse {
   return {
     object: "list",
@@ -934,6 +935,6 @@ export function buildEmbeddingResponse(
       embedding,
     })),
     model,
-    usage: { prompt_tokens: 0, total_tokens: 0 },
+    usage: { prompt_tokens: usage?.prompt_tokens ?? 0, total_tokens: usage?.total_tokens ?? 0 },
   };
 }
