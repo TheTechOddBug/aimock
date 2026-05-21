@@ -59,7 +59,7 @@ export interface A2AConfig {
 }
 
 export interface AGUIConfigFixture {
-  match: { message?: string; toolName?: string; stateKey?: string };
+  match: { message?: string; toolCallId?: string; toolName?: string; stateKey?: string };
   text?: string; // shorthand: uses buildTextResponse
   events?: AGUIEvent[]; // raw events
   delayMs?: number;
