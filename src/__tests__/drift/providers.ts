@@ -151,6 +151,17 @@ function toSSEEventShapes(events: { type: string; data: unknown }[]): SSEEventSh
 }
 
 // ---------------------------------------------------------------------------
+// Infra-error tagging
+// ---------------------------------------------------------------------------
+
+function withInfraErrorTag<T>(provider: string, fn: () => Promise<T>): Promise<T> {
+  return fn().catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`INFRA_ERROR: ${provider} — ${msg}`);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // OpenAI
 // ---------------------------------------------------------------------------
 
@@ -159,25 +170,27 @@ export async function openaiChatNonStreaming(
   messages: { role: string; content: string }[],
   tools?: object[],
 ): Promise<FetchResult> {
-  const body: Record<string, unknown> = {
-    model: "gpt-4o-mini",
-    messages,
-    stream: false,
-    max_tokens: 10,
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("OpenAI Chat", async () => {
+    const body: Record<string, unknown> = {
+      model: "gpt-4o-mini",
+      messages,
+      stream: false,
+      max_tokens: 10,
+    };
+    if (tools) body.tools = tools;
 
-  const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey}`,
-    },
-    body: JSON.stringify(body),
+    const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const raw = await res.text();
+    return { status: res.status, body: parseJsonResponse(raw, res.status, "OpenAI Chat"), raw };
   });
-
-  const raw = await res.text();
-  return { status: res.status, body: parseJsonResponse(raw, res.status, "OpenAI Chat"), raw };
 }
 
 export async function openaiChatStreaming(
@@ -185,35 +198,37 @@ export async function openaiChatStreaming(
   messages: { role: string; content: string }[],
   tools?: object[],
 ): Promise<StreamResult> {
-  const body: Record<string, unknown> = {
-    model: "gpt-4o-mini",
-    messages,
-    stream: true,
-    max_tokens: 10,
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("OpenAI Chat", async () => {
+    const body: Record<string, unknown> = {
+      model: "gpt-4o-mini",
+      messages,
+      stream: true,
+      max_tokens: 10,
+    };
+    if (tools) body.tools = tools;
 
-  const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey}`,
-    },
-    body: JSON.stringify(body),
+    const res = await fetchWithRetry("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const raw = await res.text();
+    assertOk(raw, res.status, "OpenAI Chat streaming");
+    const parsed = parseDataOnlySSE(raw);
+    const rawEvents = parsed.map((p) => ({
+      type: "chat.completion.chunk",
+      data: p.data,
+    }));
+    return {
+      status: res.status,
+      events: toSSEEventShapes(rawEvents),
+      rawEvents,
+    };
   });
-
-  const raw = await res.text();
-  assertOk(raw, res.status, "OpenAI Chat streaming");
-  const parsed = parseDataOnlySSE(raw);
-  const rawEvents = parsed.map((p) => ({
-    type: "chat.completion.chunk",
-    data: p.data,
-  }));
-  return {
-    status: res.status,
-    events: toSSEEventShapes(rawEvents),
-    rawEvents,
-  };
 }
 
 export async function openaiResponsesNonStreaming(
@@ -221,29 +236,31 @@ export async function openaiResponsesNonStreaming(
   input: object[],
   tools?: object[],
 ): Promise<FetchResult> {
-  const body: Record<string, unknown> = {
-    model: "gpt-4o-mini",
-    input,
-    stream: false,
-    max_output_tokens: 50,
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("OpenAI Responses", async () => {
+    const body: Record<string, unknown> = {
+      model: "gpt-4o-mini",
+      input,
+      stream: false,
+      max_output_tokens: 50,
+    };
+    if (tools) body.tools = tools;
 
-  const res = await fetchWithRetry("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey}`,
-    },
-    body: JSON.stringify(body),
+    const res = await fetchWithRetry("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const raw = await res.text();
+    return {
+      status: res.status,
+      body: parseJsonResponse(raw, res.status, "OpenAI Responses"),
+      raw,
+    };
   });
-
-  const raw = await res.text();
-  return {
-    status: res.status,
-    body: parseJsonResponse(raw, res.status, "OpenAI Responses"),
-    raw,
-  };
 }
 
 export async function openaiResponsesStreaming(
@@ -251,31 +268,33 @@ export async function openaiResponsesStreaming(
   input: object[],
   tools?: object[],
 ): Promise<StreamResult> {
-  const body: Record<string, unknown> = {
-    model: "gpt-4o-mini",
-    input,
-    stream: true,
-    max_output_tokens: 50,
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("OpenAI Responses", async () => {
+    const body: Record<string, unknown> = {
+      model: "gpt-4o-mini",
+      input,
+      stream: true,
+      max_output_tokens: 50,
+    };
+    if (tools) body.tools = tools;
 
-  const res = await fetchWithRetry("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey}`,
-    },
-    body: JSON.stringify(body),
+    const res = await fetchWithRetry("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const raw = await res.text();
+    assertOk(raw, res.status, "OpenAI Responses streaming");
+    const rawEvents = parseTypedSSE(raw);
+    return {
+      status: res.status,
+      events: toSSEEventShapes(rawEvents),
+      rawEvents,
+    };
   });
-
-  const raw = await res.text();
-  assertOk(raw, res.status, "OpenAI Responses streaming");
-  const rawEvents = parseTypedSSE(raw);
-  return {
-    status: res.status,
-    events: toSSEEventShapes(rawEvents),
-    rawEvents,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -287,26 +306,28 @@ export async function anthropicNonStreaming(
   messages: { role: string; content: string }[],
   tools?: object[],
 ): Promise<FetchResult> {
-  const body: Record<string, unknown> = {
-    model: "claude-haiku-4-5-20251001",
-    messages,
-    max_tokens: 10,
-    stream: false,
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("Anthropic", async () => {
+    const body: Record<string, unknown> = {
+      model: "claude-haiku-4-5-20251001",
+      messages,
+      max_tokens: 10,
+      stream: false,
+    };
+    if (tools) body.tools = tools;
 
-  const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": config.apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify(body),
+    const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": config.apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(body),
+    });
+
+    const raw = await res.text();
+    return { status: res.status, body: parseJsonResponse(raw, res.status, "Anthropic"), raw };
   });
-
-  const raw = await res.text();
-  return { status: res.status, body: parseJsonResponse(raw, res.status, "Anthropic"), raw };
 }
 
 export async function anthropicStreaming(
@@ -314,32 +335,34 @@ export async function anthropicStreaming(
   messages: { role: string; content: string }[],
   tools?: object[],
 ): Promise<StreamResult> {
-  const body: Record<string, unknown> = {
-    model: "claude-haiku-4-5-20251001",
-    messages,
-    max_tokens: 10,
-    stream: true,
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("Anthropic", async () => {
+    const body: Record<string, unknown> = {
+      model: "claude-haiku-4-5-20251001",
+      messages,
+      max_tokens: 10,
+      stream: true,
+    };
+    if (tools) body.tools = tools;
 
-  const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": config.apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify(body),
+    const res = await fetchWithRetry("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": config.apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify(body),
+    });
+
+    const raw = await res.text();
+    assertOk(raw, res.status, "Anthropic streaming");
+    const rawEvents = parseTypedSSE(raw);
+    return {
+      status: res.status,
+      events: toSSEEventShapes(rawEvents),
+      rawEvents,
+    };
   });
-
-  const raw = await res.text();
-  assertOk(raw, res.status, "Anthropic streaming");
-  const rawEvents = parseTypedSSE(raw);
-  return {
-    status: res.status,
-    events: toSSEEventShapes(rawEvents),
-    rawEvents,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -351,24 +374,26 @@ export async function geminiNonStreaming(
   contents: object[],
   tools?: object[],
 ): Promise<FetchResult> {
-  // Gemini 2.5+ uses thinking tokens from the output budget, so we need
-  // more headroom than other providers to get actual content back
-  const body: Record<string, unknown> = {
-    contents,
-    generationConfig: { maxOutputTokens: 100 },
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("Gemini", async () => {
+    // Gemini 2.5+ uses thinking tokens from the output budget, so we need
+    // more headroom than other providers to get actual content back
+    const body: Record<string, unknown> = {
+      contents,
+      generationConfig: { maxOutputTokens: 100 },
+    };
+    if (tools) body.tools = tools;
 
-  // Gemini requires API key as query parameter per Google's REST API design
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${config.apiKey}`;
-  const res = await fetchWithRetry(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    // Gemini requires API key as query parameter per Google's REST API design
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${config.apiKey}`;
+    const res = await fetchWithRetry(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    const raw = await res.text();
+    return { status: res.status, body: parseJsonResponse(raw, res.status, "Gemini", url), raw };
   });
-
-  const raw = await res.text();
-  return { status: res.status, body: parseJsonResponse(raw, res.status, "Gemini", url), raw };
 }
 
 export async function geminiStreaming(
@@ -376,31 +401,33 @@ export async function geminiStreaming(
   contents: object[],
   tools?: object[],
 ): Promise<StreamResult> {
-  const body: Record<string, unknown> = {
-    contents,
-    generationConfig: { maxOutputTokens: 100 },
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("Gemini", async () => {
+    const body: Record<string, unknown> = {
+      contents,
+      generationConfig: { maxOutputTokens: 100 },
+    };
+    if (tools) body.tools = tools;
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=${config.apiKey}`;
-  const res = await fetchWithRetry(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=${config.apiKey}`;
+    const res = await fetchWithRetry(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    const raw = await res.text();
+    assertOk(raw, res.status, "Gemini streaming", url);
+    const parsed = parseDataOnlySSE(raw);
+    const rawEvents = parsed.map((p) => ({
+      type: "gemini.chunk",
+      data: p.data,
+    }));
+    return {
+      status: res.status,
+      events: toSSEEventShapes(rawEvents),
+      rawEvents,
+    };
   });
-
-  const raw = await res.text();
-  assertOk(raw, res.status, "Gemini streaming", url);
-  const parsed = parseDataOnlySSE(raw);
-  const rawEvents = parsed.map((p) => ({
-    type: "gemini.chunk",
-    data: p.data,
-  }));
-  return {
-    status: res.status,
-    events: toSSEEventShapes(rawEvents),
-    rawEvents,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -412,31 +439,33 @@ export async function geminiInteractionsNonStreaming(
   input: string,
   tools?: object[],
 ): Promise<FetchResult> {
-  const body: Record<string, unknown> = {
-    model: "gemini-2.5-flash",
-    input,
-    stream: false,
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("Gemini Interactions", async () => {
+    const body: Record<string, unknown> = {
+      model: "gemini-2.5-flash",
+      input,
+      stream: false,
+    };
+    if (tools) body.tools = tools;
 
-  const res = await fetchWithRetry(
-    `https://generativelanguage.googleapis.com/v1beta/interactions`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": config.apiKey,
+    const res = await fetchWithRetry(
+      `https://generativelanguage.googleapis.com/v1beta/interactions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": config.apiKey,
+        },
+        body: JSON.stringify(body),
       },
-      body: JSON.stringify(body),
-    },
-  );
+    );
 
-  const raw = await res.text();
-  return {
-    status: res.status,
-    body: parseJsonResponse(raw, res.status, "Gemini Interactions"),
-    raw,
-  };
+    const raw = await res.text();
+    return {
+      status: res.status,
+      body: parseJsonResponse(raw, res.status, "Gemini Interactions"),
+      raw,
+    };
+  });
 }
 
 export async function geminiInteractionsStreaming(
@@ -444,41 +473,43 @@ export async function geminiInteractionsStreaming(
   input: string,
   tools?: object[],
 ): Promise<StreamResult> {
-  const body: Record<string, unknown> = {
-    model: "gemini-2.5-flash",
-    input,
-    stream: true,
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("Gemini Interactions", async () => {
+    const body: Record<string, unknown> = {
+      model: "gemini-2.5-flash",
+      input,
+      stream: true,
+    };
+    if (tools) body.tools = tools;
 
-  const res = await fetchWithRetry(
-    `https://generativelanguage.googleapis.com/v1beta/interactions`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": config.apiKey,
+    const res = await fetchWithRetry(
+      `https://generativelanguage.googleapis.com/v1beta/interactions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": config.apiKey,
+        },
+        body: JSON.stringify(body),
       },
-      body: JSON.stringify(body),
-    },
-  );
+    );
 
-  const raw = await res.text();
-  assertOk(raw, res.status, "Gemini Interactions streaming");
-  // Interactions uses data-only SSE (data: {...}\n\n) with event_type inside the JSON
-  const parsed = parseDataOnlySSE(raw);
-  const rawEvents = parsed.map((p) => {
-    const data = p.data as Record<string, unknown>;
+    const raw = await res.text();
+    assertOk(raw, res.status, "Gemini Interactions streaming");
+    // Interactions uses data-only SSE (data: {...}\n\n) with event_type inside the JSON
+    const parsed = parseDataOnlySSE(raw);
+    const rawEvents = parsed.map((p) => {
+      const data = p.data as Record<string, unknown>;
+      return {
+        type: (data.event_type as string) ?? "unknown",
+        data: data,
+      };
+    });
     return {
-      type: (data.event_type as string) ?? "unknown",
-      data: data,
+      status: res.status,
+      events: toSSEEventShapes(rawEvents),
+      rawEvents,
     };
   });
-  return {
-    status: res.status,
-    events: toSSEEventShapes(rawEvents),
-    rawEvents,
-  };
 }
 
 export async function geminiInteractionsNonStreamingSteps(
@@ -486,31 +517,33 @@ export async function geminiInteractionsNonStreamingSteps(
   input: string,
   tools?: object[],
 ): Promise<FetchResult> {
-  const body: Record<string, unknown> = {
-    model: "gemini-2.5-flash",
-    input: [{ type: "user_input", content: [{ type: "text", text: input }] }],
-    stream: false,
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("Gemini Interactions", async () => {
+    const body: Record<string, unknown> = {
+      model: "gemini-2.5-flash",
+      input: [{ type: "user_input", content: [{ type: "text", text: input }] }],
+      stream: false,
+    };
+    if (tools) body.tools = tools;
 
-  const res = await fetchWithRetry(
-    `https://generativelanguage.googleapis.com/v1beta/interactions`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": config.apiKey,
+    const res = await fetchWithRetry(
+      `https://generativelanguage.googleapis.com/v1beta/interactions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": config.apiKey,
+        },
+        body: JSON.stringify(body),
       },
-      body: JSON.stringify(body),
-    },
-  );
+    );
 
-  const raw = await res.text();
-  return {
-    status: res.status,
-    body: parseJsonResponse(raw, res.status, "Gemini Interactions"),
-    raw,
-  };
+    const raw = await res.text();
+    return {
+      status: res.status,
+      body: parseJsonResponse(raw, res.status, "Gemini Interactions"),
+      raw,
+    };
+  });
 }
 
 export async function geminiInteractionsStreamingSteps(
@@ -518,41 +551,43 @@ export async function geminiInteractionsStreamingSteps(
   input: string,
   tools?: object[],
 ): Promise<StreamResult> {
-  const body: Record<string, unknown> = {
-    model: "gemini-2.5-flash",
-    input: [{ type: "user_input", content: [{ type: "text", text: input }] }],
-    stream: true,
-  };
-  if (tools) body.tools = tools;
+  return withInfraErrorTag("Gemini Interactions", async () => {
+    const body: Record<string, unknown> = {
+      model: "gemini-2.5-flash",
+      input: [{ type: "user_input", content: [{ type: "text", text: input }] }],
+      stream: true,
+    };
+    if (tools) body.tools = tools;
 
-  const res = await fetchWithRetry(
-    `https://generativelanguage.googleapis.com/v1beta/interactions`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": config.apiKey,
+    const res = await fetchWithRetry(
+      `https://generativelanguage.googleapis.com/v1beta/interactions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": config.apiKey,
+        },
+        body: JSON.stringify(body),
       },
-      body: JSON.stringify(body),
-    },
-  );
+    );
 
-  const raw = await res.text();
-  assertOk(raw, res.status, "Gemini Interactions streaming");
-  // Interactions uses data-only SSE (data: {...}\n\n) with event_type inside the JSON
-  const parsed = parseDataOnlySSE(raw);
-  const rawEvents = parsed.map((p) => {
-    const data = p.data as Record<string, unknown>;
+    const raw = await res.text();
+    assertOk(raw, res.status, "Gemini Interactions streaming");
+    // Interactions uses data-only SSE (data: {...}\n\n) with event_type inside the JSON
+    const parsed = parseDataOnlySSE(raw);
+    const rawEvents = parsed.map((p) => {
+      const data = p.data as Record<string, unknown>;
+      return {
+        type: (data.event_type as string) ?? "unknown",
+        data: data,
+      };
+    });
     return {
-      type: (data.event_type as string) ?? "unknown",
-      data: data,
+      status: res.status,
+      events: toSSEEventShapes(rawEvents),
+      rawEvents,
     };
   });
-  return {
-    status: res.status,
-    events: toSSEEventShapes(rawEvents),
-    rawEvents,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -563,26 +598,28 @@ export async function openaiEmbeddings(
   config: ProviderConfig,
   input: string | string[],
 ): Promise<FetchResult> {
-  const body = {
-    model: "text-embedding-3-small",
-    input,
-  };
+  return withInfraErrorTag("OpenAI Embeddings", async () => {
+    const body = {
+      model: "text-embedding-3-small",
+      input,
+    };
 
-  const res = await fetchWithRetry("https://api.openai.com/v1/embeddings", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${config.apiKey}`,
-    },
-    body: JSON.stringify(body),
+    const res = await fetchWithRetry("https://api.openai.com/v1/embeddings", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const raw = await res.text();
+    return {
+      status: res.status,
+      body: parseJsonResponse(raw, res.status, "OpenAI Embeddings"),
+      raw,
+    };
   });
-
-  const raw = await res.text();
-  return {
-    status: res.status,
-    body: parseJsonResponse(raw, res.status, "OpenAI Embeddings"),
-    raw,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -590,42 +627,48 @@ export async function openaiEmbeddings(
 // ---------------------------------------------------------------------------
 
 export async function listOpenAIModels(apiKey: string): Promise<string[]> {
-  const res = await fetchWithRetry("https://api.openai.com/v1/models", {
-    method: "GET",
-    headers: { Authorization: `Bearer ${apiKey}` },
-  });
+  return withInfraErrorTag("OpenAI Models", async () => {
+    const res = await fetchWithRetry("https://api.openai.com/v1/models", {
+      method: "GET",
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
 
-  const raw = await res.text();
-  const json = parseJsonResponse(raw, res.status, "OpenAI model list") as {
-    data: { id: string }[];
-  };
-  return json.data.map((m) => m.id);
+    const raw = await res.text();
+    const json = parseJsonResponse(raw, res.status, "OpenAI model list") as {
+      data: { id: string }[];
+    };
+    return json.data.map((m) => m.id);
+  });
 }
 
 export async function listAnthropicModels(apiKey: string): Promise<string[]> {
-  const res = await fetchWithRetry("https://api.anthropic.com/v1/models", {
-    method: "GET",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-    },
-  });
+  return withInfraErrorTag("Anthropic Models", async () => {
+    const res = await fetchWithRetry("https://api.anthropic.com/v1/models", {
+      method: "GET",
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
+    });
 
-  const raw = await res.text();
-  const json = parseJsonResponse(raw, res.status, "Anthropic model list") as {
-    data: { id: string }[];
-  };
-  return json.data.map((m) => m.id);
+    const raw = await res.text();
+    const json = parseJsonResponse(raw, res.status, "Anthropic model list") as {
+      data: { id: string }[];
+    };
+    return json.data.map((m) => m.id);
+  });
 }
 
 export async function listGeminiModels(apiKey: string): Promise<string[]> {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
-  const res = await fetchWithRetry(url, { method: "GET" });
+  return withInfraErrorTag("Gemini Models", async () => {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+    const res = await fetchWithRetry(url, { method: "GET" });
 
-  const raw = await res.text();
-  const json = parseJsonResponse(raw, res.status, "Gemini model list", url) as {
-    models: { name: string }[];
-  };
-  // Gemini returns "models/gemini-2.5-flash" — strip prefix
-  return json.models.map((m) => m.name.replace(/^models\//, ""));
+    const raw = await res.text();
+    const json = parseJsonResponse(raw, res.status, "Gemini model list", url) as {
+      models: { name: string }[];
+    };
+    // Gemini returns "models/gemini-2.5-flash" — strip prefix
+    return json.models.map((m) => m.name.replace(/^models\//, ""));
+  });
 }

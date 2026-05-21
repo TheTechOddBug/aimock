@@ -393,6 +393,7 @@ function collectDriftEntries(results: VitestJsonResult): DriftEntry[] {
 
     // Distinguish infrastructure errors from broken drift report formats
     const infraIndicators = [
+      /^INFRA_ERROR:/m,
       /API returned \d{3}/i,
       /status \d{3}/i,
       /<!DOCTYPE/i,
