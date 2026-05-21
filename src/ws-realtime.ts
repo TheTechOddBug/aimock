@@ -115,8 +115,12 @@ export function realtimeItemsToMessages(
         });
         messages.push({ role, content: mappedContent });
       } else {
-        // Existing behavior: extract text from first content element
-        const text = item.content?.[0]?.text ?? "";
+        // Join all text content parts (not just the first)
+        const text =
+          item.content
+            ?.map((c) => c.text)
+            .filter(Boolean)
+            .join("") ?? "";
         messages.push({ role, content: text });
       }
     } else if (item.type === "function_call") {
@@ -448,9 +452,8 @@ async function processMessage(
         }
       }
 
-      // Capture pre-mutation values for rollback on validation failure
-      const prevModel = session.model;
-      const prevType = session.type;
+      // Capture full pre-mutation snapshot for rollback on validation failure
+      const prevSession = { ...session };
 
       if (s.instructions !== undefined) session.instructions = s.instructions;
       if (s.tools !== undefined) session.tools = s.tools;
@@ -480,6 +483,12 @@ async function processMessage(
       if (s.voice !== undefined) session.voice = s.voice;
       if (s.input_audio_format !== undefined) session.input_audio_format = s.input_audio_format;
       if (s.output_audio_format !== undefined) session.output_audio_format = s.output_audio_format;
+      if (s.input_audio_noise_reduction !== undefined)
+        session.input_audio_noise_reduction = s.input_audio_noise_reduction;
+      if (s.input_audio_transcription !== undefined)
+        session.input_audio_transcription = s.input_audio_transcription;
+      // turn_detection config
+      if (s.turn_detection !== undefined) session.turn_detection = s.turn_detection;
       // reasoning config
       if ((s as Record<string, unknown>).reasoning !== undefined)
         session.reasoning = (s as Record<string, unknown>).reasoning as {
@@ -500,14 +509,13 @@ async function processMessage(
       ]);
 
       if (session.type === "transcription" && !transcriptionModels.has(session.model)) {
-        session.model = prevModel;
-        session.type = prevType;
+        Object.assign(session, prevSession);
         sendEvent(
           ws,
           {
             type: "error",
             error: {
-              message: `Model ${s.model ?? prevModel} does not support session type transcription`,
+              message: `Model ${s.model ?? prevSession.model} does not support session type transcription`,
               type: "invalid_request_error",
               code: "invalid_session_config",
             },
@@ -517,14 +525,13 @@ async function processMessage(
         return;
       }
       if (session.type === "translation" && !translationModels.has(session.model)) {
-        session.model = prevModel;
-        session.type = prevType;
+        Object.assign(session, prevSession);
         sendEvent(
           ws,
           {
             type: "error",
             error: {
-              message: `Model ${s.model ?? prevModel} does not support session type translation`,
+              message: `Model ${s.model ?? prevSession.model} does not support session type translation`,
               type: "invalid_request_error",
               code: "invalid_session_config",
             },
@@ -933,18 +940,23 @@ async function handleResponseCreate(
       }
       if (ws.isClosed) break;
       const chunk = content.slice(i, i + chunkSize);
-      sendEvent(
-        ws,
-        {
-          type: "response.output_text.delta",
-          response_id: responseId,
-          item_id: textItemId,
-          output_index: textOutputIndex,
-          content_index: contentIndex,
-          delta: chunk,
-        },
-        isBeta,
-      );
+      try {
+        sendEvent(
+          ws,
+          {
+            type: "response.output_text.delta",
+            response_id: responseId,
+            item_id: textItemId,
+            output_index: textOutputIndex,
+            content_index: contentIndex,
+            delta: chunk,
+          },
+          isBeta,
+        );
+      } catch (err) {
+        defaults.logger.debug("[ws-realtime] send failed during text streaming, closing", err);
+        break;
+      }
       eventIndex++;
       interruption?.tick();
       if (interruption?.signal.aborted) {
@@ -1095,18 +1107,26 @@ async function handleResponseCreate(
         }
         if (ws.isClosed) break;
         const chunk = args.slice(i, i + chunkSize);
-        sendEvent(
-          ws,
-          {
-            type: "response.function_call_arguments.delta",
-            response_id: responseId,
-            item_id: itemId,
-            output_index: outputIndex,
-            call_id: callId,
-            delta: chunk,
-          },
-          isBeta,
-        );
+        try {
+          sendEvent(
+            ws,
+            {
+              type: "response.function_call_arguments.delta",
+              response_id: responseId,
+              item_id: itemId,
+              output_index: outputIndex,
+              call_id: callId,
+              delta: chunk,
+            },
+            isBeta,
+          );
+        } catch (err) {
+          defaults.logger.debug(
+            "[ws-realtime] send failed during tool call streaming, closing",
+            err,
+          );
+          break;
+        }
         eventIndex++;
         interruption?.tick();
         if (interruption?.signal.aborted) {
@@ -1307,18 +1327,23 @@ async function handleResponseCreate(
       }
       if (ws.isClosed) break;
       const chunk = content.slice(i, i + chunkSize);
-      sendEvent(
-        ws,
-        {
-          type: "response.output_text.delta",
-          response_id: responseId,
-          item_id: itemId,
-          output_index: outputIndex,
-          content_index: contentIndex,
-          delta: chunk,
-        },
-        isBeta,
-      );
+      try {
+        sendEvent(
+          ws,
+          {
+            type: "response.output_text.delta",
+            response_id: responseId,
+            item_id: itemId,
+            output_index: outputIndex,
+            content_index: contentIndex,
+            delta: chunk,
+          },
+          isBeta,
+        );
+      } catch (err) {
+        defaults.logger.debug("[ws-realtime] send failed during text streaming, closing", err);
+        break;
+      }
       eventIndex++;
       interruption?.tick();
       if (interruption?.signal.aborted) {
@@ -1509,18 +1534,26 @@ async function handleResponseCreate(
         }
         if (ws.isClosed) break;
         const chunk = args.slice(i, i + chunkSize);
-        sendEvent(
-          ws,
-          {
-            type: "response.function_call_arguments.delta",
-            response_id: responseId,
-            item_id: itemId,
-            output_index: tcIdx,
-            call_id: callId,
-            delta: chunk,
-          },
-          isBeta,
-        );
+        try {
+          sendEvent(
+            ws,
+            {
+              type: "response.function_call_arguments.delta",
+              response_id: responseId,
+              item_id: itemId,
+              output_index: tcIdx,
+              call_id: callId,
+              delta: chunk,
+            },
+            isBeta,
+          );
+        } catch (err) {
+          defaults.logger.debug(
+            "[ws-realtime] send failed during tool call streaming, closing",
+            err,
+          );
+          break;
+        }
         eventIndex++;
         interruption?.tick();
         if (interruption?.signal.aborted) {
