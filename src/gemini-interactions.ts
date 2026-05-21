@@ -304,12 +304,21 @@ function interactionsUsage(overrides?: ResponseOverrides): {
   total_tokens: number;
 } {
   if (!overrides?.usage) return { total_input_tokens: 0, total_output_tokens: 0, total_tokens: 0 };
-  const input = overrides.usage.input_tokens ?? overrides.usage.prompt_tokens ?? 0;
-  const output = overrides.usage.output_tokens ?? overrides.usage.completion_tokens ?? 0;
+  const input =
+    overrides.usage.input_tokens ??
+    overrides.usage.prompt_tokens ??
+    overrides.usage.promptTokenCount ??
+    0;
+  const output =
+    overrides.usage.output_tokens ??
+    overrides.usage.completion_tokens ??
+    overrides.usage.candidatesTokenCount ??
+    0;
+  const total = overrides.usage.total_tokens ?? overrides.usage.totalTokenCount ?? input + output;
   return {
     total_input_tokens: input,
     total_output_tokens: output,
-    total_tokens: input + output,
+    total_tokens: total,
   };
 }
 
@@ -700,9 +709,14 @@ export async function writeGeminiInteractionsSSEStream(
     if (res.writableEnded) return true;
     // Data-only SSE (no event: prefix, no [DONE])
     res.write(`data: ${JSON.stringify(event)}\n\n`);
-    onChunkSent?.();
+    // Only count content deltas for truncateAfterChunks — framing events
+    // (interaction.start, content.start, content.stop, interaction.complete)
+    // should not consume chunk budget or trigger the chunk-sent callback.
+    if (event.event_type === "content.delta") {
+      onChunkSent?.();
+      chunkIndex++;
+    }
     if (signal?.aborted) return false;
-    chunkIndex++;
   }
 
   if (!res.writableEnded) {
@@ -751,6 +765,13 @@ export async function handleGeminiInteractions(
 
   // Convert to ChatCompletionRequest for fixture matching
   const completionReq = geminiInteractionsToCompletionRequest(interactionsReq);
+  // Keep "chat" rather than "gemini-interactions" — the router's endpoint
+  // compatibility filter (router.ts) treats "chat" as a pass-through that
+  // matches any unendpointed fixture.  Switching to "gemini-interactions"
+  // would make the request fall into the multimedia guard branch, preventing
+  // generic chat fixtures from matching and breaking existing users.  The
+  // recorder would also start emitting `endpoint: "gemini-interactions"` in
+  // recorded fixtures, creating a one-way compatibility break.
   completionReq._endpointType = "chat";
   completionReq._context = getContext(req);
 
@@ -988,6 +1009,11 @@ export async function handleGeminiInteractions(
 
   // Tool call response
   if (isToolCallResponse(response)) {
+    if (response.webSearches?.length) {
+      logger.warn(
+        "webSearches in fixture response are not supported for Gemini Interactions API — ignoring",
+      );
+    }
     const overrides = extractOverrides(response);
     const journalEntry = journal.add({
       method: req.method ?? "POST",
