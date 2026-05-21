@@ -3,8 +3,14 @@ import * as https from "node:https";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
-import type { AGUIFixture, AGUIRecordConfig, AGUIEvent, AGUIRunAgentInput } from "./agui-types.js";
-import { extractLastUserMessage } from "./agui-handler.js";
+import type {
+  AGUIFixture,
+  AGUIFixtureMatch,
+  AGUIRecordConfig,
+  AGUIEvent,
+  AGUIRunAgentInput,
+} from "./agui-types.js";
+import { extractLastUserMessage, getLastMessageIfToolResult } from "./agui-handler.js";
 import type { Logger } from "./logger.js";
 
 /**
@@ -195,22 +201,30 @@ function teeUpstreamStream(
           const buffered = Buffer.concat(chunks).toString();
           const events = parseSSEEvents(buffered, logger);
 
-          // Build fixture
-          const message = extractLastUserMessage(input);
-          const fixture: AGUIFixture = {
-            match: message
-              ? { message }
-              : {
-                  predicate: (inp: AGUIRunAgentInput) =>
-                    !inp.messages?.length || !inp.messages.some((m) => m.role === "user"),
-                },
-            events,
-          };
-          if (!message) {
-            logger.warn(
-              `Recorded AG-UI fixture has no user message — will use ${NO_USER_MESSAGE_SENTINEL} sentinel on disk`,
-            );
+          // Build fixture — three-way match priority:
+          // 1. Tool-result continuation (HITL): match by toolCallId
+          // 2. User message: match by last user message content
+          // 3. Fallback predicate: no user message present
+          let match: AGUIFixtureMatch;
+          const lastToolResult = getLastMessageIfToolResult(input);
+          if (lastToolResult?.toolCallId) {
+            match = { toolCallId: lastToolResult.toolCallId };
+            logger.info(`Recorded AG-UI fixture keyed on toolCallId=${lastToolResult.toolCallId}`);
+          } else {
+            const message = extractLastUserMessage(input);
+            if (message) {
+              match = { message };
+            } else {
+              match = {
+                predicate: (inp: AGUIRunAgentInput) =>
+                  !inp.messages?.length || !inp.messages.some((m) => m.role === "user"),
+              };
+              logger.warn(
+                `Recorded AG-UI fixture has no user message — will use ${NO_USER_MESSAGE_SENTINEL} sentinel on disk`,
+              );
+            }
           }
+          const fixture: AGUIFixture = { match, events };
 
           if (!config.proxyOnly) {
             // Register in memory first (always available even if disk write fails)
