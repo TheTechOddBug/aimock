@@ -129,7 +129,7 @@ function httpToGrpc(httpCode: number): number {
 /**
  * Convert Gemini Live turns into ChatMessage[] for fixture matching.
  */
-function geminiTurnsToMessages(turns: GeminiLiveTurn[]): ChatMessage[] {
+function geminiTurnsToMessages(turns: GeminiLiveTurn[], logger?: Logger): ChatMessage[] {
   const messages: ChatMessage[] = [];
 
   for (const turn of turns) {
@@ -148,7 +148,7 @@ function geminiTurnsToMessages(turns: GeminiLiveTurn[]): ChatMessage[] {
           messages.push({
             role: "tool",
             content: typeof fr.response === "string" ? fr.response : JSON.stringify(fr.response),
-            tool_call_id: fr.id ?? `call_gemini_${fr.name}_${i}`,
+            tool_call_id: fr.id ?? generateToolCallId(),
           });
         }
         if (textParts.length > 0) {
@@ -170,8 +170,8 @@ function geminiTurnsToMessages(turns: GeminiLiveTurn[]): ChatMessage[] {
         messages.push({
           role: "assistant",
           content: text || null,
-          tool_calls: funcCalls.map((p, i) => ({
-            id: `call_gemini_${p.functionCall!.name}_${i}`,
+          tool_calls: funcCalls.map((p) => ({
+            id: generateToolCallId(),
             type: "function" as const,
             function: {
               name: p.functionCall!.name,
@@ -183,6 +183,8 @@ function geminiTurnsToMessages(turns: GeminiLiveTurn[]): ChatMessage[] {
         const text = textParts.map((p) => p.text!).join("");
         messages.push({ role: "assistant", content: text });
       }
+    } else {
+      logger?.warn(`[gemini-live] skipping turn with unrecognized role: ${role}`);
     }
   }
 
@@ -193,10 +195,10 @@ function geminiTurnsToMessages(turns: GeminiLiveTurn[]): ChatMessage[] {
  * Convert toolResponse messages into ChatMessage[] for fixture matching.
  */
 function toolResponseToMessages(toolResponse: GeminiLiveToolResponse): ChatMessage[] {
-  return toolResponse.functionResponses.map((fr, i) => ({
+  return toolResponse.functionResponses.map((fr) => ({
     role: "tool" as const,
     content: typeof fr.response === "string" ? fr.response : JSON.stringify(fr.response),
-    tool_call_id: fr.id ?? `call_gemini_${fr.name}_${i}`,
+    tool_call_id: fr.id ?? generateToolCallId(),
   }));
 }
 
@@ -331,7 +333,7 @@ async function processMessage(
       );
       return;
     }
-    newMessages = geminiTurnsToMessages(parsed.clientContent.turns);
+    newMessages = geminiTurnsToMessages(parsed.clientContent.turns, defaults.logger);
   } else if (parsed.toolResponse) {
     if (
       !parsed.toolResponse.functionResponses ||
@@ -541,13 +543,18 @@ async function processMessage(
         }
         if (ws.isClosed) break;
 
-        ws.send(
-          JSON.stringify({
-            serverContent: {
-              modelTurn: { parts: [{ text: chunkList[i] }] },
-            },
-          }),
-        );
+        try {
+          ws.send(
+            JSON.stringify({
+              serverContent: {
+                modelTurn: { parts: [{ text: chunkList[i] }] },
+              },
+            }),
+          );
+        } catch (err) {
+          defaults.logger.debug("[gemini-live] send failed during text streaming, closing", err);
+          break;
+        }
         interruption?.tick();
         if (interruption?.signal.aborted) {
           interrupted = true;
@@ -696,13 +703,18 @@ async function processMessage(
       }
       if (ws.isClosed) break;
 
-      ws.send(
-        JSON.stringify({
-          serverContent: {
-            modelTurn: { parts: [{ text: chunks[i] }] },
-          },
-        }),
-      );
+      try {
+        ws.send(
+          JSON.stringify({
+            serverContent: {
+              modelTurn: { parts: [{ text: chunks[i] }] },
+            },
+          }),
+        );
+      } catch (err) {
+        defaults.logger.debug("[gemini-live] send failed during text streaming, closing", err);
+        break;
+      }
       interruption?.tick();
       if (interruption?.signal.aborted) {
         interrupted = true;
@@ -766,7 +778,13 @@ async function processMessage(
       return;
     }
 
-    const functionCalls = response.toolCalls.map((tc, i) => {
+    // Pre-compute tool calls with stable IDs so wire message and history match
+    const resolvedToolCalls = response.toolCalls.map((tc) => ({
+      ...tc,
+      resolvedId: tc.id ?? generateToolCallId(),
+    }));
+
+    const functionCalls = resolvedToolCalls.map((tc) => {
       let argsObj: Record<string, unknown>;
       try {
         argsObj = JSON.parse(tc.arguments || "{}") as Record<string, unknown>;
@@ -779,7 +797,7 @@ async function processMessage(
       return {
         name: tc.name,
         args: argsObj,
-        id: tc.id ?? `call_gemini_${tc.name}_${i}`,
+        id: tc.resolvedId,
       };
     });
 
@@ -805,12 +823,12 @@ async function processMessage(
       );
     }
 
-    // Add assistant tool_calls to conversation history
+    // Add assistant tool_calls to conversation history using the same resolved IDs
     session.conversationHistory.push({
       role: "assistant",
       content: null,
-      tool_calls: response.toolCalls.map((tc, i) => ({
-        id: tc.id ?? `call_gemini_${tc.name}_${i}`,
+      tool_calls: resolvedToolCalls.map((tc) => ({
+        id: tc.resolvedId,
         type: "function" as const,
         function: {
           name: tc.name,

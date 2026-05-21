@@ -181,7 +181,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     expect(msg.toolCall.functionCalls).toHaveLength(1);
     expect(msg.toolCall.functionCalls[0].name).toBe("get_weather");
     expect(msg.toolCall.functionCalls[0].args).toEqual({ city: "NYC" });
-    expect(msg.toolCall.functionCalls[0].id).toBe("call_gemini_get_weather_0");
+    expect(msg.toolCall.functionCalls[0].id).toMatch(/^call_/);
 
     // Separate turnComplete message follows the toolCall
     const turnCompleteMsg = JSON.parse(raw[2]);
@@ -907,7 +907,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
   it("handles user turn with functionResponse that has string response", async () => {
     // Fixture that matches a tool call id
     const toolResultFixtureStr: Fixture = {
-      match: { toolCallId: "call_gemini_search_0" },
+      match: { toolCallId: "call_search_1" },
       response: { content: "Result processed" },
     };
     instance = await createServer([toolResultFixtureStr]);
@@ -917,13 +917,22 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     await ws.waitForMessages(1); // setupComplete
 
     // Send clientContent with functionResponse where response is a string
+    // Provide explicit id so it matches the fixture's toolCallId
     ws.send(
       JSON.stringify({
         clientContent: {
           turns: [
             {
               role: "user",
-              parts: [{ functionResponse: { name: "search", response: "string-result" } }],
+              parts: [
+                {
+                  functionResponse: {
+                    name: "search",
+                    response: "string-result",
+                    id: "call_search_1",
+                  },
+                },
+              ],
             },
           ],
           turnComplete: true,
@@ -941,7 +950,7 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
   it("handles toolResponse with fallback id and string response", async () => {
     // Fixture matching on tool call id
     const toolResultFixture3: Fixture = {
-      match: { toolCallId: "call_gemini_lookup_0" },
+      match: { toolCallId: "call_lookup_1" },
       response: { content: "Lookup done" },
     };
     instance = await createServer([toolResultFixture3]);
@@ -950,11 +959,13 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     ws.send(setupMsg());
     await ws.waitForMessages(1); // setupComplete
 
-    // Send toolResponse without id (relies on fallback) and with string response
+    // Send toolResponse with explicit id and string response
     ws.send(
       JSON.stringify({
         toolResponse: {
-          functionResponses: [{ name: "lookup", response: "string-response-value" }],
+          functionResponses: [
+            { name: "lookup", response: "string-response-value", id: "call_lookup_1" },
+          ],
         },
       }),
     );
@@ -962,6 +973,87 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     const raw = await ws.waitForMessages(2);
     const msg = JSON.parse(raw[1]);
     expect(msg.serverContent).toBeDefined();
+
+    ws.close();
+  });
+
+  it("generates random call_ ID when toolResponse functionResponse has no id", async () => {
+    instance = await createServer(allFixtures);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1); // setupComplete
+
+    // Send toolResponse WITHOUT an id field — exercises the generateToolCallId() fallback
+    ws.send(toolResponseMsg("get_weather", { temp: "72F" }));
+
+    // No fixture will match the random ID, so we get a "No fixture matched" error
+    const raw = await ws.waitForMessages(2);
+    const msg = JSON.parse(raw[1]);
+    expect(msg.error).toBeDefined();
+    expect(msg.error.message).toBe("No fixture matched");
+
+    // Small pause to ensure journal write completed
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Inspect the journal to verify the generated tool_call_id starts with call_
+    const entry = instance.journal.getLast();
+    expect(entry).not.toBeNull();
+    const messages = entry!.body!.messages;
+    const toolMsg = messages.find((m) => m.role === "tool");
+    expect(toolMsg).toBeDefined();
+    expect(toolMsg!.tool_call_id).toMatch(/^call_/);
+    // Verify it's a random ID (not the old deterministic format)
+    expect(toolMsg!.tool_call_id).not.toMatch(/^call_gemini_/);
+
+    ws.close();
+  });
+
+  it("generates random call_ ID when clientContent functionResponse has no id", async () => {
+    const afterToolFixture: Fixture = {
+      match: { userMessage: "continue-after-tool" },
+      response: { content: "Continued" },
+    };
+    instance = await createServer([afterToolFixture]);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1); // setupComplete
+
+    // Send clientContent with a functionResponse lacking an id, followed by user text
+    ws.send(
+      JSON.stringify({
+        clientContent: {
+          turns: [
+            {
+              role: "user",
+              parts: [
+                { functionResponse: { name: "search", response: { results: [] } } },
+                { text: "continue-after-tool" },
+              ],
+            },
+          ],
+          turnComplete: true,
+        },
+      }),
+    );
+
+    const raw = await ws.waitForMessages(3); // setupComplete + content + turnComplete
+    const contentMsg = JSON.parse(raw[1]);
+    expect(contentMsg.serverContent).toBeDefined();
+
+    // Small pause to ensure journal write completed
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Inspect the journal to verify the generated tool_call_id starts with call_
+    const entry = instance.journal.getLast();
+    expect(entry).not.toBeNull();
+    const messages = entry!.body!.messages;
+    const toolMsg = messages.find((m) => m.role === "tool");
+    expect(toolMsg).toBeDefined();
+    expect(toolMsg!.tool_call_id).toMatch(/^call_/);
+    // Verify it's a random ID (not the old deterministic format)
+    expect(toolMsg!.tool_call_id).not.toMatch(/^call_gemini_/);
 
     ws.close();
   });
