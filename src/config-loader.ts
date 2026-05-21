@@ -220,12 +220,18 @@ export async function startFromConfig(
 
     if (aguiConfig.fixtures) {
       for (const f of aguiConfig.fixtures) {
+        if (f.match.toolCallId && f.text && !f.events) {
+          logger.warn(
+            `AG-UI fixture uses text shorthand with toolCallId — text shorthand ignores toolCallId matching; use events[] instead (match: ${JSON.stringify(f.match)})`,
+          );
+        }
         if (f.text) {
           agui.onMessage(f.match.message ?? /.*/, f.text, { delayMs: f.delayMs });
         } else if (f.events) {
           agui.addFixture({
             match: {
               message: f.match.message,
+              toolCallId: f.match.toolCallId,
               toolName: f.match.toolName,
               stateKey: f.match.stateKey,
             },
