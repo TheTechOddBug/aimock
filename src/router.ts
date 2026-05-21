@@ -88,10 +88,12 @@ export function matchFixture(
         const compatible =
           (reqEndpoint === "image" && isImageResponse(r)) ||
           (reqEndpoint === "speech" && isAudioResponse(r)) ||
+          (reqEndpoint === "elevenlabs-tts" && isAudioResponse(r)) ||
           (reqEndpoint === "audio-gen" && isAudioResponse(r)) ||
           (reqEndpoint === "fal-audio" && isAudioResponse(r)) ||
           (reqEndpoint === "fal" && (isJSONResponse(r) || isErrorResponse(r))) ||
           (reqEndpoint === "transcription" && isTranscriptionResponse(r)) ||
+          (reqEndpoint === "translation" && isTranscriptionResponse(r)) ||
           (reqEndpoint === "video" && isVideoResponse(r));
         if (!compatible) continue;
       }
@@ -147,16 +149,9 @@ export function matchFixture(
         // permissive behaviour as not setting systemMessage at all.
         let allPresent = true;
         for (const needle of sm) {
-          if (useExactMatch) {
-            if (text !== needle) {
-              allPresent = false;
-              break;
-            }
-          } else {
-            if (!text.includes(needle)) {
-              allPresent = false;
-              break;
-            }
+          if (!text.includes(needle)) {
+            allPresent = false;
+            break;
           }
         }
         if (!allPresent) continue;

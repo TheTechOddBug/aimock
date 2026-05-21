@@ -6,6 +6,7 @@ import * as crypto from "node:crypto";
 import type {
   ChatCompletionRequest,
   Fixture,
+  FixtureMatch,
   FixtureResponse,
   RecordConfig,
   RecordedTimings,
@@ -240,7 +241,8 @@ export async function proxyAndRecord(
   if (!record) return "not_configured";
 
   const providers = record.providers;
-  // gemini-interactions shares the same upstream config as gemini
+  // Gemini Interactions uses the same upstream API as Gemini (identical base URL
+  // and auth), so we remap the provider key to reuse the configured Gemini URL.
   const lookupKey = providerKey === "gemini-interactions" ? "gemini" : providerKey;
   const upstreamUrl = providers[lookupKey];
 
@@ -554,7 +556,7 @@ export async function proxyAndRecord(
     const relayHeaders: Record<string, string> = {};
     const clientCt =
       (clientStatus >= 200 && clientStatus < 300) || !isAudioRelay
-        ? (ctString ?? "application/json")
+        ? ctString || "application/json"
         : "application/json";
     if (clientCt) {
       relayHeaders["Content-Type"] = clientCt;
@@ -862,7 +864,13 @@ function buildFixtureResponse(
   }
 
   // Gemini Interactions: { id, status, outputs: [{ type: "text", text }, { type: "function_call", name, arguments }] }
-  if (Array.isArray(obj.outputs) && obj.outputs.length > 0) {
+  if (
+    Array.isArray(obj.outputs) &&
+    obj.outputs.length > 0 &&
+    !("choices" in obj) &&
+    !("content" in obj) &&
+    !("candidates" in obj)
+  ) {
     const outputs = obj.outputs as Array<Record<string, unknown>>;
     const fnCallOutputs = outputs.filter((o) => o.type === "function_call");
     const textOutputs = outputs.filter((o) => o.type === "text" && typeof o.text === "string");
@@ -1248,21 +1256,7 @@ function buildFixtureResponse(
 /**
  * Derive fixture match criteria from the original request.
  */
-type EndpointType =
-  | "chat"
-  | "image"
-  | "speech"
-  | "transcription"
-  | "translation"
-  | "video"
-  | "embedding"
-  | "audio-gen"
-  | "elevenlabs-tts"
-  | "fal-audio"
-  | "fal"
-  | "realtime"
-  | "realtime-transcription"
-  | "realtime-translation";
+type EndpointType = NonNullable<FixtureMatch["endpoint"]>;
 
 export function buildFixtureMatch(
   request: ChatCompletionRequest,
@@ -1318,7 +1312,10 @@ export function buildFixtureMatch(
   // vs. text reply after the tool result). turnIndex + hasToolResult give
   // each call a distinct, matcher-aware key. Skip for non-chat (no messages).
   const messages = request.messages ?? [];
-  if (messages.length > 0) {
+  if (
+    messages.length > 0 &&
+    (request._endpointType === "chat" || request._endpointType === undefined)
+  ) {
     match.turnIndex = messages.filter((m) => m.role === "assistant").length;
     match.hasToolResult = messages.some((m) => m.role === "tool");
   }
