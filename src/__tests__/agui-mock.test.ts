@@ -1658,7 +1658,7 @@ describe("AGUIMock recorder — structured user content", () => {
     expect(parsed.fixtures[0].match.message).not.toBe(NO_USER_MESSAGE_SENTINEL);
   });
 
-  it("still writes the sentinel when no user text is present (e.g. only file parts)", async () => {
+  it("skips disk write for no-user-text predicate fixtures (in-memory only)", async () => {
     upstream = new AGUIMock({ port: 0 });
     upstream.onPredicate(() => true, buildTextResponse("ok"));
     const upstreamUrl = await upstream.start();
@@ -1684,9 +1684,23 @@ describe("AGUIMock recorder — structured user content", () => {
     expect(resp.status).toBe(200);
 
     const files = fs.readdirSync(tmpDir);
-    expect(files.length).toBe(1);
-    const parsed = JSON.parse(fs.readFileSync(path.join(tmpDir, files[0]), "utf-8"));
-    expect(parsed.fixtures[0].match.message).toBe(NO_USER_MESSAGE_SENTINEL);
+    expect(files.length).toBe(0);
+
+    const resp2 = await post(agui.url, {
+      messages: [
+        {
+          id: "u2",
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "data", value: "BBB=", mimeType: "text/plain" },
+            },
+          ],
+        },
+      ],
+    } as AGUIRunAgentInput);
+    expect(resp2.status).toBe(200);
   });
 });
 
