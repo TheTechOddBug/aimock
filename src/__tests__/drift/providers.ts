@@ -39,6 +39,10 @@ async function fetchWithRetry(url: string, init: RequestInit, maxRetries = 3): P
     try {
       const res = await fetch(url, init);
       if (RETRYABLE_STATUSES.has(res.status) && attempt < maxRetries - 1) {
+        console.warn(
+          `Retry ${attempt + 1}/${maxRetries} after ${res.status} for ${url.slice(0, 80)}`,
+        );
+        await res.text(); // consume body to free socket
         const backoff = Math.pow(2, attempt) * 1000;
         await new Promise((r) => setTimeout(r, backoff));
         continue;
@@ -59,15 +63,21 @@ async function fetchWithRetry(url: string, init: RequestInit, maxRetries = 3): P
 // Response parsing
 // ---------------------------------------------------------------------------
 
-function assertOk(raw: string, status: number, context: string): void {
+/** Redact API keys from query parameters in URLs for safe error messages */
+function redactUrl(url: string): string {
+  return url.replace(/([?&])(api[-_]?key|key|token|access_token)=[^&]+/gi, "$1$2=REDACTED");
+}
+
+function assertOk(raw: string, status: number, context: string, url?: string): void {
   if (status >= 400) {
-    throw new Error(`${context}: API returned ${status}: ${raw.slice(0, 300)}`);
+    const urlSuffix = url ? ` (${redactUrl(url)})` : "";
+    throw new Error(`${context}: API returned ${status}${urlSuffix}: ${raw.slice(0, 300)}`);
   }
 }
 
-function parseJsonResponse(raw: string, status: number, context: string): unknown {
+function parseJsonResponse(raw: string, status: number, context: string, url?: string): unknown {
   if (!raw) throw new Error(`${context}: empty response (status ${status})`);
-  assertOk(raw, status, context);
+  assertOk(raw, status, context, url);
   try {
     return JSON.parse(raw);
   } catch {
@@ -88,14 +98,18 @@ function normalizeLineEndings(text: string): string {
 function parseDataOnlySSE(text: string): { data: unknown }[] {
   return normalizeLineEndings(text)
     .split("\n\n")
-    .filter((block) => block.startsWith("data: ") && !block.includes("[DONE]"))
+    .filter((block) => block.startsWith("data: ") && block.trim() !== "data: [DONE]")
     .map((block) => {
       // Rejoin continuation lines (data split across lines)
       const json = block
         .split("\n")
         .map((line) => (line.startsWith("data: ") ? line.slice(6) : line))
         .join("");
-      return { data: JSON.parse(json) };
+      try {
+        return { data: JSON.parse(json) };
+      } catch (err) {
+        throw new Error(`Malformed SSE JSON in frame: ${json.slice(0, 100)}`, { cause: err });
+      }
     });
 }
 
@@ -105,12 +119,27 @@ function parseTypedSSE(text: string): { type: string; data: unknown }[] {
     .split("\n\n")
     .filter((block) => block.includes("event: ") && block.includes("data: "))
     .map((block) => {
-      const eventMatch = block.match(/^event: (.+)$/m);
-      const dataMatch = block.match(/^data: (.+)$/m);
-      return {
-        type: eventMatch![1],
-        data: JSON.parse(dataMatch![1]),
-      };
+      const eventMatch = block.match(/^event: (.*)$/m);
+      if (!eventMatch) {
+        throw new Error("Malformed SSE block: " + block.slice(0, 100));
+      }
+      // Handle multi-line data: collect all data lines and join them
+      const json = block
+        .split("\n")
+        .filter((line) => line.startsWith("data: "))
+        .map((line) => line.slice(6))
+        .join("");
+      if (!json) {
+        throw new Error("Malformed SSE block (no data): " + block.slice(0, 100));
+      }
+      try {
+        return {
+          type: eventMatch[1],
+          data: JSON.parse(json),
+        };
+      } catch (err) {
+        throw new Error(`Malformed SSE JSON in frame: ${json.slice(0, 100)}`, { cause: err });
+      }
     });
 }
 
@@ -339,7 +368,7 @@ export async function geminiNonStreaming(
   });
 
   const raw = await res.text();
-  return { status: res.status, body: parseJsonResponse(raw, res.status, "Gemini"), raw };
+  return { status: res.status, body: parseJsonResponse(raw, res.status, "Gemini", url), raw };
 }
 
 export async function geminiStreaming(
@@ -361,7 +390,7 @@ export async function geminiStreaming(
   });
 
   const raw = await res.text();
-  assertOk(raw, res.status, "Gemini streaming");
+  assertOk(raw, res.status, "Gemini streaming", url);
   const parsed = parseDataOnlySSE(raw);
   const rawEvents = parsed.map((p) => ({
     type: "gemini.chunk",
@@ -590,13 +619,11 @@ export async function listAnthropicModels(apiKey: string): Promise<string[]> {
 }
 
 export async function listGeminiModels(apiKey: string): Promise<string[]> {
-  const res = await fetchWithRetry(
-    `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`,
-    { method: "GET" },
-  );
+  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`;
+  const res = await fetchWithRetry(url, { method: "GET" });
 
   const raw = await res.text();
-  const json = parseJsonResponse(raw, res.status, "Gemini model list") as {
+  const json = parseJsonResponse(raw, res.status, "Gemini model list", url) as {
     models: { name: string }[];
   };
   // Gemini returns "models/gemini-2.5-flash" — strip prefix
