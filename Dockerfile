@@ -25,7 +25,9 @@ LABEL org.opencontainers.image.source="https://github.com/CopilotKit/llmock"
 
 WORKDIR /app
 
-# No runtime dependencies — all imports are node:* built-ins
+# git is needed for sparse-checkout fixture fetching in production
+RUN apk add --no-cache git
+
 COPY --from=build /app/dist/ dist/
 COPY fixtures/ fixtures/
 
