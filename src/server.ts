@@ -92,7 +92,7 @@ const SEARCH_PATH = "/search";
 const RERANK_PATH = "/v2/rerank";
 const MODERATIONS_PATH = "/v1/moderations";
 const IMAGES_PATH = "/v1/images/generations";
-const IMAGES_EDIT_PATH = "/v1/images/edit";
+const IMAGES_EDIT_PATH = "/v1/images/edits";
 const IMAGES_VARIATIONS_PATH = "/v1/images/variations";
 const SPEECH_PATH = "/v1/audio/speech";
 const TRANSCRIPTIONS_PATH = "/v1/audio/transcriptions";
@@ -123,7 +123,7 @@ const COMPAT_SUFFIXES = [
   "/audio/transcriptions",
   "/audio/translations",
   "/images/generations",
-  "/images/edit",
+  "/images/edits",
   "/images/variations",
 ];
 
@@ -166,6 +166,7 @@ const VERTEX_AI_RE =
 const OLLAMA_CHAT_PATH = "/api/chat";
 const OLLAMA_GENERATE_PATH = "/api/generate";
 const OLLAMA_EMBEDDINGS_PATH = "/api/embeddings";
+const OLLAMA_EMBED_PATH = "/api/embed";
 const OLLAMA_TAGS_PATH = "/api/tags";
 
 const HEALTH_PATH = "/health";
@@ -1118,9 +1119,13 @@ export async function createServer(
     }
 
     // Ollama /api/* routes must be dispatched BEFORE normalizeCompatPath, which
-    // rewrites any path ending in /embeddings to /v1/embeddings.  The /api/chat
-    // and /api/generate paths are unaffected (their suffixes aren't in
-    // COMPAT_SUFFIXES), but /api/embeddings would collide with the OpenAI handler.
+    // rewrites any path ending in /embeddings to /v1/embeddings.  The /api/chat,
+    // /api/generate, and /api/embed paths are unaffected (their suffixes aren't
+    // in COMPAT_SUFFIXES), but /api/embeddings would collide with the OpenAI
+    // handler.  /api/embed is the current Ollama endpoint
+    // (https://github.com/ollama/ollama/blob/main/docs/api.md); /api/embeddings
+    // is the legacy path kept for backwards-compatibility.  Both route to the
+    // same handler.
     if (pathname === OLLAMA_CHAT_PATH && req.method === "POST") {
       try {
         const raw = await readBody(req);
@@ -1159,7 +1164,10 @@ export async function createServer(
       return;
     }
 
-    if (pathname === OLLAMA_EMBEDDINGS_PATH && req.method === "POST") {
+    if (
+      (pathname === OLLAMA_EMBEDDINGS_PATH || pathname === OLLAMA_EMBED_PATH) &&
+      req.method === "POST"
+    ) {
       try {
         const raw = await readBody(req);
         await handleOllamaEmbeddings(req, res, raw, fixtures, journal, defaults, setCorsHeaders);
@@ -1478,7 +1486,7 @@ export async function createServer(
       return;
     }
 
-    // POST /v1/images/edit — OpenAI Image Edit API (multipart/form-data)
+    // POST /v1/images/edits — OpenAI Image Edit API (multipart/form-data)
     if (pathname === IMAGES_EDIT_PATH && req.method === "POST") {
       try {
         const raw = await readBody(req);
