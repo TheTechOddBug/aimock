@@ -81,7 +81,7 @@ When a `critical` drift is detected:
    - Gemini Interactions → `src/gemini-interactions.ts` (`buildInteractionsTextResponse`, `buildInteractionsToolCallResponse`, `buildInteractionsTextSSEEvents`, `buildInteractionsToolCallSSEEvents`)
    - OpenAI Image Edit → `src/images.ts` (multipart `/v1/images/edits` handler)
    - OpenAI Audio Translation → `src/transcription.ts` (multipart `/v1/audio/translations` handler)
-   - Ollama Embeddings → `src/ollama.ts` (`/api/embeddings` response builder)
+   - Ollama Embeddings → `src/ollama.ts` (`/api/embed` + legacy `/api/embeddings` response builder)
    - Cohere Embed → `src/cohere.ts` (`/v2/embed` response builder)
    - ElevenLabs TTS → `src/elevenlabs-audio.ts` (`/v1/text-to-speech/{voice_id}` response builder)
 
@@ -122,7 +122,7 @@ In addition to the 23 existing drift tests (20 HTTP response-shape + 3 model dep
 | POST /v1beta/models/{model}:embedContent | Gemini        | HTTP              | Covered |
 | POST /v1/images/edits                    | OpenAI        | HTTP (multipart)  | Covered |
 | POST /v1/audio/translations              | OpenAI        | HTTP (multipart)  | Covered |
-| POST /api/embeddings                     | Ollama        | HTTP              | Covered |
+| POST /api/embed, /api/embeddings         | Ollama        | HTTP              | Covered |
 | POST /v2/embed                           | Cohere        | HTTP              | Covered |
 | POST /v1/text-to-speech/{voice_id}       | ElevenLabs    | HTTP              | Covered |
 | stream_options.include_usage             | OpenAI        | Streaming feature | Covered |
