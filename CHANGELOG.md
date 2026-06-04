@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.29.0] - 2026-06-04
+
 ### Added
 
 - `POST /__aimock/reset/fixtures` — full reset (clears fixtures, generation state, and journal).
