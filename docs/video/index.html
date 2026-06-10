@@ -50,9 +50,9 @@
       <main class="docs-content">
         <h1>Video Generation</h1>
         <p class="lead">
-          The video generation endpoints support async creation via
-          <code>POST /v1/videos</code> and status polling via <code>GET /v1/videos/{id}</code>. Mock
-          the full async polling lifecycle with deterministic responses.
+          The video generation endpoints support async-style creation via
+          <code>POST /v1/videos</code> and status polling via <code>GET /v1/videos/{id}</code>, with
+          deterministic responses driven entirely by your fixture.
         </p>
 
         <h2>Endpoints</h2>
@@ -85,10 +85,15 @@
 
         <h2>Async Polling Pattern</h2>
         <p>
-          Video generation is asynchronous. The <code>POST</code> endpoint returns a job ID, and the
-          <code>GET</code> endpoint returns the current status. aimock simulates this by returning
-          <code>"processing"</code> on the first poll and <code>"completed"</code> with the video
-          URL on subsequent polls.
+          Real video generation is asynchronous: the <code>POST</code> endpoint returns a job ID,
+          and the <code>GET</code> endpoint returns the current status. aimock does
+          <strong>not</strong> simulate status progression on this surface &mdash; the create
+          response and every subsequent poll echo the fixture's <code>video.status</code> verbatim.
+          A fixture with <code>"status": "completed"</code> is completed immediately; a fixture with
+          <code>"status": "processing"</code> stays processing on every poll. If you need staged
+          progression (<code>pending &rarr; in_progress &rarr; completed</code>), use the
+          <a href="/openrouter-video">OpenRouter Video</a> surface with its
+          <code>openRouterVideo</code> polling configuration.
         </p>
 
         <h2>Unit Test: Create and Poll</h2>
@@ -114,9 +119,13 @@
   <span class="kw">await</span> <span class="op">mock</span>.<span class="fn">stop</span>();
 });
 
-<span class="fn">it</span>(<span class="str">"creates a video job and polls for completion"</span>, <span class="kw">async</span> () <span class="kw">=&gt;</span> {
+<span class="fn">it</span>(<span class="str">"creates a video job and polls its status"</span>, <span class="kw">async</span> () <span class="kw">=&gt;</span> {
   <span class="op">mock</span>.<span class="fn">onVideo</span>(<span class="str">"a cat playing piano"</span>, {
-    <span class="prop">video</span>: { <span class="prop">url</span>: <span class="str">"https://example.com/cat-piano.mp4"</span>, <span class="prop">duration</span>: <span class="num">10</span> },
+    <span class="prop">video</span>: {
+      <span class="prop">id</span>: <span class="str">"video_123"</span>,
+      <span class="prop">status</span>: <span class="str">"completed"</span>,
+      <span class="prop">url</span>: <span class="str">"https://example.com/cat-piano.mp4"</span>,
+    },
   });
 
   <span class="cm">// Step 1: Create the video job</span>
@@ -124,23 +133,24 @@
     <span class="prop">method</span>: <span class="str">"POST"</span>,
     <span class="prop">headers</span>: { <span class="str">"Content-Type"</span>: <span class="str">"application/json"</span> },
     <span class="prop">body</span>: <span class="type">JSON</span>.<span class="fn">stringify</span>({
-      <span class="prop">model</span>: <span class="str">"sora"</span>,
+      <span class="prop">model</span>: <span class="str">"sora-2"</span>,
       <span class="prop">prompt</span>: <span class="str">"a cat playing piano"</span>,
-      <span class="prop">duration</span>: <span class="num">10</span>,
     }),
   });
 
   <span class="kw">const</span> <span class="op">createBody</span> = <span class="kw">await</span> <span class="op">createRes</span>.<span class="fn">json</span>();
-  <span class="fn">expect</span>(<span class="op">createBody</span>.<span class="prop">id</span>).<span class="fn">toBeDefined</span>();
-  <span class="fn">expect</span>(<span class="op">createBody</span>.<span class="prop">status</span>).<span class="fn">toBe</span>(<span class="str">"processing"</span>);
+  <span class="fn">expect</span>(<span class="op">createBody</span>.<span class="prop">id</span>).<span class="fn">toBe</span>(<span class="str">"video_123"</span>);
+  <span class="fn">expect</span>(<span class="op">createBody</span>.<span class="prop">status</span>).<span class="fn">toBe</span>(<span class="str">"completed"</span>);
+  <span class="fn">expect</span>(<span class="op">createBody</span>.<span class="prop">url</span>).<span class="fn">toBe</span>(<span class="str">"https://example.com/cat-piano.mp4"</span>);
+  <span class="fn">expect</span>(<span class="op">createBody</span>.<span class="prop">created_at</span>).<span class="fn">toBeDefined</span>();
 
-  <span class="cm">// Step 2: Poll for completion</span>
+  <span class="cm">// Step 2: Poll the job — the status echoes the fixture</span>
   <span class="kw">const</span> <span class="op">pollRes</span> = <span class="kw">await</span> <span class="fn">fetch</span>(<span class="str">`${mock.url}/v1/videos/${createBody.id}`</span>);
   <span class="kw">const</span> <span class="op">pollBody</span> = <span class="kw">await</span> <span class="op">pollRes</span>.<span class="fn">json</span>();
 
+  <span class="cm">// The poll body is flat: { id, status, created_at, url }</span>
   <span class="fn">expect</span>(<span class="op">pollBody</span>.<span class="prop">status</span>).<span class="fn">toBe</span>(<span class="str">"completed"</span>);
-  <span class="fn">expect</span>(<span class="op">pollBody</span>.<span class="prop">video</span>.<span class="prop">url</span>).<span class="fn">toBe</span>(<span class="str">"https://example.com/cat-piano.mp4"</span>);
-  <span class="fn">expect</span>(<span class="op">pollBody</span>.<span class="prop">video</span>.<span class="prop">duration</span>).<span class="fn">toBe</span>(<span class="num">10</span>);
+  <span class="fn">expect</span>(<span class="op">pollBody</span>.<span class="prop">url</span>).<span class="fn">toBe</span>(<span class="str">"https://example.com/cat-piano.mp4"</span>);
 });</code></pre>
         </div>
 
@@ -153,11 +163,12 @@
           <pre><code>{
   <span class="key">"fixtures"</span>: [
     {
-      <span class="key">"match"</span>: { <span class="key">"userMessage"</span>: <span class="str">"cat playing piano"</span> },
+      <span class="key">"match"</span>: { <span class="key">"userMessage"</span>: <span class="str">"cat playing piano"</span>, <span class="key">"endpoint"</span>: <span class="str">"video"</span> },
       <span class="key">"response"</span>: {
         <span class="key">"video"</span>: {
-          <span class="key">"url"</span>: <span class="str">"https://example.com/cat-piano.mp4"</span>,
-          <span class="key">"duration"</span>: <span class="num">10</span>
+          <span class="key">"id"</span>: <span class="str">"video_123"</span>,
+          <span class="key">"status"</span>: <span class="str">"completed"</span>,
+          <span class="key">"url"</span>: <span class="str">"https://example.com/cat-piano.mp4"</span>
         }
       }
     }
@@ -169,27 +180,41 @@
 
         <h3>Create (POST /v1/videos)</h3>
         <ul>
-          <li><code>id</code> &mdash; unique job identifier</li>
-          <li><code>status</code> &mdash; <code>"processing"</code> initially</li>
-          <li><code>created</code> &mdash; Unix timestamp</li>
+          <li>
+            <code>id</code> &mdash; job identifier, taken from the fixture's <code>video.id</code>
+          </li>
+          <li>
+            <code>status</code> &mdash; the fixture's <code>video.status</code>:
+            <code>"processing"</code>, <code>"completed"</code>, or <code>"failed"</code>
+          </li>
+          <li><code>created_at</code> &mdash; Unix timestamp set when the job is created</li>
+          <li>
+            <code>url</code> &mdash; URL of the generated video; included only when
+            <code>status</code> is <code>"completed"</code>
+          </li>
         </ul>
 
         <h3>Poll (GET /v1/videos/{id})</h3>
+        <p>The poll response is flat &mdash; there is no nested <code>video</code> object.</p>
         <ul>
           <li><code>id</code> &mdash; the job identifier</li>
           <li>
-            <code>status</code> &mdash; <code>"processing"</code> or
-            <code>"completed"</code>
+            <code>status</code> &mdash; the fixture's <code>video.status</code>, echoed verbatim:
+            <code>"processing"</code>, <code>"completed"</code>, or <code>"failed"</code>
           </li>
-          <li><code>video.url</code> &mdash; URL of the generated video (when completed)</li>
-          <li><code>video.duration</code> &mdash; video duration in seconds</li>
+          <li><code>created_at</code> &mdash; Unix timestamp from job creation</li>
+          <li>
+            <code>url</code> &mdash; URL of the generated video; present whenever the fixture sets
+            <code>video.url</code>
+          </li>
         </ul>
 
         <div class="info-box">
           <p>
             Video fixtures use <code>match.userMessage</code> which maps to the
-            <code>prompt</code> field in the creation request. The async polling pattern is handled
-            automatically by aimock.
+            <code>prompt</code> field in the creation request. The fixture's
+            <code>video.id</code> and <code>video.status</code> are required &mdash; aimock echoes
+            them in the create response and on every poll, without progression.
           </p>
         </div>
 
@@ -198,9 +223,9 @@
           When no fixture matches an incoming request, aimock can proxy it to the real API and
           record the response as a fixture for future replays. Enable recording with the
           <code>--record</code> flag or via <code>RecordConfig</code> in the programmatic API.
-          Completed videos are recorded with their final URL; in-progress responses are also saved
-          so that the async polling lifecycle can be simulated on replay without hitting the real
-          API.
+          Completed videos are recorded with their final URL; in-progress upstream responses are
+          saved with <code>"status": "processing"</code> and replay with that status verbatim,
+          without hitting the real API.
         </p>
 
         <div class="code-block">
