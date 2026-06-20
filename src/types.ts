@@ -274,11 +274,12 @@ export interface RawJSONResponse extends ResponseOverrides {
   status?: number;
   /**
    * Billed quantity surfaced on the completed fal `queue-result` response via
-   * the `x-fal-billable-units` header (alongside the always-present
-   * `x-fal-request-id`). Real fal sets this header on every queue response;
-   * `@tanstack/ai-fal` (≥ 0.8.x) reads it to populate `result.usage.unitsBilled`.
-   * Omit it to preserve the header-less default — present only to let a fixture
-   * opt into exercising a consumer's cost/billing accounting path on replay.
+   * the `x-fal-billable-units` header (emitted alongside `x-fal-request-id` on
+   * the completed result). Real fal sets this header on its queue responses;
+   * recent versions of `@tanstack/ai-fal` read it to populate a consumer-side
+   * billed-units field (e.g. `usage.unitsBilled`). Omit it to preserve the
+   * header-less default — present only to let a fixture opt into exercising a
+   * consumer's cost/billing accounting path on replay.
    */
   billableUnits?: number;
 }

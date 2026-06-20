@@ -99,6 +99,32 @@ describe("fal.ai general handler — fixture lookup", () => {
     expect(result.headers.get("x-fal-billable-units")).toBe("42");
   });
 
+  test("billableUnits: 0 still emits x-fal-billable-units (zero is a real billed count)", async () => {
+    // Guards the deliberate `!= null` / `Number.isFinite` checks: a truthy
+    // guard (`if (job.billableUnits)`) would drop the header for a zero-cost
+    // call, and every other billableUnits test would stay green.
+    mock = new LLMock({ port: 0 });
+    mock.onFalQueue(
+      /flux/,
+      { images: [{ url: "https://example.com/cat.png" }] },
+      { billableUnits: 0 },
+    );
+    await mock.start();
+
+    const submit = await fetch(`${mock.url}/fal/fal-ai/flux/dev`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-fal-target-host": "queue.fal.run" },
+      body: JSON.stringify({ input: { prompt: "a cat" } }),
+    });
+    const envelope = await submit.json();
+
+    const result = await fetch(`${mock.url}/fal/fal-ai/flux/dev/requests/${envelope.request_id}`, {
+      headers: { "x-fal-target-host": "queue.fal.run" },
+    });
+    expect(result.status).toBe(200);
+    expect(result.headers.get("x-fal-billable-units")).toBe("0");
+  });
+
   test("billableUnits header is withheld until the result completes", async () => {
     // Progression keeps the job IN_QUEUE on the first result poll, so the
     // billable-units header must not ride the 202 — only the completed 200.
@@ -508,6 +534,55 @@ describe("fal.ai general handler — record and replay", () => {
     const recorded = JSON.parse(fs.readFileSync(path.join(tmpDir, files[0]), "utf-8"));
     expect(recorded.fixtures[0].response.billableUnits).toBe(13);
   });
+
+  test.each([
+    ["absent", undefined],
+    ["non-numeric", "not-a-number"],
+  ])(
+    "recording omits billableUnits when the upstream header is %s",
+    async (_label, headerValue) => {
+      const FINAL_BODY = { images: [{ url: "https://mock.fal.media/files/unbilled.png" }] };
+      queueUpstream = await startFalQueueUpstream({
+        finalBody: FINAL_BODY,
+        pollsBeforeCompleted: 2,
+        billableUnits: headerValue,
+      });
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aimock-fal-queue-unbilled-"));
+
+      mock = new LLMock({
+        port: 0,
+        record: {
+          providers: { fal: queueUpstream.url },
+          fixturePath: tmpDir,
+          fal: { pollIntervalMs: 5, timeoutMs: 5000 },
+        },
+      });
+      await mock.start();
+
+      const submit = await fetch(`${mock.url}/fal/fal-ai/flux/dev`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-fal-target-host": "queue.fal.run" },
+        body: JSON.stringify({ input: { prompt: "a cat" } }),
+      });
+      const envelope = await submit.json();
+
+      // No usable upstream units → no header on the same-session replay.
+      const result = await fetch(
+        `${mock.url}/fal/fal-ai/flux/dev/requests/${envelope.request_id}`,
+        { headers: { "x-fal-target-host": "queue.fal.run" } },
+      );
+      expect(result.status).toBe(200);
+      expect(result.headers.get("x-fal-billable-units")).toBeNull();
+
+      // …and the persisted fixture stays clean: no billableUnits key at all.
+      const files = fs
+        .readdirSync(tmpDir)
+        .filter((f) => f.startsWith("fal-") && f.endsWith(".json"));
+      expect(files.length).toBe(1);
+      const recorded = JSON.parse(fs.readFileSync(path.join(tmpDir, files[0]), "utf-8"));
+      expect("billableUnits" in recorded.fixtures[0].response).toBe(false);
+    },
+  );
 
   test("mock-internal headers never reach the upstream on the recorded queue walk", async () => {
     // CHANGELOG/docs claim x-test-id / x-aimock-strict / x-aimock-context /

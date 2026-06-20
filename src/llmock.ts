@@ -229,10 +229,9 @@ export class LLMock {
   // fal.queue.* is the dominant client API; onFalRun is a sync alias.
   //
   // `opts.billableUnits` rides through to the completed `queue-result`
-  // response's `x-fal-billable-units` header (alongside the always-present
-  // `x-fal-request-id`), letting consumers like `@tanstack/ai-fal` surface
-  // `result.usage.unitsBilled` on replay. Omit it to preserve the header-less
-  // default.
+  // response's `x-fal-billable-units` header (emitted alongside
+  // `x-fal-request-id`), letting consumers like `@tanstack/ai-fal` surface a
+  // billed-units value on replay. Omit it to preserve the header-less default.
   onFalQueue(modelOrPrompt: string | RegExp, response: unknown, opts?: FalQueueOpts): this {
     const { billableUnits, ...fixtureOpts } = opts ?? {};
     return this.addFixture({

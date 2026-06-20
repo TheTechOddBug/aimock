@@ -274,11 +274,14 @@ const FAL_HOSTS = {
   gateway: "gateway.fal.ai",
 } as const;
 
-// Headers real fal sets on every queue response. `@tanstack/ai-fal` (and
+// Headers real fal sets on its queue responses. `@tanstack/ai-fal` (and
 // likely other adapters) read both to correlate a billed quantity with the
 // originating request: the request-id keys the lookup, the billable-units
-// value is the quantity. aimock always emits the request-id on queue
-// responses; the billable-units header rides only when a fixture opts in via
+// value is the quantity. aimock emits the request-id on the `status` and
+// `result` queue responses (where adapters perform the billing lookup); the
+// submit envelope already carries `request_id` in its JSON body, and the
+// cancel / not-found responses omit it. The billable-units header rides only
+// the completed `result`, and only when a fixture opts in via
 // `response.billableUnits`.
 const FAL_REQUEST_ID_HEADER = "x-fal-request-id";
 const FAL_BILLABLE_UNITS_HEADER = "x-fal-billable-units";
@@ -460,9 +463,8 @@ export async function handleFal(
       // Callers may fetch result without first polling status — advance so
       // tests that skip the status check still reach completion.
       advanceJob(job);
-      // Real fal sets x-fal-request-id on every queue response; adapters key
-      // their billing lookup off it, so emit it whether or not the job has
-      // completed.
+      // Emit x-fal-request-id on both the in-progress (202) and completed (200)
+      // result; adapters key their billing lookup off it.
       const resultHeaders: Record<string, string> = { [FAL_REQUEST_ID_HEADER]: job.requestId };
       if (job.status !== "COMPLETED") {
         writeJson(req, res, 202, statusResponseBody(job), pathname, journal, resultHeaders);
