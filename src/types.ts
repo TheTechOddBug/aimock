@@ -272,6 +272,16 @@ export interface VideoResponse {
 export interface RawJSONResponse extends ResponseOverrides {
   json: unknown;
   status?: number;
+  /**
+   * Billed quantity surfaced on the completed fal `queue-result` response via
+   * the `x-fal-billable-units` header (emitted alongside `x-fal-request-id` on
+   * the completed result). Real fal sets this header on its queue responses;
+   * recent versions of `@tanstack/ai-fal` read it to populate a consumer-side
+   * billed-units field (e.g. `usage.unitsBilled`). Omit it to preserve the
+   * header-less default — present only to let a fixture opt into exercising a
+   * consumer's cost/billing accounting path on replay.
+   */
+  billableUnits?: number;
 }
 
 export type FixtureResponse =
@@ -375,6 +385,12 @@ export interface Fixture {
 
 export type FixtureOpts = Omit<Fixture, "match" | "response">;
 export type EmbeddingFixtureOpts = Pick<FixtureOpts, "latency" | "chaos">;
+/**
+ * Options for the fal queue/run fixture builders. Adds `billableUnits`, which
+ * is emitted as the `x-fal-billable-units` header on the completed
+ * `queue-result` response (see {@link RawJSONResponse.billableUnits}).
+ */
+export type FalQueueOpts = FixtureOpts & { billableUnits?: number };
 
 // Fixture file format (JSON on disk)
 //

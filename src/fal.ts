@@ -51,6 +51,12 @@ interface FalQueueJob {
   modelId: string;
   status: FalQueueStatus;
   result: unknown;
+  /**
+   * Billed quantity emitted as the `x-fal-billable-units` header on the
+   * completed `queue-result` response. Sourced from the fixture's
+   * `response.billableUnits`; `null` when the fixture omitted it (no header).
+   */
+  billableUnits: number | null;
   /** Number of `/status` (or `/{id}`) polls the caller has made against this job. */
   pollCount: number;
   /** Poll-count threshold for `IN_QUEUE → IN_PROGRESS` transition. */
@@ -268,6 +274,32 @@ const FAL_HOSTS = {
   gateway: "gateway.fal.ai",
 } as const;
 
+// Headers real fal sets on its queue responses. `@tanstack/ai-fal` (and
+// likely other adapters) read both to correlate a billed quantity with the
+// originating request: the request-id keys the lookup, the billable-units
+// value is the quantity. aimock emits the request-id on the `status` and
+// `result` queue responses (where adapters perform the billing lookup); the
+// submit envelope already carries `request_id` in its JSON body, and the
+// cancel / not-found responses omit it. The billable-units header rides only
+// the completed `result`, and only when a fixture opts in via
+// `response.billableUnits`.
+const FAL_REQUEST_ID_HEADER = "x-fal-request-id";
+const FAL_BILLABLE_UNITS_HEADER = "x-fal-billable-units";
+
+/**
+ * Read an optional `billableUnits` off a resolved fixture response. Returns the
+ * finite numeric value or `null` (absent, non-numeric, or non-finite) — the
+ * `x-fal-billable-units` header is emitted only for a non-null result.
+ */
+function extractBillableUnits(response: unknown): number | null {
+  if (response && typeof response === "object" && "billableUnits" in response) {
+    // The `in` narrowing types `response.billableUnits` as `unknown` — no cast.
+    const value: unknown = response.billableUnits;
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
 const QUEUE_REQUESTS_RE = /^(.+)\/requests\/([^/]+)(\/status|\/cancel)?$/;
 const STORAGE_INITIATE_PATH = "/storage/upload/initiate";
 
@@ -416,7 +448,9 @@ export async function handleFal(
         return "handled";
       }
       advanceJob(job);
-      writeJson(req, res, 200, statusResponseBody(job), pathname, journal);
+      writeJson(req, res, 200, statusResponseBody(job), pathname, journal, {
+        [FAL_REQUEST_ID_HEADER]: job.requestId,
+      });
       return "handled";
     }
 
@@ -429,11 +463,19 @@ export async function handleFal(
       // Callers may fetch result without first polling status — advance so
       // tests that skip the status check still reach completion.
       advanceJob(job);
+      // Emit x-fal-request-id on both the in-progress (202) and completed (200)
+      // result; adapters key their billing lookup off it.
+      const resultHeaders: Record<string, string> = { [FAL_REQUEST_ID_HEADER]: job.requestId };
       if (job.status !== "COMPLETED") {
-        writeJson(req, res, 202, statusResponseBody(job), pathname, journal);
+        writeJson(req, res, 202, statusResponseBody(job), pathname, journal, resultHeaders);
         return "handled";
       }
-      writeJson(req, res, 200, job.result, pathname, journal);
+      // x-fal-billable-units rides only the completed result, and only when the
+      // fixture opted into a billed quantity.
+      if (job.billableUnits != null) {
+        resultHeaders[FAL_BILLABLE_UNITS_HEADER] = String(job.billableUnits);
+      }
+      writeJson(req, res, 200, job.result, pathname, journal, resultHeaders);
       return "handled";
     }
 
@@ -722,6 +764,7 @@ export async function handleFal(
         modelId,
         status: initialStatus,
         result: payload,
+        billableUnits: extractBillableUnits(response),
         pollCount: 0,
         pollsBeforeInProgress: progression.pollsBeforeInProgress,
         pollsBeforeCompleted: progression.pollsBeforeCompleted,
@@ -796,9 +839,22 @@ const DEFAULT_FAL_FETCH_TIMEOUT_MS = 30_000;
 // (one shared list, not a per-surface copy, so the surfaces cannot drift).
 
 /**
+ * The result of a queue walk: the parsed final body plus the billed quantity
+ * captured from the result fetch's `x-fal-billable-units` header (`null` when
+ * upstream didn't set it). The caller persists `body` as the fixture and seeds
+ * local queue state; `billableUnits` round-trips real fal billing so a recorded
+ * fixture replays `x-fal-billable-units` without hand-editing.
+ */
+export interface FalQueueWalkResult {
+  body: unknown;
+  billableUnits: number | null;
+}
+
+/**
  * Walk a fal-shaped queue protocol upstream: POST submit, poll status until
- * COMPLETED, GET final result body. Returns the parsed final body so the caller
- * can persist it as the fixture and seed local queue state.
+ * COMPLETED, GET final result. Returns the parsed final body and the result
+ * response's billed quantity so the caller can persist the fixture and seed
+ * local queue state.
  *
  * Decoupled from the route layer so the legacy `/fal/queue/submit/{model}`
  * audio path (`fal-audio.ts`) can reuse the same logic.
@@ -829,7 +885,7 @@ export async function walkFalQueue(args: {
   fallbackResultPath: (requestId: string) => string;
   /** Warn sink for the same-origin envelope-URL gate (omitting it only mutes the warns). */
   logger?: Logger;
-}): Promise<unknown> {
+}): Promise<FalQueueWalkResult> {
   const {
     upstreamBase,
     submitPath,
@@ -947,7 +1003,21 @@ export async function walkFalQueue(args: {
   if (!resultRes.ok) {
     throw new Error(`Result ${resultRes.status}: ${resultText.slice(0, 200)}`);
   }
-  return parseJsonOrThrow(resultText, "Result");
+  return {
+    body: parseJsonOrThrow(resultText, "Result"),
+    billableUnits: parseBillableUnitsHeader(resultRes.headers.get(FAL_BILLABLE_UNITS_HEADER)),
+  };
+}
+
+/**
+ * Parse the upstream `x-fal-billable-units` header into a finite number, or
+ * `null` when absent/unparseable — mirrors the consumer-side parse so a
+ * recorded fixture's captured units match what the live adapter would have read.
+ */
+function parseBillableUnitsHeader(raw: string | null): number | null {
+  if (raw == null) return null;
+  const value = Number(raw.trim());
+  return Number.isFinite(value) ? value : null;
 }
 
 async function proxyAndRecordFalQueueSubmit(args: {
@@ -988,8 +1058,9 @@ async function proxyAndRecordFalQueueSubmit(args: {
   defaults.logger.warn(`NO FIXTURE MATCH — walking fal queue at ${upstreamBase}${strippedPath}`);
 
   let finalBody: unknown;
+  let billableUnits: number | null;
   try {
-    finalBody = await walkFalQueue({
+    const walk = await walkFalQueue({
       upstreamBase,
       submitPath: strippedPath,
       body,
@@ -1001,6 +1072,8 @@ async function proxyAndRecordFalQueueSubmit(args: {
       fallbackResultPath: (id) => `${modelId}/requests/${id}`,
       logger: defaults.logger,
     });
+    finalBody = walk.body;
+    billableUnits = walk.billableUnits;
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown queue-walk error";
     defaults.logger.error(`fal queue-walk proxy failed: ${msg}`);
@@ -1030,7 +1103,14 @@ async function proxyAndRecordFalQueueSubmit(args: {
     : syntheticReq;
   const fixture: Fixture = {
     match: buildFixtureMatch(matchRequest, record),
-    response: { json: finalBody, status: 200 },
+    // Persist the captured billed quantity so the recorded fixture replays
+    // x-fal-billable-units verbatim; omit the field entirely when upstream
+    // didn't bill (keeps recorded fixtures clean).
+    response: {
+      json: finalBody,
+      status: 200,
+      ...(billableUnits != null ? { billableUnits } : {}),
+    },
   };
   const persistResult = persistFixture({
     record,
@@ -1058,6 +1138,10 @@ async function proxyAndRecordFalQueueSubmit(args: {
     modelId,
     status: initialStatus,
     result: finalBody,
+    // Captured from the upstream result's x-fal-billable-units header so the
+    // same-session replay (before the persisted fixture is reloaded) already
+    // surfaces the billed quantity.
+    billableUnits,
     pollCount: 0,
     pollsBeforeInProgress: progression.pollsBeforeInProgress,
     pollsBeforeCompleted: progression.pollsBeforeCompleted,
@@ -1125,6 +1209,7 @@ function writeJson(
   payload: unknown,
   pathname: string,
   journal: Journal,
+  extraHeaders?: Record<string, string>,
 ): void {
   journal.add({
     method: req.method ?? "GET",
@@ -1133,7 +1218,7 @@ function writeJson(
     body: null,
     response: { status, fixture: null },
   });
-  res.writeHead(status, { "Content-Type": "application/json" });
+  res.writeHead(status, { "Content-Type": "application/json", ...extraHeaders });
   res.end(JSON.stringify(payload));
 }
 
