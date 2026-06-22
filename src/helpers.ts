@@ -984,8 +984,15 @@ export function matchesPattern(text: string, pattern: string | RegExp): boolean 
   if (typeof pattern === "string") {
     return text.toLowerCase().includes(pattern.toLowerCase());
   }
+  // A global/sticky RegExp carries mutable `lastIndex` state that `.test()`
+  // advances. Save and restore it so callers reusing the same regex object
+  // (search/rerank/moderation filter loops) are not left with mutated state
+  // and get consistent results across repeated calls.
+  const savedLastIndex = pattern.lastIndex;
   pattern.lastIndex = 0;
-  return pattern.test(text);
+  const result = pattern.test(text);
+  pattern.lastIndex = savedLastIndex;
+  return result;
 }
 
 export function getTestId(req: http.IncomingMessage): string {

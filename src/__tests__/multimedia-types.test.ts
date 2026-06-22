@@ -4,6 +4,7 @@ import {
   isAudioResponse,
   isTranscriptionResponse,
   isVideoResponse,
+  matchesPattern,
 } from "../helpers.js";
 import { matchFixture } from "../router.js";
 import type { Fixture, ChatCompletionRequest, FixtureResponse } from "../types.js";
@@ -181,5 +182,27 @@ describe("endpoint filtering in matchFixture", () => {
     // The sequence is exhausted: no fixture has a sequenceIndex matching the
     // next shared count, so further requests no longer match.
     expect(resolve()).toBeNull();
+  });
+});
+
+describe("matchesPattern", () => {
+  test("does not mutate the caller's RegExp lastIndex", () => {
+    // A global regex carries mutable `lastIndex` state. matchesPattern must
+    // not leave that state mutated, or callers reusing the same regex object
+    // (e.g. the search/rerank/moderation filter loops) get inconsistent
+    // results on subsequent uses.
+    const re = /guitar/g;
+    expect(matchesPattern("guitar", re)).toBe(true);
+    // After the call, the caller's own use of the same regex must behave as if
+    // matchesPattern never touched it.
+    expect(re.lastIndex).toBe(0);
+    expect(re.test("guitar")).toBe(true);
+  });
+
+  test("is consistent across repeated calls with the same global regex", () => {
+    const re = /g/g;
+    expect(matchesPattern("guitar", re)).toBe(true);
+    expect(matchesPattern("guitar", re)).toBe(true);
+    expect(matchesPattern("guitar", re)).toBe(true);
   });
 });
