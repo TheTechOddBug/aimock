@@ -26,6 +26,11 @@ describe("multimedia type guards", () => {
     expect(isImageResponse(r)).toBe(false);
   });
 
+  test("isImageResponse rejects non-object image value", () => {
+    const r = { image: "not-an-object" } as unknown as FixtureResponse;
+    expect(isImageResponse(r)).toBe(false);
+  });
+
   test("isAudioResponse detects audio (string form)", () => {
     const r: FixtureResponse = { audio: "AAAA", format: "mp3" };
     expect(isAudioResponse(r)).toBe(true);
@@ -149,7 +154,32 @@ describe("endpoint filtering in matchFixture", () => {
       _endpointType: "image",
     };
 
-    const first = matchFixture(fixtures, imageReq, counts);
-    expect(first).toBe(fixtures[0]);
+    // Pin the FULL sequence ordering this test claims to verify. matchFixture
+    // gates a sequenced fixture on its match count equalling sequenceIndex but
+    // does not itself mutate the count — the caller (journal) increments after
+    // consuming a match, and crucially advances ALL sequenced siblings sharing
+    // the same match criteria so the group shares one logical counter. Mimic
+    // that here so each call advances to the next sequenceIndex, proving the
+    // sequence resolves 0 → 1 in order and then exhausts.
+    const advanceSequence = (matched: Fixture): void => {
+      for (const f of fixtures) {
+        if (f.match.sequenceIndex !== undefined) {
+          counts.set(f, (counts.get(f) ?? 0) + 1);
+        }
+      }
+      // (matched is part of the group; the loop above already advanced it)
+      void matched;
+    };
+    const resolve = (): Fixture | null => {
+      const f = matchFixture(fixtures, imageReq, counts);
+      if (f) advanceSequence(f);
+      return f;
+    };
+
+    expect(resolve()).toBe(fixtures[0]);
+    expect(resolve()).toBe(fixtures[1]);
+    // The sequence is exhausted: no fixture has a sequenceIndex matching the
+    // next shared count, so further requests no longer match.
+    expect(resolve()).toBeNull();
   });
 });

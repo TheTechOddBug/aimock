@@ -449,6 +449,88 @@ describe("recorder integration", () => {
     expect(savedResponse.toolCalls).toHaveLength(1);
   });
 
+  it('coalesces missing tool-call arguments to "{}" in recorded fixture', async () => {
+    // Real record path: a raw upstream returns an OpenAI non-streaming
+    // chat-completions tool call whose `function.arguments` field is ABSENT
+    // (a no-arg tool call). The recorder must persist `arguments: "{}"` so the
+    // OpenAI replay path's `JSON.parse(args || "{}")` does not crash. Before the
+    // fix, `String(fn.arguments)` persisted the literal string "undefined".
+    const rawUpstream = http.createServer((_upReq, upRes) => {
+      upRes.writeHead(200, { "Content-Type": "application/json" });
+      upRes.end(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    id: "call_abc",
+                    type: "function",
+                    function: { name: "get_time" }, // no `arguments` field
+                  },
+                ],
+              },
+              finish_reason: "tool_calls",
+            },
+          ],
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => rawUpstream.listen(0, "127.0.0.1", () => resolve()));
+    const upstreamPort = (rawUpstream.address() as { port: number }).port;
+
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aimock-record-noarg-"));
+
+    const recorderServer = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", async () => {
+        const rawBody = Buffer.concat(chunks).toString();
+        await proxyAndRecord(
+          req,
+          res,
+          JSON.parse(rawBody),
+          "openai",
+          "/v1/chat/completions",
+          [],
+          {
+            record: {
+              providers: { openai: `http://127.0.0.1:${upstreamPort}` },
+              fixturePath: tmpDir!,
+            },
+            logger: new Logger("silent"),
+          },
+          rawBody,
+        );
+      });
+    });
+    await new Promise<void>((resolve) => recorderServer.listen(0, "127.0.0.1", () => resolve()));
+    const recorderPort = (recorderServer.address() as { port: number }).port;
+
+    try {
+      await post(`http://127.0.0.1:${recorderPort}/v1/chat/completions`, {
+        model: "gpt-4",
+        messages: [{ role: "user", content: "What time is it?" }],
+        tools: [{ type: "function", function: { name: "get_time", parameters: {} } }],
+      });
+
+      const files = fs.readdirSync(tmpDir!).filter((f) => f.endsWith(".json"));
+      expect(files).toHaveLength(1);
+      const fixtureContent = JSON.parse(
+        fs.readFileSync(path.join(tmpDir!, files[0]), "utf-8"),
+      ) as FixtureFile;
+      const savedResponse = fixtureContent.fixtures[0].response as {
+        toolCalls: Array<{ arguments: string }>;
+      };
+      expect(savedResponse.toolCalls).toHaveLength(1);
+      expect(savedResponse.toolCalls[0].arguments).toBe("{}");
+    } finally {
+      await new Promise<void>((resolve) => rawUpstream.close(() => resolve()));
+      await new Promise<void>((resolve) => recorderServer.close(() => resolve()));
+    }
+  });
+
   it("records embedding response from upstream", async () => {
     const { recorderUrl, fixturePath } = await setupUpstreamAndRecorder(
       [
@@ -4152,8 +4234,11 @@ describe("buildFixtureResponse format detection", () => {
     expect(fixtureContent.fixtures[0].response.embedding).toEqual([0.5, 1, -0.25]);
   });
 
-  it("does not decode base64 embedding when encoding_format is not set", async () => {
-    // Same base64 string but no encoding_format in request — should NOT decode
+  it("decodes a base64 embedding even when encoding_format is not echoed in the request", async () => {
+    // Some providers return a base64-packed Float32 embedding even when the
+    // client did not request encoding_format: "base64". The recorder must decode
+    // it regardless of the request echo, rather than silently dropping a valid
+    // embedding into the proxy_error fixture. base64 of Float32Array([0.5,1,-0.25]).
     const base64Embedding = "AAAAPwAAgD8AAIC+";
     const { url: upstreamUrl } = await createRawUpstreamWithStatus({
       object: "list",
@@ -4183,12 +4268,11 @@ describe("buildFixtureResponse format detection", () => {
       fs.readFileSync(path.join(tmpDir, fixtureFiles[0]), "utf-8"),
     ) as {
       fixtures: Array<{
-        response: { error?: { type: string } };
+        response: { embedding?: number[]; error?: { type: string } };
       }>;
     };
-    // Without encoding_format, base64 string embedding is not an array →
-    // falls through to proxy_error
-    expect(fixtureContent.fixtures[0].response.error?.type).toBe("proxy_error");
+    expect(fixtureContent.fixtures[0].response.error).toBeUndefined();
+    expect(fixtureContent.fixtures[0].response.embedding).toEqual([0.5, 1, -0.25]);
   });
 
   it("still detects array embeddings when encoding_format is base64", async () => {
@@ -4229,8 +4313,11 @@ describe("buildFixtureResponse format detection", () => {
     expect(fixtureContent.fixtures[0].response.embedding).toEqual([0.5, 1, -0.25]);
   });
 
-  it("handles truncated base64 embedding gracefully (odd byte count)", async () => {
-    // 2 bytes decodes to 0 float32 elements — produces empty embedding, not a crash
+  it("does not silently emit a zero-dim embedding for truncated base64 (odd byte count)", async () => {
+    // 2 bytes is not a whole number of Float32s (byteLength % 4 !== 0). The
+    // recorder must NOT silently produce a valid-looking empty embedding — it
+    // logs the malformed input and falls through to the proxy_error fixture so
+    // the loss is diagnosable rather than masquerading as a valid 0-dim vector.
     const shortBase64 = Buffer.from([0x00, 0x01]).toString("base64");
     const { url: upstreamUrl } = await createRawUpstreamWithStatus({
       object: "list",
@@ -4261,11 +4348,12 @@ describe("buildFixtureResponse format detection", () => {
       fs.readFileSync(path.join(tmpDir, fixtureFiles[0]), "utf-8"),
     ) as {
       fixtures: Array<{
-        response: { embedding?: number[] };
+        response: { embedding?: number[]; error?: { type: string } };
       }>;
     };
-    // Truncated base64 decodes to empty array rather than crashing
-    expect(fixtureContent.fixtures[0].response.embedding).toEqual([]);
+    // Must not be a silent valid-looking zero-dimension embedding.
+    expect(fixtureContent.fixtures[0].response.embedding).toBeUndefined();
+    expect(fixtureContent.fixtures[0].response.error?.type).toBe("proxy_error");
   });
 
   it("preserves error code field from upstream error response", async () => {
@@ -6723,5 +6811,113 @@ describe("sanitizeHeaderValue", () => {
     );
     expect(sanitizeHeaderValue("line1\nline2\x7f")).toBe("line1?line2?");
     expect(sanitizeHeaderValue("plain ascii\twith tab")).toBe("plain ascii\twith tab");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OpenAI image-generation branch entry gate (regression)
+//
+// The image branch's entry gate keyed on `data[0]` carrying media (url/b64_json).
+// An image batch whose FIRST element lacks both — but a LATER element HAS one —
+// skipped the whole branch and fell through to the generic error fixture,
+// silently dropping every captured image. The gate must enter when ANY item
+// carries media. Driven against the real record path: a raw OpenAI image
+// upstream fronted by a real recorder, posting to /v1/images/generations, then
+// asserting the persisted fixture retains the image(s).
+// ---------------------------------------------------------------------------
+
+describe("recorder OpenAI image-branch entry gate", () => {
+  let rawServer: http.Server | undefined;
+
+  afterEach(async () => {
+    if (rawServer) {
+      await new Promise<void>((resolve) => rawServer!.close(() => resolve()));
+      rawServer = undefined;
+    }
+  });
+
+  // Raw OpenAI image-generation upstream emitting a fixed JSON body, fronted by a
+  // real recorder configured with the `openai` provider key so buildFixtureResponse
+  // runs over the upstream image response.
+  async function recordOpenAiImage(responseJson: unknown): Promise<{
+    fixturePath: string;
+    response: { status: number; body: string };
+  }> {
+    rawServer = http.createServer((_upReq, upRes) => {
+      upRes.writeHead(200, { "Content-Type": "application/json" });
+      upRes.end(JSON.stringify(responseJson));
+    });
+    await new Promise<void>((resolve) => rawServer!.listen(0, "127.0.0.1", () => resolve()));
+    const upstreamPort = (rawServer!.address() as { port: number }).port;
+
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aimock-openai-image-"));
+    recorder = await createServer([], {
+      port: 0,
+      record: {
+        providers: { openai: `http://127.0.0.1:${upstreamPort}` },
+        fixturePath: tmpDir,
+      },
+    });
+
+    const response = await post(`${recorder.url}/v1/images/generations`, {
+      model: "gpt-image-1",
+      prompt: "a red cube and a blue sphere",
+      n: 2,
+    });
+
+    return { fixturePath: tmpDir, response };
+  }
+
+  it("captures images when data[0] lacks media but a later item carries a url", async () => {
+    // OpenAI batch where the FIRST element has neither url nor b64_json (e.g. a
+    // partial/placeholder entry), but the SECOND element carries a real url.
+    const { fixturePath } = await recordOpenAiImage({
+      created: 1_700_000_000,
+      data: [
+        { revised_prompt: "a red cube and a blue sphere" },
+        { url: "https://example.com/image-2.png", revised_prompt: "blue sphere" },
+      ],
+    });
+
+    const files = fs.readdirSync(fixturePath).filter((f) => f.endsWith(".json"));
+    expect(files).toHaveLength(1);
+    const fixtureContent = JSON.parse(
+      fs.readFileSync(path.join(fixturePath, files[0]), "utf-8"),
+    ) as FixtureFile;
+    const saved = fixtureContent.fixtures[0].response as {
+      image?: { url?: string; b64Json?: string; revisedPrompt?: string };
+      images?: Array<{ url?: string; b64Json?: string; revisedPrompt?: string }>;
+      error?: { message: string };
+    };
+
+    // RED (pre-fix): the gate keyed on data[0] (no media) skipped the branch and
+    // the response fell through to the generic error fixture, dropping the image.
+    expect(saved.error).toBeUndefined();
+    // GREEN: the single media-bearing item is captured. The within-branch filter
+    // drops the media-less first element, leaving exactly one image — which the
+    // branch collapses to `{ image }`.
+    expect(saved.image).toBeDefined();
+    expect(saved.image!.url).toBe("https://example.com/image-2.png");
+  });
+
+  it("captures b64_json when data[0] lacks media but a later item carries b64_json", async () => {
+    const { fixturePath } = await recordOpenAiImage({
+      created: 1_700_000_001,
+      data: [{ revised_prompt: "placeholder" }, { b64_json: "aGVsbG8=", revised_prompt: "real" }],
+    });
+
+    const files = fs.readdirSync(fixturePath).filter((f) => f.endsWith(".json"));
+    expect(files).toHaveLength(1);
+    const fixtureContent = JSON.parse(
+      fs.readFileSync(path.join(fixturePath, files[0]), "utf-8"),
+    ) as FixtureFile;
+    const saved = fixtureContent.fixtures[0].response as {
+      image?: { url?: string; b64Json?: string };
+      error?: { message: string };
+    };
+
+    expect(saved.error).toBeUndefined();
+    expect(saved.image).toBeDefined();
+    expect(saved.image!.b64Json).toBe("aGVsbG8=");
   });
 });

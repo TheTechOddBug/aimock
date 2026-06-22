@@ -20,7 +20,7 @@ import type { Logger } from "./logger.js";
 import { collapseStreamingResponse, capturedRedactedData } from "./stream-collapse.js";
 import { writeErrorResponse } from "./sse-writer.js";
 import { resolveUpstreamUrl } from "./url.js";
-import { getTestId, slugifyTestId } from "./helpers.js";
+import { getTestId, slugifyTestId, slugifyContext } from "./helpers.js";
 import { DEFAULT_TEST_ID } from "./constants.js";
 
 /** Headers to strip when proxying — hop-by-hop (RFC 2616 §13.5.1) + client-set. */
@@ -146,6 +146,22 @@ export function sanitizeHeaderValue(value: string): string {
 }
 
 /**
+ * Resolve a `content-type` header value to a single string. Node's
+ * `http.IncomingHttpHeaders` types `content-type` as `string | string[]`, and
+ * a constructed/proxied header object CAN carry an array (e.g. duplicated
+ * header lines surfaced by some HTTP stacks). `join(", ")`-ing such an array
+ * produces a malformed `Content-Type: application/json, text/html` value — pick
+ * the FIRST element instead, which is the value the client should act on.
+ * Returns `""` when the header is absent or an empty array.
+ */
+export function pickContentType(contentType: string | string[] | undefined): string {
+  if (Array.isArray(contentType)) {
+    return contentType.length > 0 ? contentType[0] : "";
+  }
+  return contentType ?? "";
+}
+
+/**
  * Write a built fixture to disk (snapshot vs. timestamp file layout) and, when
  * the match is non-empty, register it in the in-memory cache so subsequent
  * identical requests match. Extracted from `proxyAndRecord` so the fal
@@ -206,8 +222,15 @@ export function persistFixture(opts: {
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const timestampFile = `${providerKey}-${timestamp}-${crypto.randomUUID().slice(0, 8)}.json`;
-    filepath = fixture.match.context
-      ? path.join(fixturePath, fixture.match.context, timestampFile)
+    // The context becomes a directory segment, but it originates from the
+    // attacker-controllable `X-AIMock-Context` header — slugify it (mirroring
+    // testId above) so `../`, separators, and absolute prefixes can't escape
+    // the fixtures base dir. An empty slug → no context segment.
+    const contextSegment = fixture.match.context
+      ? slugifyContext(fixture.match.context)
+      : undefined;
+    filepath = contextSegment
+      ? path.join(fixturePath, contextSegment, timestampFile)
       : path.join(fixturePath, timestampFile);
   }
 
@@ -222,7 +245,14 @@ export function persistFixture(opts: {
     // Auth headers are forwarded to upstream but excluded from saved fixtures.
     // The persisted fixture is always the real upstream response, even when
     // chaos later mutates the relay; replay must see what upstream said.
-    let fileContent: { fixtures: unknown[]; _warning?: string };
+    // Warnings are persisted as a `_warnings` JSON array (authoritative,
+    // non-fragmenting) AND a legacy "; "-joined `_warning` string (kept for
+    // backward-compatible readers). The array is the source of truth on a
+    // snapshot merge: a single warning that itself contains "; " (e.g.
+    // "captured A; then B") would be fragmented into two bogus entries if the
+    // joined string were split back apart on merge. Carrying the array forward
+    // avoids that round-trip fragmentation entirely.
+    let fileContent: { fixtures: unknown[]; _warning?: string; _warnings?: string[] };
     if (mergeExisting && fs.existsSync(filepath)) {
       try {
         const existing = JSON.parse(fs.readFileSync(filepath, "utf-8"));
@@ -238,12 +268,18 @@ export function persistFixture(opts: {
           );
         }
         fileContent = { fixtures: [...(existingFixtures ?? []), fixture] };
-        // Carry an existing _warning forward — a later clean capture merging
-        // into the same snapshot file must not erase an earlier capture's
-        // warning (e.g. an over-cap b64 omission). Split the "; "-joined
-        // string back into its elements first so a re-emitted warning dedupes
-        // against them ("A; B" + "A" must stay "A; B", not "A; B; A").
-        if (typeof existing._warning === "string" && existing._warning) {
+        // Carry existing warnings forward — a later clean capture merging into
+        // the same snapshot file must not erase an earlier capture's warning
+        // (e.g. an over-cap b64 omission). Prefer the new `_warnings` array;
+        // fall back to the legacy "; "-joined `_warning` string for files
+        // written before this format change. The legacy split can still
+        // fragment an embedded-"; " warning in a pre-existing file, but new
+        // captures no longer create that hazard.
+        if (Array.isArray(existing._warnings)) {
+          fileWarnings.unshift(
+            ...(existing._warnings as unknown[]).filter((w): w is string => typeof w === "string"),
+          );
+        } else if (typeof existing._warning === "string" && existing._warning) {
           fileWarnings.unshift(...existing._warning.split("; "));
         }
       } catch (mergeErr) {
@@ -256,8 +292,11 @@ export function persistFixture(opts: {
     }
     if (fileWarnings.length > 0) {
       // Exact-duplicate warnings (e.g. repeated over-cap captures merging into
-      // the same snapshot file) collapse to one entry.
-      fileContent._warning = [...new Set(fileWarnings)].join("; ");
+      // the same snapshot file) collapse to one entry. Emit BOTH the
+      // authoritative array and the legacy joined string.
+      const dedupedWarnings = [...new Set(fileWarnings)];
+      fileContent._warnings = dedupedWarnings;
+      fileContent._warning = dedupedWarnings.join("; ");
     }
     // Atomic write: write to temp file then rename to avoid read-modify-write
     // races. Keep synchronous — for streamed responses the HTTP reply is
@@ -379,8 +418,12 @@ export async function proxyAndRecord(
         }),
       );
     } else {
-      // SSE headers already sent — gracefully close the connection
-      res.end();
+      // Streaming headers (200) are already on the wire, so we cannot change the
+      // status — but we MUST NOT call res.end(), which the client reads as a
+      // clean EOF and treats as a complete (silently truncated) response.
+      // Destroy the connection instead so the client sees an aborted stream and
+      // can surface the upstream failure rather than acting on partial data.
+      res.destroy();
     }
     return "relayed";
   }
@@ -391,7 +434,7 @@ export async function proxyAndRecord(
   // this path ever proxies long-lived or large streams — both the buffer
   // here and the hook below receive the full payload.
   const contentType = upstreamHeaders["content-type"];
-  const ctString = Array.isArray(contentType) ? contentType.join(", ") : (contentType ?? "");
+  const ctString = pickContentType(contentType);
   const isBinaryStream = ctString.toLowerCase().includes("application/vnd.amazon.eventstream");
   const collapsed = collapseStreamingResponse(
     ctString,
@@ -402,9 +445,15 @@ export async function proxyAndRecord(
 
   let fixtureResponse: FixtureResponse;
 
-  // TTS response — binary audio, not JSON
+  // TTS response — binary audio, not JSON. Classify on the audio content-type
+  // when upstream succeeded (2xx), regardless of body length: a zero-length
+  // audio body is still an audio response (empty audio), NOT an opaque
+  // proxy_error — letting it fall through to the JSON path would mis-record it.
+  // A non-2xx audio response (error JSON in the body) is left to the JSON/error
+  // path below.
   const isAudioResponse = ctString.toLowerCase().startsWith("audio/");
-  if (isAudioResponse && rawBuffer.length > 0) {
+  const isAudioSuccess = upstreamStatus >= 200 && upstreamStatus < 300;
+  if (isAudioResponse && isAudioSuccess) {
     // Derive format from Content-Type (audio/mpeg→mp3, audio/opus→opus, etc.)
     const audioFormat = ctString
       .toLowerCase()
@@ -412,6 +461,11 @@ export async function proxyAndRecord(
       .replace("mpeg", "mp3")
       .split(";")[0]
       .trim();
+    if (rawBuffer.length === 0) {
+      defaults.logger.warn(
+        "Audio response had a zero-length body — recording an empty audio fixture",
+      );
+    }
     fixtureResponse = {
       audio: rawBuffer.toString("base64"),
       ...(audioFormat && audioFormat !== "mp3" ? { format: audioFormat } : {}),
@@ -584,20 +638,10 @@ export async function proxyAndRecord(
         fixtureResponse = { json: parsedResponse, status: upstreamStatus };
       }
     } else {
-      let encodingFormat: string | undefined;
-      try {
-        encodingFormat = rawBody ? JSON.parse(rawBody).encoding_format : undefined;
-      } catch (err) {
-        defaults.logger.debug(
-          `Could not parse encoding_format from raw body: ${err instanceof Error ? err.message : "unknown error"}`,
-        );
-      }
-      fixtureResponse = buildFixtureResponse(
-        parsedResponse,
-        upstreamStatus,
-        encodingFormat,
-        defaults.logger,
-      );
+      // NOTE: base64 embeddings are decoded unconditionally inside
+      // buildFixtureResponse regardless of the request's `encoding_format`, so
+      // there is no need to re-parse it here — it was a dead param.
+      fixtureResponse = buildFixtureResponse(parsedResponse, upstreamStatus, defaults.logger);
     }
   }
 
@@ -774,6 +818,12 @@ function makeUpstreamRequest(
     const transport = target.protocol === "https:" ? https : http;
     const UPSTREAM_TIMEOUT_MS = clampTimeout(timeouts?.upstreamTimeoutMs, 30_000);
     const BODY_TIMEOUT_MS = clampTimeout(timeouts?.bodyTimeoutMs, 30_000);
+    // Capture the moment the request is dispatched (set just before
+    // `req.write` below). ttft/total durations are measured from request SEND,
+    // not from when upstream HEADERS arrive — basing them on headers-received
+    // time would exclude the upstream's time-to-first-byte and understate the
+    // recorded time-to-first-token.
+    let requestSendTime = 0;
     const req = transport.request(
       target,
       {
@@ -795,7 +845,7 @@ function makeUpstreamRequest(
         // which defeats progressive rendering in downstream consumers and
         // can trip HTTP idle timeouts on slow calls.
         const ct = res.headers["content-type"];
-        const ctStr = Array.isArray(ct) ? ct.join(", ") : (ct ?? "");
+        const ctStr = pickContentType(ct);
         const ctLower = ctStr.toLowerCase();
         const isSSE = ctLower.includes("text/event-stream");
         const isNDJSON = ctLower.includes("application/x-ndjson");
@@ -804,7 +854,9 @@ function makeUpstreamRequest(
         // SSE/NDJSON frame timing capture — timestamps each complete frame
         // so proxyAndRecord can build RecordedTimings for the fixture.
         const frameTimestamps: number[] = [];
-        const streamStartTime = Date.now();
+        // Measure from request send (see requestSendTime above), falling back to
+        // now only if it was somehow not set before the response callback fired.
+        const streamStartTime = requestSendTime || Date.now();
         let frameBuffer = "";
         // Decode chunks through a streaming-aware decoder so a multibyte UTF-8
         // character split across a TCP chunk boundary buffers across chunks
@@ -951,6 +1003,9 @@ function makeUpstreamRequest(
       );
     });
     req.on("error", reject);
+    // Stamp the send time immediately before dispatching the body so ttft and
+    // total-duration are measured from request send, not headers-received.
+    requestSendTime = Date.now();
     req.write(body);
     req.end();
   });
@@ -973,15 +1028,24 @@ function logDroppedReasoningSignature(
 }
 
 /**
+ * Coerce a tool call's `arguments` field into the string the fixture contract
+ * requires (types.ts `ToolCall.arguments: string`). When the upstream omits the
+ * arguments field entirely, `JSON.stringify(undefined)` yields the JS value
+ * `undefined` (not a string), which then gets dropped on disk-write and breaks
+ * cross-provider replay through the OpenAI streaming path. Coalesce to "{}" so
+ * `arguments` is ALWAYS a string, matching the streaming recorder's behavior.
+ */
+function toToolCallArguments(raw: unknown): string {
+  if (typeof raw === "string") return raw;
+  if (raw === undefined || raw === null) return "{}";
+  return JSON.stringify(raw);
+}
+
+/**
  * Detect the response format from the parsed upstream JSON and convert
  * it into an aimock FixtureResponse.
  */
-function buildFixtureResponse(
-  parsed: unknown,
-  status: number,
-  encodingFormat?: string,
-  logger?: Logger,
-): FixtureResponse {
+function buildFixtureResponse(parsed: unknown, status: number, logger?: Logger): FixtureResponse {
   if (parsed === null || parsed === undefined) {
     // Raw / unparseable response — save as error
     return {
@@ -1016,25 +1080,53 @@ function buildFixtureResponse(
     if (Array.isArray(first.embedding)) {
       return { embedding: first.embedding as number[] };
     }
-    if (typeof first.embedding === "string" && encodingFormat === "base64") {
+    // A string embedding is a base64-packed Float32 array. Decode it regardless
+    // of whether the request echoed `encoding_format: "base64"` — some providers
+    // return base64 without the client having asked for it, and gating on the
+    // request echo silently drops a valid embedding into the error fixture.
+    if (typeof first.embedding === "string") {
       const buf = Buffer.from(first.embedding, "base64");
-      if (buf.byteLength % 4 !== 0) {
-        // Malformed embedding — return a zero-dimension embedding fixture
-        return { embedding: [] };
+      if (buf.byteLength === 0 || buf.byteLength % 4 !== 0) {
+        // Malformed base64 (not a whole number of Float32s). Don't silently
+        // return a valid-looking zero-dimension embedding — log it and fall
+        // through to the generic error fixture so the loss is diagnosable.
+        logger?.warn(
+          `Could not decode base64 embedding (byteLength=${buf.byteLength} is not a positive multiple of 4) — saving as error fixture`,
+        );
+      } else {
+        // Uint8Array constructor copies Buffer data to a fresh ArrayBuffer at offset 0,
+        // guaranteeing the alignment Float32Array requires.
+        const copied = new Uint8Array(buf);
+        const floats = new Float32Array(copied.buffer, 0, buf.byteLength / 4);
+        return { embedding: Array.from(floats) };
       }
-      // Uint8Array constructor copies Buffer data to a fresh ArrayBuffer at offset 0,
-      // guaranteeing the alignment Float32Array requires.
-      const copied = new Uint8Array(buf);
-      const floats = new Float32Array(copied.buffer, 0, buf.byteLength / 4);
-      return { embedding: Array.from(floats) };
     }
     // OpenAI image generation: { created, data: [{ url, b64_json, revised_prompt }] }
-    if (first.url || first.b64_json) {
-      const images = (obj.data as Array<Record<string, unknown>>).map((item) => ({
-        ...(item.url ? { url: String(item.url) } : {}),
-        ...(item.b64_json ? { b64Json: String(item.b64_json) } : {}),
-        ...(item.revised_prompt ? { revisedPrompt: String(item.revised_prompt) } : {}),
-      }));
+    // Enter the branch when ANY item carries media — not just data[0]. A batch
+    // whose first element lacks both url and b64_json (e.g. a partial/placeholder
+    // entry) but whose later element HAS one would otherwise skip the branch and
+    // fall through to the error fixture, silently dropping every captured image.
+    if ((obj.data as Array<Record<string, unknown>>).some((item) => item.url || item.b64_json)) {
+      // Map only items that actually carry media (url or b64_json). A later item
+      // lacking both — including one whose `b64_json` is an empty string — would
+      // otherwise produce an empty {} image entry (all the conditional spreads
+      // are skipped) — silent fidelity loss.
+      const dataItems = obj.data as Array<Record<string, unknown>>;
+      const images = dataItems
+        .filter((item) => item.url || item.b64_json)
+        .map((item) => ({
+          ...(item.url ? { url: String(item.url) } : {}),
+          ...(item.b64_json ? { b64Json: String(item.b64_json) } : {}),
+          ...(item.revised_prompt ? { revisedPrompt: String(item.revised_prompt) } : {}),
+        }));
+      // Surface any dropped items (e.g. empty-string b64_json placeholders) so
+      // the fidelity loss is diagnosable rather than silent.
+      const droppedCount = dataItems.length - images.length;
+      if (droppedCount > 0) {
+        logger?.warn(
+          `Dropped ${droppedCount} image item(s) from batch lacking a non-empty url or b64_json`,
+        );
+      }
       if (images.length === 1) {
         return { image: images[0] };
       }
@@ -1055,10 +1147,21 @@ function buildFixtureResponse(
   }
 
   // OpenAI transcription: { text: "...", ... }
-  if (
+  // Tightened: a bare `text` string alongside a single incidental `language` or
+  // `duration` field is too weak — many non-transcription payloads carry a
+  // `text` plus a `duration`-like number. Require an explicit
+  // `task: "transcribe"`, OR BOTH `language` and `duration` (the verbose
+  // transcription shape). Also reject anything carrying clear non-transcription
+  // markers (chat completions, events, etc.) so they route to their own branch.
+  const looksLikeTranscription =
     typeof obj.text === "string" &&
-    (obj.task === "transcribe" || obj.language !== undefined || obj.duration !== undefined)
-  ) {
+    (obj.task === "transcribe" || (obj.language !== undefined && obj.duration !== undefined)) &&
+    !("choices" in obj) &&
+    !("candidates" in obj) &&
+    !("object" in obj) &&
+    !("message" in obj) &&
+    !("outputs" in obj);
+  if (looksLikeTranscription) {
     return {
       transcription: {
         text: obj.text as string,
@@ -1088,7 +1191,7 @@ function buildFixtureResponse(
     if (hasToolCalls) {
       const toolCalls: ToolCall[] = fnCallOutputs.map((o) => ({
         name: String(o.name),
-        arguments: typeof o.arguments === "string" ? o.arguments : JSON.stringify(o.arguments),
+        arguments: toToolCallArguments(o.arguments),
         ...(o.id ? { id: String(o.id) } : {}),
       }));
       if (hasContent) {
@@ -1154,10 +1257,16 @@ function buildFixtureResponse(
       const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
       const hasContent = typeof message.content === "string" && message.content.length > 0;
 
+      // Reasoning is exposed under different keys across OpenAI-compatible
+      // providers: OpenAI/vLLM use `reasoning_content`, while DeepSeek and
+      // OpenRouter use `reasoning`. Read both (preferring `reasoning_content`)
+      // so a reasoning turn is not silently dropped on the latter providers.
       const openaiReasoning =
         typeof message.reasoning_content === "string" && message.reasoning_content.length > 0
           ? message.reasoning_content
-          : undefined;
+          : typeof message.reasoning === "string" && message.reasoning.length > 0
+            ? message.reasoning
+            : undefined;
 
       if (hasToolCalls) {
         const toolCalls: ToolCall[] = (message.tool_calls as Array<Record<string, unknown>>).map(
@@ -1165,7 +1274,7 @@ function buildFixtureResponse(
             const fn = tc.function as Record<string, unknown>;
             return {
               name: String(fn.name),
-              arguments: String(fn.arguments),
+              arguments: toToolCallArguments(fn.arguments),
               ...(tc.id ? { id: String(tc.id) } : {}),
             };
           },
@@ -1246,7 +1355,7 @@ function buildFixtureResponse(
     if (hasToolCalls) {
       const toolCalls: ToolCall[] = toolUseBlocks.map((b) => ({
         name: String(b.name),
-        arguments: typeof b.input === "string" ? b.input : JSON.stringify(b.input),
+        arguments: toToolCallArguments(b.input),
         ...(b.id ? { id: String(b.id) } : {}),
       }));
       if (hasContent) {
@@ -1302,19 +1411,39 @@ function buildFixtureResponse(
     if (content && Array.isArray(content.parts)) {
       const parts = content.parts as Array<Record<string, unknown>>;
 
-      // Audio inlineData parts take priority over text
-      const audioParts = parts.filter(
-        (p: Record<string, unknown>) =>
-          p.inlineData &&
-          typeof (p.inlineData as Record<string, unknown>).mimeType === "string" &&
-          ((p.inlineData as Record<string, unknown>).mimeType as string).startsWith("audio/"),
-      );
+      // Audio inlineData parts take priority over text. Key on the PRESENCE of
+      // `inlineData.data` rather than solely on the mimeType: an audio part can
+      // arrive with a missing or unexpected mimeType, and filtering strictly on
+      // an `audio/` prefix would then drop a part that genuinely carries audio
+      // bytes, producing an empty b64Json. A NON-audio mimeType (e.g. `image/`)
+      // still routes elsewhere, so image inlineData is not misclassified — only
+      // an explicit `audio/` prefix OR a missing/blank mimeType counts as audio.
+      const audioParts = parts.filter((p: Record<string, unknown>) => {
+        const inline = p.inlineData as Record<string, unknown> | undefined;
+        if (
+          inline === undefined ||
+          inline === null ||
+          typeof inline.data !== "string" ||
+          inline.data.length === 0
+        ) {
+          return false;
+        }
+        const mt = inline.mimeType;
+        if (typeof mt === "string" && mt.length > 0) {
+          return mt.startsWith("audio/");
+        }
+        // Missing/blank mimeType but data present → treat as audio.
+        return true;
+      });
       if (audioParts.length > 0) {
         const inlineData = audioParts[0].inlineData as Record<string, unknown>;
         return {
           audio: {
             b64Json: String(inlineData.data ?? ""),
-            contentType: String(inlineData.mimeType),
+            contentType:
+              typeof inlineData.mimeType === "string" && inlineData.mimeType.length > 0
+                ? inlineData.mimeType
+                : "audio/mpeg",
           },
         };
       }
@@ -1335,7 +1464,7 @@ function buildFixtureResponse(
           const fc = p.functionCall as Record<string, unknown>;
           return {
             name: String(fc.name),
-            arguments: typeof fc.args === "string" ? fc.args : JSON.stringify(fc.args),
+            arguments: toToolCallArguments(fc.args),
           };
         });
         if (hasContent) {
@@ -1386,7 +1515,7 @@ function buildFixtureResponse(
           const tu = b.toolUse as Record<string, unknown>;
           return {
             name: String(tu.name ?? ""),
-            arguments: typeof tu.input === "string" ? tu.input : JSON.stringify(tu.input),
+            arguments: toToolCallArguments(tu.input),
             ...(tu.toolUseId ? { id: String(tu.toolUseId) } : {}),
           };
         });
@@ -1421,8 +1550,13 @@ function buildFixtureResponse(
   ) {
     const msg = obj.message as Record<string, unknown>;
     const contentBlocks = msg.content as Array<Record<string, unknown>>;
-    const textBlock = contentBlocks.find((b) => b.type === "text" && typeof b.text === "string");
-    const hasContent = textBlock && typeof textBlock.text === "string" && textBlock.text.length > 0;
+    // Join ALL text blocks, not just the first — a multi-block Cohere response
+    // would otherwise be truncated to its leading segment.
+    const joinedText = contentBlocks
+      .filter((b) => b.type === "text" && typeof b.text === "string")
+      .map((b) => String(b.text ?? ""))
+      .join("");
+    const hasContent = joinedText.length > 0;
     const toolCallBlocks = contentBlocks.filter((b) => b.type === "tool_call");
 
     // Also check message-level tool_calls (Cohere v2 puts tool calls here, not in content blocks)
@@ -1440,11 +1574,11 @@ function buildFixtureResponse(
               ? JSON.stringify(b.parameters)
               : typeof (b.function as Record<string, unknown>)?.arguments === "string"
                 ? String((b.function as Record<string, unknown>).arguments)
-                : JSON.stringify((b.function as Record<string, unknown>)?.arguments),
+                : toToolCallArguments((b.function as Record<string, unknown>)?.arguments),
         ...(b.id ? { id: String(b.id) } : {}),
       }));
       if (hasContent) {
-        return { content: textBlock.text as string, toolCalls };
+        return { content: joinedText, toolCalls };
       }
       return { toolCalls };
     }
@@ -1460,18 +1594,23 @@ function buildFixtureResponse(
                 ? JSON.stringify(tc.parameters)
                 : typeof fn?.arguments === "string"
                   ? String(fn.arguments)
-                  : JSON.stringify(fn?.arguments),
+                  : toToolCallArguments(fn?.arguments),
           ...(tc.id ? { id: String(tc.id) } : {}),
         };
       });
       if (hasContent) {
-        return { content: textBlock.text as string, toolCalls };
+        return { content: joinedText, toolCalls };
       }
       return { toolCalls };
     }
     if (hasContent) {
-      return { content: textBlock.text as string };
+      return { content: joinedText };
     }
+    // Recognized Cohere v2 shape (finish_reason + message.content array) with
+    // no text and no tool calls. Own the empty turn here and return an
+    // empty-content fixture rather than falling through to the Ollama branch
+    // below, which would re-handle `message.content` and mis-route it.
+    return { content: "" };
   }
 
   // Ollama: { message: { content: "...", tool_calls: [...] } }
@@ -1487,8 +1626,7 @@ function buildFixtureResponse(
           const fn = tc.function as Record<string, unknown>;
           return {
             name: String(fn.name ?? ""),
-            arguments:
-              typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments),
+            arguments: toToolCallArguments(fn.arguments),
           };
         });
       if (hasOllamaContent) {
@@ -1509,11 +1647,21 @@ function buildFixtureResponse(
   }
 
   // Ollama /api/generate: { response: "...", done: true/false }
-  if (typeof obj.response === "string" && "done" in obj) {
+  // Narrowed: require `done` to be a boolean — Ollama always sends a boolean
+  // here, and gating merely on `"done" in obj` would capture unrelated payloads
+  // that happen to carry a `response` string and some other `done`-keyed value.
+  if (typeof obj.response === "string" && typeof obj.done === "boolean") {
     return { content: obj.response };
   }
 
-  // Fallback: unknown format — save as error
+  // Fallback: unknown format — save as error. Log the observed top-level shape
+  // so an unrecognized/new provider response is diagnosable instead of silently
+  // becoming an opaque error fixture.
+  logger?.warn(
+    `Could not detect response format from upstream (status=${status}) — saving as error fixture; top-level keys: [${Object.keys(
+      obj,
+    ).join(", ")}]`,
+  );
   return {
     error: {
       message: "Could not detect response format from upstream",

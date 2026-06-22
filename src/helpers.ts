@@ -310,7 +310,7 @@ export function isEmbeddingResponse(r: FixtureResponse): r is EmbeddingResponse 
 
 export function isImageResponse(r: FixtureResponse): r is ImageResponse {
   return (
-    ("image" in r && r.image != null) ||
+    ("image" in r && typeof r.image === "object" && r.image != null) ||
     ("images" in r && Array.isArray((r as ImageResponse).images))
   );
 }
