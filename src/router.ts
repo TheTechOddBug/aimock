@@ -1,4 +1,10 @@
-import type { ChatCompletionRequest, ChatMessage, ContentPart, Fixture } from "./types.js";
+import type {
+  ChatCompletionRequest,
+  ChatMessage,
+  ContentPart,
+  Fixture,
+  FixtureMatch,
+} from "./types.js";
 import {
   isImageResponse,
   isAudioResponse,
@@ -19,15 +25,23 @@ export function getLastMessageByRole(messages: ChatMessage[], role: string): Cha
  * Concatenate the text content of every `system` role message in order.
  * Hosts that build a system context from multiple sources (persona, agent
  * context entries, tool guidance) often emit several system messages in one
- * request; this joins them with newlines so a substring matcher sees the
- * whole context as one body.
+ * request; this joins SEPARATE system messages with newlines so a substring
+ * matcher sees the whole context as one body.
+ *
+ * Empty handling is symmetric with {@link getTextContent}: a system message
+ * with no extractable text (`null`) contributes nothing, while a message that
+ * extracts to an empty string is a present-but-empty body. We skip only the
+ * `null` (no-text) case so a genuinely empty system message does not inject a
+ * stray newline; this matches getTextContent treating "no text" and "empty
+ * text" consistently.
  */
 export function getSystemText(messages: ChatMessage[]): string {
   const parts: string[] = [];
   for (const m of messages) {
     if (m.role !== "system") continue;
     const text = getTextContent(m.content);
-    if (text) parts.push(text);
+    if (text === null) continue;
+    parts.push(text);
   }
   return parts.join("\n");
 }
@@ -36,12 +50,20 @@ export function getSystemText(messages: ChatMessage[]): string {
  * Extract the text content from a message's content field.
  * Handles both plain string content and array-of-parts content
  * (e.g. `[{type: "text", text: "..."}]` as sent by some SDKs).
+ *
+ * Multi-part text is joined with `""` (the parts form one logical body split
+ * across segments). Empty handling is symmetric with the string path: a string
+ * `""` returns `""`, and an array containing at least one text part whose
+ * combined text is empty likewise returns `""` (NOT `null`). `null` is reserved
+ * for "no text content at all" — null content, or an array with no text parts —
+ * so callers can distinguish "absent" from "present but empty" the same way for
+ * both content shapes.
  */
 export function getTextContent(content: string | ContentPart[] | null): string | null {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     const texts = content
-      .filter((p) => p.type === "text" && typeof p.text === "string" && p.text !== "")
+      .filter((p) => p.type === "text" && typeof p.text === "string")
       .map((p) => p.text as string);
     return texts.length > 0 ? texts.join("") : null;
   }
@@ -62,6 +84,107 @@ export function getTextContent(content: string | ContentPart[] | null): string |
 export interface MatchFixtureDiagnostic {
   fixture: Fixture | null;
   skippedBySequenceOrTurn: number;
+  /**
+   * `true` when the served fixture was selected by relaxed content-anchored
+   * matching even though its `turnIndex` is defined and does NOT equal the
+   * request's assistant-message count — i.e. the legacy strict turnIndex gate
+   * (now opt-in via `AIMOCK_STRICT_TURN_INDEX`) WOULD HAVE rejected it. Absent /
+   * falsy on canonical-position matches, non-turnIndexed matches, and misses.
+   * Additive optional field — existing handler destructures are unaffected.
+   */
+  turnIndexRelaxed?: boolean;
+  /**
+   * How the served fixture was selected: `"turnIndex"` when its `turnIndex`
+   * sits exactly at the current assistant count (canonical position),
+   * `"content"` otherwise (a non-turnIndexed match or a relaxed off-by-N
+   * match). Absent on misses. Additive optional field.
+   */
+  matchedBy?: "content" | "turnIndex";
+}
+
+/**
+ * Optional matcher tuning.
+ *
+ * `strictTurnIndex` restores the legacy behaviour where `turnIndex` must equal
+ * the request's assistant-message count exactly (a hard reject gate). It is set
+ * by the record path, where a miss proxies upstream to capture a fresh turn; an
+ * earlier-turn fixture must not shadow a longer request or the new turn would
+ * never be recorded. Replay (the default, `false`) treats `turnIndex` as a
+ * non-fatal disambiguator instead — see {@link selectByTurnIndex}.
+ */
+export interface MatchOptions {
+  strictTurnIndex?: boolean;
+  /**
+   * Optional sink for the one-shot relaxed-turnIndex divergence warning. Handlers
+   * pass their `defaults.logger`; the structural `{ warn }` shape avoids an
+   * import cycle with logger.ts and keeps the matcher decoupled. When omitted no
+   * warning is emitted (the diagnostic fields are still populated). The Logger's
+   * own level gate keeps a passing programmatic run (silent default) quiet.
+   */
+  logger?: { warn(...args: unknown[]): void };
+}
+
+/**
+ * Process-level opt-out: when `AIMOCK_STRICT_TURN_INDEX=1` (or `true`) is set,
+ * REPLAY selection restores the legacy hard turnIndex gate — a content-matching
+ * fixture whose `turnIndex` is defined and `!== assistantCount` is rejected,
+ * reproducing origin/main semantics. Follows the `AIMOCK_ALLOW_PRIVATE_URLS`
+ * precedent for parsing/precedence. Read per-call (not cached) so tests can flip
+ * it. Does NOT affect the record path, which is already strict regardless.
+ */
+function strictTurnIndexEnv(): boolean {
+  const v = process.env.AIMOCK_STRICT_TURN_INDEX;
+  return v === "1" || v === "true";
+}
+
+/**
+ * Process-level set of fixtures for which the relaxed-turnIndex divergence
+ * warning has already fired, so each divergent fixture warns at most ONCE per
+ * process (throttle). Keyed by the selected fixture's OBJECT IDENTITY: the
+ * `Fixture` references in the server's fixtures array are stable across replays
+ * (the array is held by reference and only fully replaced on a fixtures reset),
+ * so identity uniquely distinguishes divergent fixtures and warns each exactly
+ * once. A `WeakSet` was chosen over the previous `JSON.stringify(match)` key for
+ * two reasons: (1) stringifying the match DROPS `predicate` functions and
+ * serialises any RegExp matcher to `{}`, so two distinct fixtures differing only
+ * by a predicate/regex collided to one key and the second's warning was silently
+ * suppressed; and (2) a string `Set` only grows, accumulating an entry per
+ * divergent shape on a long-lived server, whereas a `WeakSet` auto-evicts when a
+ * fixture object is released (e.g. after a fixtures reset drops the references).
+ * `let` because `WeakSet` has no `.clear()`, so the test hook reassigns a fresh
+ * one.
+ */
+let warnedRelaxedFixtures = new WeakSet<Fixture>();
+
+/**
+ * Test-only hook to clear the throttle state between cases. Not part of the
+ * public contract. `WeakSet` has no `.clear()`, so reassign a fresh instance.
+ */
+export function _resetTurnIndexRelaxWarnings(): void {
+  warnedRelaxedFixtures = new WeakSet<Fixture>();
+}
+
+/**
+ * Build the {@link MatchOptions} a request handler must pass to
+ * {@link matchFixtureDiagnostic} / {@link matchFixture}, derived from whether
+ * the handler is about to record on a miss.
+ *
+ * EVERY record-capable handler (OpenAI chat, Anthropic messages, Responses,
+ * Gemini, Bedrock, Bedrock-Converse, Cohere, Ollama, …) must build its match
+ * options through THIS helper rather than hand-rolling `{ strictTurnIndex }` at
+ * the call site. Recording proxies upstream on a miss to capture a fresh turn;
+ * if `strictTurnIndex` is left false during recording, an earlier-turn fixture
+ * can content-shadow a longer request, the `if (!fixture)` record branch never
+ * fires, and the new turn is SILENTLY never recorded. Funnelling the decision
+ * through one helper makes that wiring impossible for a future handler to miss:
+ * pass `recording = true` whenever the handler's own record gate is satisfied
+ * (i.e. it will call `proxyAndRecord` on a miss), `false` otherwise.
+ */
+export function recordMatchOptions(
+  recording: boolean,
+  logger?: { warn(...args: unknown[]): void },
+): MatchOptions {
+  return { strictTurnIndex: recording, logger };
 }
 
 /**
@@ -77,12 +200,27 @@ export function matchFixtureDiagnostic(
   req: ChatCompletionRequest,
   matchCounts?: Map<Fixture, number>,
   requestTransform?: (req: ChatCompletionRequest) => ChatCompletionRequest,
+  options?: MatchOptions,
 ): MatchFixtureDiagnostic {
   // Apply transform once before matching — used for stripping dynamic data
   const effective = requestTransform ? requestTransform(req) : req;
   const useExactMatch = !!requestTransform;
+  // In record mode the server proxies to the upstream on a miss, so a fixture
+  // already captured for an EARLIER turn must NOT shadow a longer (later-turn)
+  // request — otherwise the new turn would never be proxied and recorded.
+  // There turnIndex stays a strict hard gate. Replay (the default) instead
+  // treats turnIndex as a non-fatal disambiguator so a canonical multi-bubble
+  // run isn't falsely rejected for an off-by-N assistant count.
+  // Strict turnIndex is in force when the record path requests it OR the
+  // process-level AIMOCK_STRICT_TURN_INDEX opt-out is set (which restores the
+  // legacy hard gate for replay too). Record mode passes `true` explicitly; the
+  // env only matters when the caller left it `false`/unset (replay).
+  const strictTurnIndex = (options?.strictTurnIndex ?? false) || strictTurnIndexEnv();
 
   let skippedBySequenceOrTurn = 0;
+  // Every fixture whose content / shape predicates (and sequenceIndex gate)
+  // pass. turnIndex is applied afterwards as a non-fatal disambiguator.
+  const contentMatches: Fixture[] = [];
 
   for (const fixture of fixtures) {
     const { match } = fixture;
@@ -165,31 +303,38 @@ export function matchFixtureDiagnostic(
     // name AND a default activity list whose positions in the serialised
     // context JSON aren't stable).
     if (match.systemMessage !== undefined) {
-      const text = getSystemText(effective.messages);
-      if (!text) continue;
       const sm = match.systemMessage;
-      if (Array.isArray(sm)) {
-        // Empty array is treated as "no constraint" → effectively matches
-        // unconditionally. Validation rejects this at load time for JSON
-        // fixtures; programmatic callers that pass [] get the same
-        // permissive behaviour as not setting systemMessage at all.
-        let allPresent = true;
-        for (const needle of sm) {
-          if (!text.includes(needle)) {
-            allPresent = false;
-            break;
-          }
-        }
-        if (!allPresent) continue;
-      } else if (typeof sm === "string") {
-        if (useExactMatch) {
-          if (text !== sm) continue;
-        } else {
-          if (!text.includes(sm)) continue;
-        }
+      // Empty array is treated as "no constraint" → matches unconditionally,
+      // INCLUDING requests with no system text at all. This is the documented
+      // contract (same permissive behaviour as not setting systemMessage), so
+      // it must be honored BEFORE the no-system-text guard below — otherwise a
+      // request without a system message would be wrongly skipped. Validation
+      // rejects [] at load time for JSON fixtures; programmatic callers that
+      // pass [] get this permissive behaviour.
+      if (Array.isArray(sm) && sm.length === 0) {
+        // no constraint — fall through to the next predicate
       } else {
-        sm.lastIndex = 0;
-        if (!sm.test(text)) continue;
+        const text = getSystemText(effective.messages);
+        if (!text) continue;
+        if (Array.isArray(sm)) {
+          let allPresent = true;
+          for (const needle of sm) {
+            if (!text.includes(needle)) {
+              allPresent = false;
+              break;
+            }
+          }
+          if (!allPresent) continue;
+        } else if (typeof sm === "string") {
+          if (useExactMatch) {
+            if (text !== sm) continue;
+          } else {
+            if (!text.includes(sm)) continue;
+          }
+        } else {
+          sm.lastIndex = 0;
+          if (!sm.test(text)) continue;
+        }
       }
     }
 
@@ -257,33 +402,231 @@ export function matchFixtureDiagnostic(
       if (hasTool !== match.hasToolResult) continue;
     }
 
-    // At this point every SHAPE predicate above has passed. The sequenceIndex
-    // and turnIndex gates below reject based on per-test count / turn STATE,
-    // not request shape — a fixture that fails only these is a "candidate that
-    // was skipped by sequence/turn state", which we count separately so callers
-    // can disambiguate the strict-mode 503 message.
-    let skippedByState = false;
-
-    // sequenceIndex — check against the fixture's match count
+    // At this point every SHAPE / CONTENT predicate above has passed, so this
+    // fixture is a genuine CONTENT match for the request. The sequenceIndex and
+    // turnIndex constraints below are POSITION state, not request shape.
+    //
+    // sequenceIndex remains a hard, stateful gate: it consumes sequenced
+    // siblings one call at a time (and an exhausted index intentionally falls
+    // through to a later fixture). A fixture that matched the shape but fails
+    // ONLY the sequenceIndex gate is a "candidate skipped by sequence/turn
+    // state", counted separately so callers can disambiguate the strict-mode
+    // 503 message.
     if (match.sequenceIndex !== undefined && matchCounts !== undefined) {
       const count = matchCounts.get(fixture) ?? 0;
-      if (count !== match.sequenceIndex) skippedByState = true;
+      if (count !== match.sequenceIndex) {
+        skippedBySequenceOrTurn++;
+        continue;
+      }
     }
 
-    if (!skippedByState && match.turnIndex !== undefined) {
+    // turnIndex is normally NOT a hard gate (replay). Multi-step agents emit
+    // several assistant bubbles per logical turn, so a canonical run's assistant
+    // count routinely differs from a fixture's hardcoded turnIndex even when the
+    // request content matches exactly. Rejecting a uniquely content-matching
+    // fixture on absolute position produced false "empty assistant response"
+    // misses. Instead we collect every content match and use turnIndex only as a
+    // non-fatal DISAMBIGUATOR to choose AMONG several content-matching fixtures
+    // (see selectByTurnIndex below). Content that does not match any fixture
+    // still matches nothing — only the position gate is relaxed.
+    //
+    // Under strictTurnIndex (record mode) turnIndex stays a hard, exact gate so
+    // an earlier-turn capture can't shadow a longer request; the miss then
+    // proxies upstream and records the new turn.
+    if (strictTurnIndex && match.turnIndex !== undefined) {
       const assistantCount = effective.messages.filter((m) => m.role === "assistant").length;
-      if (assistantCount !== match.turnIndex) skippedByState = true;
+      if (assistantCount !== match.turnIndex) {
+        skippedBySequenceOrTurn++;
+        continue;
+      }
     }
 
-    if (skippedByState) {
-      skippedBySequenceOrTurn++;
-      continue;
-    }
-
-    return { fixture, skippedBySequenceOrTurn };
+    contentMatches.push(fixture);
   }
 
-  return { fixture: null, skippedBySequenceOrTurn };
+  if (contentMatches.length === 0) {
+    return { fixture: null, skippedBySequenceOrTurn };
+  }
+
+  const assistantCount = effective.messages.filter((m) => m.role === "assistant").length;
+  const { fixture: selected, byUniquePosition } = selectByTurnIndex(contentMatches, assistantCount);
+
+  // Divergence predicate: the served fixture carries a turnIndex that does NOT
+  // sit at the current assistant position. Under strict matching this fixture
+  // would have been rejected at the gate above, so serving it here is the (rare,
+  // off-by-N) relaxed behaviour change PR #276 introduced. Computed from values
+  // already in hand — no second matching pass.
+  const selectedTurn = selected.match.turnIndex;
+  const turnIndexRelaxed = selectedTurn !== undefined && selectedTurn !== assistantCount;
+  // `matchedBy` reports "turnIndex" ONLY when the selection was genuinely decided
+  // by a UNIQUE positional criterion (a single candidate whose turnIndex sits
+  // exactly at the current assistant count). A canonical-position fixture that
+  // tied with another at-position candidate, or that lost the exact-turn
+  // tie-break to an earlier fallback, was decided by REGISTRATION ORDER, not by
+  // position — those are "content". `selectByTurnIndex` reports which it was.
+  const matchedBy: "content" | "turnIndex" = byUniquePosition ? "turnIndex" : "content";
+
+  if (turnIndexRelaxed && options?.logger) {
+    // Throttle: warn at most once per divergent fixture per process. Keyed by
+    // the fixture's OBJECT IDENTITY so distinct fixtures whose match serialises
+    // identically (predicate/regex collisions) each warn, and entries auto-evict
+    // when the fixture is released (see warnedRelaxedFixtures above).
+    if (!warnedRelaxedFixtures.has(selected)) {
+      warnedRelaxedFixtures.add(selected);
+      // Human-readable description for the message only (NOT the throttle key,
+      // which is the fixture's object identity). `JSON.stringify(match)` is
+      // unfit here: it DROPS `predicate` functions entirely and collapses any
+      // RegExp matcher to `{}`, so a predicate/regex fixture's warning read
+      // "served fixture {}" / "{"userMessage":{}}". `describeMatch` instead
+      // summarizes the present matcher KEYS (annotating predicate/regex values)
+      // so the warned fixture is identifiable.
+      const idx = fixtures.indexOf(selected);
+      const desc = describeMatch(selected.match, idx);
+      options.logger.warn(
+        `turnIndex relaxed: served fixture ${desc} at assistantCount=${assistantCount} ` +
+          `(scripted turnIndex=${selectedTurn}); set AIMOCK_STRICT_TURN_INDEX=1 to restore strict matching`,
+      );
+    }
+  }
+
+  return { fixture: selected, skippedBySequenceOrTurn, turnIndexRelaxed, matchedBy };
+}
+
+/**
+ * Build a stable, human-readable identifier for a fixture's match shape for the
+ * relaxed-turnIndex warning. The previous `JSON.stringify(match)` was unfit: it
+ * DROPS `predicate` functions (non-serialisable) and serialises any RegExp
+ * matcher to `{}`, so a predicate- or regex-gated fixture's warning collapsed to
+ * an uninformative "served fixture {}" / `{"userMessage":{}}` blob.
+ *
+ * Instead we list the PRESENT matcher keys in declaration order, annotating each
+ * by VALUE KIND so predicates and regexes survive: `predicate(fn)`,
+ * `userMessage(regex)`, `userMessage("hello")`, `turnIndex=0`, etc. The
+ * fixture's array `index` (when known, i.e. `>= 0`) is prefixed as the stable
+ * positional identifier — the `Fixture` type carries no `id`/`name`, so its
+ * registration index is the only stable handle. String/number values are shown
+ * inline (truncated) so a content match remains recognisable; the whole string
+ * is capped to keep the log line bounded.
+ */
+function describeMatch(match: FixtureMatch, index: number): string {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(match)) {
+    if (value === undefined) continue;
+    if (typeof value === "function") {
+      parts.push(`${key}(fn)`);
+    } else if (value instanceof RegExp) {
+      parts.push(`${key}(${value})`);
+    } else if (typeof value === "string") {
+      const v = value.length > 40 ? `${value.slice(0, 40)}…` : value;
+      parts.push(`${key}(${JSON.stringify(v)})`);
+    } else if (Array.isArray(value)) {
+      parts.push(`${key}(${value.length} item${value.length === 1 ? "" : "s"})`);
+    } else {
+      parts.push(`${key}=${String(value)}`);
+    }
+  }
+  const keys = parts.length > 0 ? parts.join(", ") : "no matchers";
+  const prefix = index >= 0 ? `#${index} ` : "";
+  return `${prefix}{ ${keys} }`.slice(0, 160);
+}
+
+/**
+ * Choose one fixture from a set that all CONTENT-matched the same request,
+ * using `turnIndex` purely as a position disambiguator (never as a reject
+ * gate).
+ *
+ * The selection rule is applied UNIFORMLY regardless of candidate count (a
+ * single candidate is NOT special-cased), so the same request never flips its
+ * answer just because an unrelated content-matching fixture was registered.
+ * Within every tier ties are broken by REGISTRATION ORDER — the
+ * earliest-registered eligible candidate wins — preserving the historical
+ * greedy "first matching fixture wins" contract.
+ *
+ *  1. Prefer the turnIndexed candidate whose `turnIndex` is closest to
+ *     `assistantCount` WITHOUT exceeding it (the highest `turnIndex <=
+ *     assistantCount`). A behind-the-count scripted turn (turnIndex <
+ *     assistantCount) beats a plain fallback — an explicit position is a
+ *     stronger signal than an unpositioned default. A negative `turnIndex` such
+ *     as -1 is a valid at/behind position (the seed is `-Infinity`, never a `-1`
+ *     sentinel that would mis-skip it). Earlier registration breaks ties among
+ *     equal turnIndexes.
+ *  2. EXACT-turn tie-break: when the best at/behind scripted turn sits at the
+ *     EXACT current position (`turnIndex === assistantCount`) a plain fallback
+ *     also answers "right now", so the two are equally eligible and REGISTRATION
+ *     ORDER decides — a later-registered `turnIndex:0` does NOT override an
+ *     earlier-registered fallback, and vice-versa.
+ *  3. Otherwise every turnIndexed candidate is still AHEAD of the conversation.
+ *     An explicit future turn must NOT answer an earlier point, so a plain
+ *     fallback (eligible at every position) is the better answer — applied
+ *     uniformly, INCLUDING when the fallback is the sole partner of a single
+ *     future-turn fixture (the single/multi asymmetry this fixes).
+ *  4. Otherwise (pure script, every candidate turnIndexed and all ahead) the
+ *     script genuinely has no earlier answer, so serve the lowest `turnIndex`
+ *     candidate — the false-red-kill for a lone scripted turn whose run has
+ *     FEWER assistant bubbles than its `turnIndex`; registration order breaks
+ *     ties.
+ *
+ * A future-turn fixture therefore NEVER answers an earlier-point request when an
+ * eligible alternative (a fallback, or an at/behind scripted turn) exists — the
+ * future-turn guard is enforced uniformly for single and multiple candidates.
+ *
+ * Returns the selected fixture alongside `byUniquePosition`: `true` ONLY when the
+ * choice was decided by a UNIQUE positional criterion — the served fixture's
+ * `turnIndex` sits EXACTLY at `assistantCount`, no earlier fallback overrode it
+ * (tier 2), and no other candidate shared that exact position (so registration
+ * order did not break a tie). `matchFixtureDiagnostic` maps this to
+ * `matchedBy === "turnIndex"`; every other selection path (tie-break,
+ * registration order, behind/ahead scripted turn, fallback) is `"content"`.
+ */
+function selectByTurnIndex(
+  candidates: Fixture[],
+  assistantCount: number,
+): { fixture: Fixture; byUniquePosition: boolean } {
+  // The first non-turnIndexed candidate is the registration-order-first plain
+  // fallback (eligible at every position). Tracked by index so the exact-turn
+  // tie-break can compare registration order against the chosen scripted turn.
+  const fallbackIdx = candidates.findIndex((f) => f.match.turnIndex === undefined);
+
+  // Tier 1: closest scripted turn at/before the current count. Strict `>`
+  // preserves registration order on equal turnIndexes; `-Infinity` seed so a
+  // negative turnIndex is a legitimate at/behind candidate, not a sentinel skip.
+  let bestIdx = -1;
+  let bestTurn = -Infinity;
+  for (let i = 0; i < candidates.length; i++) {
+    const t = candidates[i].match.turnIndex;
+    if (t === undefined) continue;
+    if (t <= assistantCount && t > bestTurn) {
+      bestIdx = i;
+      bestTurn = t;
+    }
+  }
+
+  if (bestIdx !== -1) {
+    // Tier 2: exact-turn tie with a fallback → earlier registration wins. A
+    // fallback won the tie, so position did NOT uniquely decide → content.
+    if (bestTurn === assistantCount && fallbackIdx !== -1 && fallbackIdx < bestIdx) {
+      return { fixture: candidates[fallbackIdx], byUniquePosition: false };
+    }
+    // A UNIQUE positional decision requires the chosen turn to sit EXACTLY at
+    // the current count AND to be the only candidate at that exact position —
+    // otherwise registration order, not position, broke the tie.
+    const atExactPosition =
+      bestTurn === assistantCount &&
+      candidates.filter((f) => f.match.turnIndex === assistantCount).length === 1;
+    return { fixture: candidates[bestIdx], byUniquePosition: atExactPosition };
+  }
+
+  // Tier 3: every scripted turn is ahead. A plain fallback answers this earlier
+  // point; first-registered fallback wins.
+  if (fallbackIdx !== -1) return { fixture: candidates[fallbackIdx], byUniquePosition: false };
+
+  // Tier 4: pure script, all turnIndexed and all ahead. Serve the lowest
+  // scripted turn; registration order breaks ties (first of the lowest wins).
+  let lowest = candidates[0];
+  for (const f of candidates) {
+    if ((f.match.turnIndex as number) < (lowest.match.turnIndex as number)) lowest = f;
+  }
+  return { fixture: lowest, byUniquePosition: false };
 }
 
 /**
@@ -296,6 +639,7 @@ export function matchFixture(
   req: ChatCompletionRequest,
   matchCounts?: Map<Fixture, number>,
   requestTransform?: (req: ChatCompletionRequest) => ChatCompletionRequest,
+  options?: MatchOptions,
 ): Fixture | null {
-  return matchFixtureDiagnostic(fixtures, req, matchCounts, requestTransform).fixture;
+  return matchFixtureDiagnostic(fixtures, req, matchCounts, requestTransform, options).fixture;
 }
