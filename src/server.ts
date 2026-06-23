@@ -9,7 +9,7 @@ import type {
   RecordProviderKey,
 } from "./types.js";
 import { Journal } from "./journal.js";
-import { matchFixtureDiagnostic } from "./router.js";
+import { matchFixtureDiagnostic, recordMatchOptions } from "./router.js";
 import { validateFixtures, entryToFixture } from "./fixture-loader.js";
 import { writeSSEStream, writeErrorResponse } from "./sse-writer.js";
 import { createInterruptionSignal } from "./interruption.js";
@@ -564,6 +564,11 @@ async function handleCompletions(
     body,
     journal.getFixtureMatchCountsForTest(testId),
     defaults.requestTransform,
+    // In record mode a miss proxies upstream to capture a fresh turn, so an
+    // earlier-turn capture must not shadow a longer request via the relaxed
+    // turnIndex disambiguator — keep turnIndex a strict gate while recording.
+    // This handler's record gate (below) is `defaults.record && providerKey`.
+    recordMatchOptions(!!(defaults.record && providerKey), defaults.logger),
   );
 
   if (fixture) {

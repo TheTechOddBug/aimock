@@ -40,7 +40,7 @@ import {
   strictNoMatchMessage,
   strictNoMatchLogLine,
 } from "./helpers.js";
-import { matchFixtureDiagnostic } from "./router.js";
+import { matchFixtureDiagnostic, recordMatchOptions } from "./router.js";
 import { writeErrorResponse } from "./sse-writer.js";
 import { writeNDJSONStream } from "./ndjson-writer.js";
 import { createInterruptionSignal } from "./interruption.js";
@@ -585,6 +585,10 @@ export async function handleOllama(
     completionReq,
     journal.getFixtureMatchCountsForTest(testId),
     defaults.requestTransform,
+    // Record mode proxies on a miss to capture a fresh turn (see record gate
+    // below), so keep turnIndex strict to prevent an earlier-turn fixture from
+    // shadowing a longer request and skipping the new turn's recording.
+    recordMatchOptions(!!defaults.record, defaults.logger),
   );
 
   if (fixture) {
@@ -969,6 +973,10 @@ export async function handleOllamaGenerate(
     completionReq,
     journal.getFixtureMatchCountsForTest(testId),
     defaults.requestTransform,
+    // Record mode proxies on a miss to capture a fresh turn (see record gate
+    // below), so keep turnIndex strict to prevent an earlier-turn fixture from
+    // shadowing a longer request and skipping the new turn's recording.
+    recordMatchOptions(!!defaults.record, defaults.logger),
   );
 
   if (fixture) {
@@ -1304,6 +1312,10 @@ export async function handleOllamaEmbeddings(
     syntheticReq,
     journal.getFixtureMatchCountsForTest(testId),
     defaults.requestTransform,
+    // Record mode proxies on a miss to capture a fresh turn (see record gate
+    // below), so keep turnIndex strict to prevent an earlier-turn fixture from
+    // shadowing a longer request and skipping the new turn's recording.
+    recordMatchOptions(!!defaults.record, defaults.logger),
   );
 
   if (fixture) {
