@@ -20,10 +20,66 @@ import type { Logger } from "./logger.js";
 import { collapseStreamingResponse, capturedRedactedData } from "./stream-collapse.js";
 import { writeErrorResponse } from "./sse-writer.js";
 import { resolveUpstreamUrl } from "./url.js";
-import { getTestId, slugifyTestId } from "./helpers.js";
+import { getTestId, slugifyTestId, slugifyContext } from "./helpers.js";
 import { DEFAULT_TEST_ID } from "./constants.js";
 
 /** Headers to strip when proxying — hop-by-hop (RFC 2616 §13.5.1) + client-set. */
+/**
+ * Default ceiling (bytes) for the in-memory proxy-path buffer. Chosen well
+ * under V8's ~512 MiB max string length so `rawBuffer.toString()` /
+ * stream-collapse never throws `RangeError: Invalid string length`, and so a
+ * single huge proxied response cannot spike the heap unbounded. Overridable
+ * via `RecordConfig.maxProxyBufferBytes` / `--max-proxy-buffer-bytes`.
+ */
+export const DEFAULT_MAX_PROXY_BUFFER_BYTES = 64 * 1024 * 1024; // 64 MiB
+
+/**
+ * Default ceiling for the number of SSE/NDJSON/EventStream frames whose
+ * per-frame state (`frameTimestamps`, parse buffers) aimock retains for a
+ * single proxied response. Frame state is count-indexed, not byte-sized, so a
+ * long-lived / never-ending stream accumulates `frameTimestamps` entries (and,
+ * if a frame never completes, parse-buffer bytes) UNBOUNDED even when the byte
+ * cap is generous — observed as multi-GB heap growth over many hours from a few
+ * long nested-sub-agent streams. Tripping truncation on EITHER bytes OR frame
+ * count bounds both. 5M frames is generous for any real response (a normal
+ * completion is hundreds-to-thousands of frames) while still bounding a runaway
+ * stream to ~tens of MB of frame state. Overridable via
+ * `RecordConfig.maxProxyBufferFrames` / `--max-proxy-buffer-frames`.
+ */
+export const DEFAULT_MAX_PROXY_BUFFER_FRAMES = 5_000_000;
+
+/**
+ * Absolute hard ceiling (bytes) for any in-memory proxy buffer, independent of
+ * the configurable `maxProxyBufferBytes`. V8's maximum STRING length on 64-bit
+ * is 2^29 - 1 (~512 MiB of UTF-16 code units), and the proxy buffer is
+ * eventually stringified via `rawBuffer.toString()` for collapse/relay — so the
+ * BYTE buffer must stay safely under that string limit or the toString throws
+ * `RangeError: Invalid string length`. 256 MiB of bytes is well under the
+ * ~512 MiB string-length boundary (these are different units — bytes vs UTF-16
+ * code units — but 256 MiB of bytes can never decode to more than 256 Mi code
+ * units, comfortably below 2^29 - 1). Used to clamp the configurable cap AND to
+ * bound the non-progressive relay buffer that must be retained past a cap trip.
+ */
+export const PROXY_BUFFER_HARD_CEILING = 256 * 1024 * 1024; // 256 MiB
+
+/**
+ * Test-only override of the effective hard ceiling. Lets the proxy-buffer
+ * enforcement suite exercise the >hard-ceiling fail-loud path with a small
+ * body instead of streaming 256 MiB. `undefined` (the default) uses the real
+ * `PROXY_BUFFER_HARD_CEILING`. NEVER set from production code.
+ */
+let proxyBufferHardCeilingOverride: number | undefined;
+
+/** @internal test-only — see `proxyBufferHardCeilingOverride`. */
+export function setProxyBufferHardCeilingForTests(value: number | undefined): void {
+  proxyBufferHardCeilingOverride = value;
+}
+
+/** Effective hard ceiling, honoring any active test-only override. */
+function effectiveHardCeiling(): number {
+  return proxyBufferHardCeilingOverride ?? PROXY_BUFFER_HARD_CEILING;
+}
+
 const STRIP_HEADERS = new Set([
   // Hop-by-hop (RFC 2616 §13.5.1)
   "connection",
@@ -146,6 +202,22 @@ export function sanitizeHeaderValue(value: string): string {
 }
 
 /**
+ * Resolve a `content-type` header value to a single string. Node's
+ * `http.IncomingHttpHeaders` types `content-type` as `string | string[]`, and
+ * a constructed/proxied header object CAN carry an array (e.g. duplicated
+ * header lines surfaced by some HTTP stacks). `join(", ")`-ing such an array
+ * produces a malformed `Content-Type: application/json, text/html` value — pick
+ * the FIRST element instead, which is the value the client should act on.
+ * Returns `""` when the header is absent or an empty array.
+ */
+export function pickContentType(contentType: string | string[] | undefined): string {
+  if (Array.isArray(contentType)) {
+    return contentType.length > 0 ? contentType[0] : "";
+  }
+  return contentType ?? "";
+}
+
+/**
  * Write a built fixture to disk (snapshot vs. timestamp file layout) and, when
  * the match is non-empty, register it in the in-memory cache so subsequent
  * identical requests match. Extracted from `proxyAndRecord` so the fal
@@ -206,8 +278,15 @@ export function persistFixture(opts: {
   } else {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const timestampFile = `${providerKey}-${timestamp}-${crypto.randomUUID().slice(0, 8)}.json`;
-    filepath = fixture.match.context
-      ? path.join(fixturePath, fixture.match.context, timestampFile)
+    // The context becomes a directory segment, but it originates from the
+    // attacker-controllable `X-AIMock-Context` header — slugify it (mirroring
+    // testId above) so `../`, separators, and absolute prefixes can't escape
+    // the fixtures base dir. An empty slug → no context segment.
+    const contextSegment = fixture.match.context
+      ? slugifyContext(fixture.match.context)
+      : undefined;
+    filepath = contextSegment
+      ? path.join(fixturePath, contextSegment, timestampFile)
       : path.join(fixturePath, timestampFile);
   }
 
@@ -222,7 +301,14 @@ export function persistFixture(opts: {
     // Auth headers are forwarded to upstream but excluded from saved fixtures.
     // The persisted fixture is always the real upstream response, even when
     // chaos later mutates the relay; replay must see what upstream said.
-    let fileContent: { fixtures: unknown[]; _warning?: string };
+    // Warnings are persisted as a `_warnings` JSON array (authoritative,
+    // non-fragmenting) AND a legacy "; "-joined `_warning` string (kept for
+    // backward-compatible readers). The array is the source of truth on a
+    // snapshot merge: a single warning that itself contains "; " (e.g.
+    // "captured A; then B") would be fragmented into two bogus entries if the
+    // joined string were split back apart on merge. Carrying the array forward
+    // avoids that round-trip fragmentation entirely.
+    let fileContent: { fixtures: unknown[]; _warning?: string; _warnings?: string[] };
     if (mergeExisting && fs.existsSync(filepath)) {
       try {
         const existing = JSON.parse(fs.readFileSync(filepath, "utf-8"));
@@ -238,12 +324,18 @@ export function persistFixture(opts: {
           );
         }
         fileContent = { fixtures: [...(existingFixtures ?? []), fixture] };
-        // Carry an existing _warning forward — a later clean capture merging
-        // into the same snapshot file must not erase an earlier capture's
-        // warning (e.g. an over-cap b64 omission). Split the "; "-joined
-        // string back into its elements first so a re-emitted warning dedupes
-        // against them ("A; B" + "A" must stay "A; B", not "A; B; A").
-        if (typeof existing._warning === "string" && existing._warning) {
+        // Carry existing warnings forward — a later clean capture merging into
+        // the same snapshot file must not erase an earlier capture's warning
+        // (e.g. an over-cap b64 omission). Prefer the new `_warnings` array;
+        // fall back to the legacy "; "-joined `_warning` string for files
+        // written before this format change. The legacy split can still
+        // fragment an embedded-"; " warning in a pre-existing file, but new
+        // captures no longer create that hazard.
+        if (Array.isArray(existing._warnings)) {
+          fileWarnings.unshift(
+            ...(existing._warnings as unknown[]).filter((w): w is string => typeof w === "string"),
+          );
+        } else if (typeof existing._warning === "string" && existing._warning) {
           fileWarnings.unshift(...existing._warning.split("; "));
         }
       } catch (mergeErr) {
@@ -256,8 +348,11 @@ export function persistFixture(opts: {
     }
     if (fileWarnings.length > 0) {
       // Exact-duplicate warnings (e.g. repeated over-cap captures merging into
-      // the same snapshot file) collapse to one entry.
-      fileContent._warning = [...new Set(fileWarnings)].join("; ");
+      // the same snapshot file) collapse to one entry. Emit BOTH the
+      // authoritative array and the legacy joined string.
+      const dedupedWarnings = [...new Set(fileWarnings)];
+      fileContent._warnings = dedupedWarnings;
+      fileContent._warning = dedupedWarnings.join("; ");
     }
     // Atomic write: write to temp file then rename to avoid read-modify-write
     // races. Keep synchronous — for streamed responses the HTTP reply is
@@ -343,6 +438,10 @@ export async function proxyAndRecord(
   let upstreamHeaders: http.IncomingHttpHeaders;
   let upstreamBody: string;
   let rawBuffer: Buffer;
+  let bufferTruncated = false;
+  let truncationCap: "byte" | "frame" | undefined;
+  let totalBytes = 0;
+  let hardCeilingExceeded = false;
 
   // Track whether we streamed SSE progressively to the client; if so,
   // skip the final res.writeHead/res.end relay at the bottom of this fn.
@@ -350,6 +449,8 @@ export async function proxyAndRecord(
   let clientDisconnected = false;
   let frameTimestamps: number[] = [];
   let streamStartTime = 0;
+  const maxProxyBufferBytes = clampMaxBufferBytes(record.maxProxyBufferBytes);
+  const maxProxyBufferFrames = clampMaxBufferFrames(record.maxProxyBufferFrames);
   try {
     const result = await makeUpstreamRequest(
       target,
@@ -359,6 +460,8 @@ export async function proxyAndRecord(
       req.method,
       defaults.logger,
       { upstreamTimeoutMs: record.upstreamTimeoutMs, bodyTimeoutMs: record.bodyTimeoutMs },
+      maxProxyBufferBytes,
+      maxProxyBufferFrames,
     );
     upstreamStatus = result.status;
     upstreamHeaders = result.headers;
@@ -368,6 +471,10 @@ export async function proxyAndRecord(
     clientDisconnected = result.clientDisconnected;
     frameTimestamps = result.frameTimestamps;
     streamStartTime = result.streamStartTime;
+    bufferTruncated = result.bufferTruncated;
+    truncationCap = result.truncationCap;
+    totalBytes = result.totalBytes;
+    hardCeilingExceeded = result.hardCeilingExceeded;
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown proxy error";
     defaults.logger.error(`Proxy request failed: ${msg}`);
@@ -379,19 +486,78 @@ export async function proxyAndRecord(
         }),
       );
     } else {
-      // SSE headers already sent — gracefully close the connection
+      // Streaming headers (200) are already on the wire, so we cannot change the
+      // status — but we MUST NOT call res.end(), which the client reads as a
+      // clean EOF and treats as a complete (silently truncated) response.
+      // Destroy the connection instead so the client sees an aborted stream and
+      // can surface the upstream failure rather than acting on partial data.
+      res.destroy();
+    }
+    return "relayed";
+  }
+
+  // Buffer cap tripped: skip collapse + recording (the in-memory buffer can't
+  // be safely/faithfully journaled), but ALWAYS deliver a faithful response to
+  // the client. The cap means "don't journal", not "don't answer".
+  //  - PROGRESSIVE stream: the bytes were already teed to the client live, so
+  //    nothing more to write — just end if still open.
+  //  - NON-progressive response, UNDER the hard ceiling: makeUpstreamRequest
+  //    kept the FULL body (bounded by PROXY_BUFFER_HARD_CEILING) precisely so we
+  //    can relay it here. Relay the real body so a large single-shot JSON
+  //    (embeddings / fal / image-b64) reaches the client intact — but NORMALIZE
+  //    the status (success→200 / error→502) exactly like every other relay path
+  //    so upstream provider details don't leak through this branch alone.
+  //  - NON-progressive response, OVER the hard ceiling: the retained buffer is
+  //    PARTIAL (we stopped buffering at the ceiling and there is no live tee),
+  //    so relaying it would present a truncated body as success. FAIL LOUD with
+  //    a 502 instead — never deliver a silently-truncated body as 2xx.
+  if (bufferTruncated) {
+    const capDetail =
+      truncationCap === "frame"
+        ? `the ${maxProxyBufferFrames}-frame cap`
+        : `the ${maxProxyBufferBytes}-byte cap`;
+    if (!streamedToClient && hardCeilingExceeded && !res.headersSent) {
+      const ceilingMiB = Math.round(PROXY_BUFFER_HARD_CEILING / (1024 * 1024));
+      defaults.logger.error(
+        `Upstream response exceeded the ${ceilingMiB} MiB proxy hard ceiling (saw ${totalBytes} bytes) on a non-progressive body — cannot relay the full body and refusing to relay a truncated one; returning 502`,
+      );
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: {
+            message: `Upstream response exceeds ${ceilingMiB}MiB proxy ceiling`,
+            type: "proxy_error",
+          },
+        }),
+      );
+      return "relayed";
+    }
+    defaults.logger.warn(
+      `Upstream response exceeded ${capDetail} (saw ${totalBytes} bytes) — relayed to client, recording skipped`,
+    );
+    if (!streamedToClient && !res.headersSent) {
+      // Normalize the relayed status like the under-cap relay paths
+      // (success→200, error→502) so this branch does not leak a raw upstream
+      // 429/503/etc. The full real body (under the hard ceiling) is relayed.
+      const clientStatus = upstreamStatus >= 200 && upstreamStatus < 300 ? 200 : 502;
+      const relayHeaders: Record<string, string> = {};
+      const ct = upstreamHeaders["content-type"];
+      const ctStr = Array.isArray(ct) ? ct.join(", ") : (ct ?? "");
+      relayHeaders["Content-Type"] = ctStr || "application/json";
+      res.writeHead(clientStatus, relayHeaders);
+      res.end(rawBuffer);
+    } else if (!res.writableEnded) {
       res.end();
     }
     return "relayed";
   }
 
   // Detect streaming response and collapse if necessary.
-  // NOTE: collapse buffers the entire upstream body in memory. Fine for
-  // current chat-completions traffic (responses are small), but revisit if
-  // this path ever proxies long-lived or large streams — both the buffer
-  // here and the hook below receive the full payload.
+  // NOTE: collapse buffers the upstream body in memory up to maxProxyBufferBytes
+  // (see makeUpstreamRequest). Over-cap responses short-circuit above, so the
+  // buffer reaching here is bounded and safe to stringify/collapse.
   const contentType = upstreamHeaders["content-type"];
-  const ctString = Array.isArray(contentType) ? contentType.join(", ") : (contentType ?? "");
+  const ctString = pickContentType(contentType);
   const isBinaryStream = ctString.toLowerCase().includes("application/vnd.amazon.eventstream");
   const collapsed = collapseStreamingResponse(
     ctString,
@@ -402,9 +568,15 @@ export async function proxyAndRecord(
 
   let fixtureResponse: FixtureResponse;
 
-  // TTS response — binary audio, not JSON
+  // TTS response — binary audio, not JSON. Classify on the audio content-type
+  // when upstream succeeded (2xx), regardless of body length: a zero-length
+  // audio body is still an audio response (empty audio), NOT an opaque
+  // proxy_error — letting it fall through to the JSON path would mis-record it.
+  // A non-2xx audio response (error JSON in the body) is left to the JSON/error
+  // path below.
   const isAudioResponse = ctString.toLowerCase().startsWith("audio/");
-  if (isAudioResponse && rawBuffer.length > 0) {
+  const isAudioSuccess = upstreamStatus >= 200 && upstreamStatus < 300;
+  if (isAudioResponse && isAudioSuccess) {
     // Derive format from Content-Type (audio/mpeg→mp3, audio/opus→opus, etc.)
     const audioFormat = ctString
       .toLowerCase()
@@ -412,6 +584,11 @@ export async function proxyAndRecord(
       .replace("mpeg", "mp3")
       .split(";")[0]
       .trim();
+    if (rawBuffer.length === 0) {
+      defaults.logger.warn(
+        "Audio response had a zero-length body — recording an empty audio fixture",
+      );
+    }
     fixtureResponse = {
       audio: rawBuffer.toString("base64"),
       ...(audioFormat && audioFormat !== "mp3" ? { format: audioFormat } : {}),
@@ -584,20 +761,10 @@ export async function proxyAndRecord(
         fixtureResponse = { json: parsedResponse, status: upstreamStatus };
       }
     } else {
-      let encodingFormat: string | undefined;
-      try {
-        encodingFormat = rawBody ? JSON.parse(rawBody).encoding_format : undefined;
-      } catch (err) {
-        defaults.logger.debug(
-          `Could not parse encoding_format from raw body: ${err instanceof Error ? err.message : "unknown error"}`,
-        );
-      }
-      fixtureResponse = buildFixtureResponse(
-        parsedResponse,
-        upstreamStatus,
-        encodingFormat,
-        defaults.logger,
-      );
+      // NOTE: base64 embeddings are decoded unconditionally inside
+      // buildFixtureResponse regardless of the request's `encoding_format`, so
+      // there is no need to re-parse it here — it was a dead param.
+      fixtureResponse = buildFixtureResponse(parsedResponse, upstreamStatus, defaults.logger);
     }
   }
 
@@ -752,6 +919,37 @@ export function clampTimeout(value: number | undefined, fallback: number): numbe
   return value;
 }
 
+/**
+ * Sanitize the configured proxy-buffer cap: non-finite or non-positive values
+ * fall back to the default. Also hard-clamps to just under V8's max string
+ * length so a misconfigured large value can never permit an over-string-limit
+ * buffer to reach `.toString()`.
+ */
+export function clampMaxBufferBytes(value: number | undefined): number {
+  if (value == null || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_MAX_PROXY_BUFFER_BYTES;
+  }
+  return Math.min(value, PROXY_BUFFER_HARD_CEILING);
+}
+
+/**
+ * Sanitize the configured proxy-buffer frame cap: non-finite or non-positive
+ * values fall back to the default. Bounds the count-indexed per-frame state
+ * (`frameTimestamps` + parse buffers) that the byte cap cannot bound on its own.
+ */
+export function clampMaxBufferFrames(value: number | undefined): number {
+  // INTENTIONAL DIVERGENCE from journal-max's `0 = unbounded` convention: here
+  // 0 (and any non-positive / non-finite value) maps to the DEFAULT cap, never
+  // "unbounded". The frame cap exists as leak-safety for never-ending proxy
+  // streams; allowing 0 to disable it would reintroduce the exact unbounded
+  // per-frame-state growth this cap guards against. Do NOT make 0 mean
+  // unbounded.
+  if (value == null || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_MAX_PROXY_BUFFER_FRAMES;
+  }
+  return Math.floor(value);
+}
+
 function makeUpstreamRequest(
   target: URL,
   headers: Record<string, string>,
@@ -760,6 +958,8 @@ function makeUpstreamRequest(
   method: string = "POST",
   logger?: Logger,
   timeouts?: Pick<RecordConfig, "upstreamTimeoutMs" | "bodyTimeoutMs">,
+  maxBufferBytes: number = DEFAULT_MAX_PROXY_BUFFER_BYTES,
+  maxBufferFrames: number = DEFAULT_MAX_PROXY_BUFFER_FRAMES,
 ): Promise<{
   status: number;
   headers: http.IncomingHttpHeaders;
@@ -769,11 +969,38 @@ function makeUpstreamRequest(
   clientDisconnected: boolean;
   frameTimestamps: number[];
   streamStartTime: number;
+  /**
+   * True when the upstream response exceeded `maxBufferBytes`. The client still
+   * received every byte (the relay is independent of this buffer), but the
+   * in-memory buffer was capped, so `body`/`rawBuffer` are partial and the
+   * caller MUST skip collapse/recording.
+   */
+  bufferTruncated: boolean;
+  /**
+   * Which cap tripped truncation (`"byte"` or `"frame"`), or `undefined` when
+   * not truncated. Lets the caller log accurately which budget was exceeded
+   * rather than conflating the two.
+   */
+  truncationCap?: "byte" | "frame";
+  /** Total bytes seen from upstream (may exceed the buffered amount when capped). */
+  totalBytes: number;
+  /**
+   * True when a NON-progressive (non-teed) upstream body exceeded the proxy
+   * hard ceiling, so the retained `rawBuffer` is PARTIAL. The caller MUST fail
+   * loud (502) rather than relay this truncated body as a success status.
+   */
+  hardCeilingExceeded: boolean;
 }> {
   return new Promise((resolve, reject) => {
     const transport = target.protocol === "https:" ? https : http;
     const UPSTREAM_TIMEOUT_MS = clampTimeout(timeouts?.upstreamTimeoutMs, 30_000);
     const BODY_TIMEOUT_MS = clampTimeout(timeouts?.bodyTimeoutMs, 30_000);
+    // Capture the moment the request is dispatched (set just before
+    // `req.write` below). ttft/total durations are measured from request SEND,
+    // not from when upstream HEADERS arrive — basing them on headers-received
+    // time would exclude the upstream's time-to-first-byte and understate the
+    // recorded time-to-first-token.
+    let requestSendTime = 0;
     const req = transport.request(
       target,
       {
@@ -795,7 +1022,7 @@ function makeUpstreamRequest(
         // which defeats progressive rendering in downstream consumers and
         // can trip HTTP idle timeouts on slow calls.
         const ct = res.headers["content-type"];
-        const ctStr = Array.isArray(ct) ? ct.join(", ") : (ct ?? "");
+        const ctStr = pickContentType(ct);
         const ctLower = ctStr.toLowerCase();
         const isSSE = ctLower.includes("text/event-stream");
         const isNDJSON = ctLower.includes("application/x-ndjson");
@@ -804,7 +1031,9 @@ function makeUpstreamRequest(
         // SSE/NDJSON frame timing capture — timestamps each complete frame
         // so proxyAndRecord can build RecordedTimings for the fixture.
         const frameTimestamps: number[] = [];
-        const streamStartTime = Date.now();
+        // Measure from request send (see requestSendTime above), falling back to
+        // now only if it was somehow not set before the response callback fired.
+        const streamStartTime = requestSendTime || Date.now();
         let frameBuffer = "";
         // Decode chunks through a streaming-aware decoder so a multibyte UTF-8
         // character split across a TCP chunk boundary buffers across chunks
@@ -838,17 +1067,130 @@ function makeUpstreamRequest(
             if (!clientRes.writableFinished) {
               clientDisconnected = true;
               req.destroy();
+              // Stop in-flight buffering immediately rather than draining the
+              // upstream socket under backpressure: detach the data listener so
+              // no further chunks accumulate, and free what's already buffered.
+              // The promise still settles via the 'end'/'error'/'close' the
+              // destroyed request emits; collapse/recording is skipped because
+              // the client disconnected.
+              res.removeListener("data", onUpstreamData);
+              chunks.length = 0;
+              bufferedBytes = 0;
+              frameTimestamps.length = 0;
+              frameBuffer = "";
+              binaryFrameBuffer = Buffer.alloc(0);
             }
           });
         }
         const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer) => {
-          chunks.push(chunk);
+        // Bound the in-memory buffer used to collapse/journal the response so a
+        // single huge proxied stream can neither spike the heap nor build a
+        // string past V8's ~512 MiB limit (RangeError: Invalid string length).
+        // The client relay below is independent of this buffer, so capping it
+        // does NOT truncate what the client receives.
+        let bufferedBytes = 0;
+        let totalBytes = 0;
+        let bufferTruncated = false;
+        /** Which cap tripped truncation — surfaced to the caller for an accurate warning. */
+        let truncationCap: "byte" | "frame" | undefined;
+        // Snapshot the effective hard ceiling once for this request (honors the
+        // test-only override). Bounds the non-progressive relay buffer; when the
+        // body would exceed it we can neither buffer the full copy nor safely
+        // relay the partial one, so the caller fails loud instead of truncating.
+        const hardCeiling = effectiveHardCeiling();
+        /**
+         * True when a NON-progressive upstream body exceeded `hardCeiling`, so
+         * the buffered `rawBuffer` is a PARTIAL copy that must NOT be relayed as
+         * success. Distinct from `bufferTruncated` (which also covers the
+         * under-ceiling over-soft-cap case where the full body IS retained).
+         */
+        let hardCeilingExceeded = false;
+        // Trip truncation: mark the response over-cap so the caller skips
+        // collapse/recording, and eagerly drop the accumulated PARSE state
+        // (frameTimestamps + frame/binary parse buffers) which only ever feeds
+        // recording. Reused by the top-of-callback byte guard AND the per-frame
+        // guards inside the SSE/NDJSON and binary splitter loops, so a single
+        // coalesced chunk carrying many complete frames cannot overshoot the
+        // frame cap before the next data event re-checks.
+        //
+        // The raw `chunks` array is handled differently by stream shape:
+        //  - progressive streams (SSE/NDJSON/binary) are teed to the client
+        //    live, so the bytes are already on the wire — `chunks` is freed
+        //    immediately and the partial buffer is never relayed.
+        //  - non-progressive responses (a single non-stream body) are NOT teed;
+        //    the only copy the client can receive is `chunks`, so we KEEP
+        //    accumulating it (bounded by HARD_CEILING below) and relay it in
+        //    full. We still skip recording — the cap means "don't journal", not
+        //    "don't answer the client".
+        const tripTruncation = (cap: "byte" | "frame") => {
+          bufferTruncated = true;
+          truncationCap = cap;
+          frameTimestamps.length = 0;
+          frameBuffer = "";
+          // Intentional: the returned flush string is discarded (frameBuffer was
+          // just cleared and recording is skipped), but `.end()` releases any
+          // partial-multibyte bytes the StringDecoder is internally holding — so
+          // this frees decoder state rather than being dead cleanup.
+          frameDecoder.end();
+          binaryFrameBuffer = Buffer.alloc(0);
+          if (isProgressiveStream) {
+            chunks.length = 0;
+            bufferedBytes = 0;
+          }
+          // State which cap tripped accurately (do not conflate the two caps),
+          // and report the relay truthfully — the client received every byte on
+          // the streamed path and, post-fix, on the non-streamed path too.
+          const detail =
+            cap === "byte"
+              ? `byte cap (${maxBufferBytes} bytes)`
+              : `frame cap (${maxBufferFrames} frames)`;
+          logger?.warn(
+            `Upstream response exceeded the proxy buffer ${detail} — relaying full body to client, but skipping in-memory collapse/recording to bound memory`,
+          );
+        };
+        const onUpstreamData = (chunk: Buffer) => {
+          totalBytes += chunk.length;
+          // Trip truncation on EITHER bytes OR frame count. The byte cap alone
+          // never bounds `frameTimestamps` (count-indexed, not byte-sized) nor a
+          // never-completing parse buffer, so a long-lived / never-ending stream
+          // would otherwise grow per-frame state forever. `frameTimestamps.length`
+          // is the running complete-frame count. `>=` (not `>`) so we never
+          // retain MORE than `maxBufferFrames` frames — see the "maximum N
+          // frames retained" contract on DEFAULT_MAX_PROXY_BUFFER_FRAMES.
+          if (!bufferTruncated && bufferedBytes + chunk.length > maxBufferBytes) {
+            tripTruncation("byte");
+          } else if (!bufferTruncated && frameTimestamps.length >= maxBufferFrames) {
+            tripTruncation("frame");
+          }
+          // Buffer the raw bytes. Under cap: always. Over cap on a progressive
+          // stream: never (bytes are already teed live; chunks was freed). Over
+          // cap on a NON-progressive response: keep buffering for the relay —
+          // it has no live tee, so `chunks` is the only copy the client can get
+          // — but hard-cap it at HARD_CEILING (well under V8's max string
+          // length) so the eventual rawBuffer.toString() relay can never throw
+          // RangeError: Invalid string length.
+          if (!bufferTruncated) {
+            chunks.push(chunk);
+            bufferedBytes += chunk.length;
+          } else if (!isProgressiveStream) {
+            if (bufferedBytes + chunk.length <= hardCeiling) {
+              chunks.push(chunk);
+              bufferedBytes += chunk.length;
+            } else {
+              // The non-progressive relay copy would exceed the hard ceiling.
+              // We CANNOT relay the full body (it can't be buffered safely) and
+              // MUST NOT relay the partial buffer as a success — flag it so the
+              // caller fails loud (502) instead of presenting a truncated 2xx.
+              hardCeilingExceeded = true;
+            }
+          }
 
-          // Capture per-frame timestamps for SSE/NDJSON streams.
+          // Capture per-frame timestamps for SSE/NDJSON streams. Gated on
+          // !bufferTruncated so per-frame parse/timing state stops growing once
+          // the cap trips (the byte/frame guard above already freed it).
           // TCP data events don't align with SSE frames — buffer and
           // split on the protocol delimiter to timestamp each complete frame.
-          if (isSSE || isNDJSON) {
+          if (!bufferTruncated && (isSSE || isNDJSON)) {
             frameBuffer += frameDecoder.write(chunk);
             // Split on the protocol delimiter, tolerating CRLF line endings.
             // The SSE spec permits CRLF, and some upstreams/proxies emit
@@ -859,26 +1201,60 @@ function makeUpstreamRequest(
             const delimiter = isNDJSON ? /\r?\n/ : /\r?\n\r?\n/;
             const parts = frameBuffer.split(delimiter);
             // All complete frames (everything except the last part which
-            // may be incomplete).
+            // may be incomplete). Enforce the frame cap PER-FRAME: a single
+            // coalesced chunk can carry many complete frames, so checking only
+            // at the top of the callback would let one event push them all and
+            // overshoot the cap unbounded. Trip + bail mid-loop instead.
             for (let fi = 0; fi < parts.length - 1; fi++) {
+              if (frameTimestamps.length >= maxBufferFrames) {
+                tripTruncation("frame");
+                break;
+              }
               if (parts[fi].trim().length > 0) {
                 frameTimestamps.push(Date.now());
               }
             }
-            // Last part stays in buffer (may be incomplete)
-            frameBuffer = parts[parts.length - 1];
+            // Last part stays in buffer (may be incomplete). Skip when the
+            // per-frame guard just tripped — tripTruncation already cleared it.
+            if (!bufferTruncated) {
+              frameBuffer = parts[parts.length - 1];
+            }
           }
 
           // Binary EventStream frame boundary detection — parse the 4-byte
           // total-length prefix to detect complete frames without decoding
           // frame contents (CRC validation happens in stream-collapse).
-          if (isBinaryEventStream) {
-            binaryFrameBuffer = Buffer.concat([binaryFrameBuffer, chunk]);
-            while (binaryFrameBuffer.length >= 4) {
-              const totalLen = binaryFrameBuffer.readUInt32BE(0);
-              if (totalLen < 12 || binaryFrameBuffer.length < totalLen) break;
-              frameTimestamps.push(Date.now());
-              binaryFrameBuffer = binaryFrameBuffer.subarray(totalLen);
+          // Also gated on !bufferTruncated so binaryFrameBuffer stops growing
+          // once the cap trips.
+          if (!bufferTruncated && isBinaryEventStream) {
+            // Count the binary parse buffer's growth toward the byte cap.
+            // binaryFrameBuffer is a SECOND, parallel copy of the bytes (the
+            // raw `chunks` array also holds them), so without this a
+            // never-completing / malformed (`totalLen<12`) frame — which pushes
+            // no frameTimestamps — would let a full second copy accumulate up
+            // to the byte cap, peaking at ~2× the configured cap. Trip on the
+            // COMBINED footprint so the byte cap bounds both copies together.
+            // NOTE: `bufferedBytes` ALREADY includes the current `chunk.length`
+            // (added in the raw-buffer accumulation above), so the combined
+            // footprint is `bufferedBytes + binaryFrameBuffer.length`. Adding
+            // `chunk.length` again would double-count it and trip the cap one
+            // chunk early (matching the L<byte-guard> accounting at the top).
+            if (bufferedBytes + binaryFrameBuffer.length > maxBufferBytes) {
+              tripTruncation("byte");
+            } else {
+              binaryFrameBuffer = Buffer.concat([binaryFrameBuffer, chunk]);
+              while (binaryFrameBuffer.length >= 4) {
+                if (frameTimestamps.length >= maxBufferFrames) {
+                  // Per-frame cap: a single chunk can complete many binary
+                  // frames; trip mid-loop rather than overshoot.
+                  tripTruncation("frame");
+                  break;
+                }
+                const totalLen = binaryFrameBuffer.readUInt32BE(0);
+                if (totalLen < 12 || binaryFrameBuffer.length < totalLen) break;
+                frameTimestamps.push(Date.now());
+                binaryFrameBuffer = binaryFrameBuffer.subarray(totalLen);
+              }
             }
           }
 
@@ -898,15 +1274,18 @@ function makeUpstreamRequest(
               clientDisconnected = true;
             }
           }
-        });
+        };
+        res.on("data", onUpstreamData);
         res.on("error", reject);
         res.on("end", () => {
           if (res.socket) res.setTimeout(0);
           // Flush remaining text frame buffer — captures the last frame if
           // the stream ended without a trailing delimiter. Binary EventStream
           // frames are length-prefixed so partial frames at end-of-stream are
-          // genuinely incomplete and should not be timestamped.
-          if (isSSE || isNDJSON) {
+          // genuinely incomplete and should not be timestamped. Skipped when
+          // truncated: the decoder/parse buffer were already drained+cleared on
+          // the trip, and recording is skipped, so there is nothing to flush.
+          if (!bufferTruncated && (isSSE || isNDJSON)) {
             // Drain any bytes the decoder buffered for an incomplete multibyte
             // sequence so the final frame text is complete before we test it.
             frameBuffer += frameDecoder.end();
@@ -930,15 +1309,29 @@ function makeUpstreamRequest(
               );
             }
           }
+          // Decide the string `body`:
+          //  - not truncated: stringify the full buffer as usual.
+          //  - truncated PROGRESSIVE stream: `chunks` was freed on the trip, so
+          //    rawBuffer is empty; skip toString to keep the path allocation-free
+          //    (the client already got every byte via the live tee).
+          //  - truncated NON-progressive response: we deliberately kept the full
+          //    bytes (bounded by HARD_CEILING) so they can be relayed — stringify
+          //    them so proxyAndRecord can `res.end(body)` the real response.
+          const bodyString =
+            !bufferTruncated || (bufferTruncated && !streamedToClient) ? rawBuffer.toString() : "";
           resolve({
             status: res.statusCode ?? 500,
             headers: res.headers,
-            body: rawBuffer.toString(),
+            body: bodyString,
             rawBuffer,
             streamedToClient,
             clientDisconnected,
             frameTimestamps,
             streamStartTime,
+            bufferTruncated,
+            truncationCap,
+            totalBytes,
+            hardCeilingExceeded,
           });
         });
       },
@@ -951,6 +1344,9 @@ function makeUpstreamRequest(
       );
     });
     req.on("error", reject);
+    // Stamp the send time immediately before dispatching the body so ttft and
+    // total-duration are measured from request send, not headers-received.
+    requestSendTime = Date.now();
     req.write(body);
     req.end();
   });
@@ -973,15 +1369,24 @@ function logDroppedReasoningSignature(
 }
 
 /**
+ * Coerce a tool call's `arguments` field into the string the fixture contract
+ * requires (types.ts `ToolCall.arguments: string`). When the upstream omits the
+ * arguments field entirely, `JSON.stringify(undefined)` yields the JS value
+ * `undefined` (not a string), which then gets dropped on disk-write and breaks
+ * cross-provider replay through the OpenAI streaming path. Coalesce to "{}" so
+ * `arguments` is ALWAYS a string, matching the streaming recorder's behavior.
+ */
+function toToolCallArguments(raw: unknown): string {
+  if (typeof raw === "string") return raw;
+  if (raw === undefined || raw === null) return "{}";
+  return JSON.stringify(raw);
+}
+
+/**
  * Detect the response format from the parsed upstream JSON and convert
  * it into an aimock FixtureResponse.
  */
-function buildFixtureResponse(
-  parsed: unknown,
-  status: number,
-  encodingFormat?: string,
-  logger?: Logger,
-): FixtureResponse {
+function buildFixtureResponse(parsed: unknown, status: number, logger?: Logger): FixtureResponse {
   if (parsed === null || parsed === undefined) {
     // Raw / unparseable response — save as error
     return {
@@ -1016,25 +1421,53 @@ function buildFixtureResponse(
     if (Array.isArray(first.embedding)) {
       return { embedding: first.embedding as number[] };
     }
-    if (typeof first.embedding === "string" && encodingFormat === "base64") {
+    // A string embedding is a base64-packed Float32 array. Decode it regardless
+    // of whether the request echoed `encoding_format: "base64"` — some providers
+    // return base64 without the client having asked for it, and gating on the
+    // request echo silently drops a valid embedding into the error fixture.
+    if (typeof first.embedding === "string") {
       const buf = Buffer.from(first.embedding, "base64");
-      if (buf.byteLength % 4 !== 0) {
-        // Malformed embedding — return a zero-dimension embedding fixture
-        return { embedding: [] };
+      if (buf.byteLength === 0 || buf.byteLength % 4 !== 0) {
+        // Malformed base64 (not a whole number of Float32s). Don't silently
+        // return a valid-looking zero-dimension embedding — log it and fall
+        // through to the generic error fixture so the loss is diagnosable.
+        logger?.warn(
+          `Could not decode base64 embedding (byteLength=${buf.byteLength} is not a positive multiple of 4) — saving as error fixture`,
+        );
+      } else {
+        // Uint8Array constructor copies Buffer data to a fresh ArrayBuffer at offset 0,
+        // guaranteeing the alignment Float32Array requires.
+        const copied = new Uint8Array(buf);
+        const floats = new Float32Array(copied.buffer, 0, buf.byteLength / 4);
+        return { embedding: Array.from(floats) };
       }
-      // Uint8Array constructor copies Buffer data to a fresh ArrayBuffer at offset 0,
-      // guaranteeing the alignment Float32Array requires.
-      const copied = new Uint8Array(buf);
-      const floats = new Float32Array(copied.buffer, 0, buf.byteLength / 4);
-      return { embedding: Array.from(floats) };
     }
     // OpenAI image generation: { created, data: [{ url, b64_json, revised_prompt }] }
-    if (first.url || first.b64_json) {
-      const images = (obj.data as Array<Record<string, unknown>>).map((item) => ({
-        ...(item.url ? { url: String(item.url) } : {}),
-        ...(item.b64_json ? { b64Json: String(item.b64_json) } : {}),
-        ...(item.revised_prompt ? { revisedPrompt: String(item.revised_prompt) } : {}),
-      }));
+    // Enter the branch when ANY item carries media — not just data[0]. A batch
+    // whose first element lacks both url and b64_json (e.g. a partial/placeholder
+    // entry) but whose later element HAS one would otherwise skip the branch and
+    // fall through to the error fixture, silently dropping every captured image.
+    if ((obj.data as Array<Record<string, unknown>>).some((item) => item.url || item.b64_json)) {
+      // Map only items that actually carry media (url or b64_json). A later item
+      // lacking both — including one whose `b64_json` is an empty string — would
+      // otherwise produce an empty {} image entry (all the conditional spreads
+      // are skipped) — silent fidelity loss.
+      const dataItems = obj.data as Array<Record<string, unknown>>;
+      const images = dataItems
+        .filter((item) => item.url || item.b64_json)
+        .map((item) => ({
+          ...(item.url ? { url: String(item.url) } : {}),
+          ...(item.b64_json ? { b64Json: String(item.b64_json) } : {}),
+          ...(item.revised_prompt ? { revisedPrompt: String(item.revised_prompt) } : {}),
+        }));
+      // Surface any dropped items (e.g. empty-string b64_json placeholders) so
+      // the fidelity loss is diagnosable rather than silent.
+      const droppedCount = dataItems.length - images.length;
+      if (droppedCount > 0) {
+        logger?.warn(
+          `Dropped ${droppedCount} image item(s) from batch lacking a non-empty url or b64_json`,
+        );
+      }
       if (images.length === 1) {
         return { image: images[0] };
       }
@@ -1055,10 +1488,21 @@ function buildFixtureResponse(
   }
 
   // OpenAI transcription: { text: "...", ... }
-  if (
+  // Tightened: a bare `text` string alongside a single incidental `language` or
+  // `duration` field is too weak — many non-transcription payloads carry a
+  // `text` plus a `duration`-like number. Require an explicit
+  // `task: "transcribe"`, OR BOTH `language` and `duration` (the verbose
+  // transcription shape). Also reject anything carrying clear non-transcription
+  // markers (chat completions, events, etc.) so they route to their own branch.
+  const looksLikeTranscription =
     typeof obj.text === "string" &&
-    (obj.task === "transcribe" || obj.language !== undefined || obj.duration !== undefined)
-  ) {
+    (obj.task === "transcribe" || (obj.language !== undefined && obj.duration !== undefined)) &&
+    !("choices" in obj) &&
+    !("candidates" in obj) &&
+    !("object" in obj) &&
+    !("message" in obj) &&
+    !("outputs" in obj);
+  if (looksLikeTranscription) {
     return {
       transcription: {
         text: obj.text as string,
@@ -1088,7 +1532,7 @@ function buildFixtureResponse(
     if (hasToolCalls) {
       const toolCalls: ToolCall[] = fnCallOutputs.map((o) => ({
         name: String(o.name),
-        arguments: typeof o.arguments === "string" ? o.arguments : JSON.stringify(o.arguments),
+        arguments: toToolCallArguments(o.arguments),
         ...(o.id ? { id: String(o.id) } : {}),
       }));
       if (hasContent) {
@@ -1154,10 +1598,16 @@ function buildFixtureResponse(
       const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0;
       const hasContent = typeof message.content === "string" && message.content.length > 0;
 
+      // Reasoning is exposed under different keys across OpenAI-compatible
+      // providers: OpenAI/vLLM use `reasoning_content`, while DeepSeek and
+      // OpenRouter use `reasoning`. Read both (preferring `reasoning_content`)
+      // so a reasoning turn is not silently dropped on the latter providers.
       const openaiReasoning =
         typeof message.reasoning_content === "string" && message.reasoning_content.length > 0
           ? message.reasoning_content
-          : undefined;
+          : typeof message.reasoning === "string" && message.reasoning.length > 0
+            ? message.reasoning
+            : undefined;
 
       if (hasToolCalls) {
         const toolCalls: ToolCall[] = (message.tool_calls as Array<Record<string, unknown>>).map(
@@ -1165,7 +1615,7 @@ function buildFixtureResponse(
             const fn = tc.function as Record<string, unknown>;
             return {
               name: String(fn.name),
-              arguments: String(fn.arguments),
+              arguments: toToolCallArguments(fn.arguments),
               ...(tc.id ? { id: String(tc.id) } : {}),
             };
           },
@@ -1246,7 +1696,7 @@ function buildFixtureResponse(
     if (hasToolCalls) {
       const toolCalls: ToolCall[] = toolUseBlocks.map((b) => ({
         name: String(b.name),
-        arguments: typeof b.input === "string" ? b.input : JSON.stringify(b.input),
+        arguments: toToolCallArguments(b.input),
         ...(b.id ? { id: String(b.id) } : {}),
       }));
       if (hasContent) {
@@ -1302,19 +1752,39 @@ function buildFixtureResponse(
     if (content && Array.isArray(content.parts)) {
       const parts = content.parts as Array<Record<string, unknown>>;
 
-      // Audio inlineData parts take priority over text
-      const audioParts = parts.filter(
-        (p: Record<string, unknown>) =>
-          p.inlineData &&
-          typeof (p.inlineData as Record<string, unknown>).mimeType === "string" &&
-          ((p.inlineData as Record<string, unknown>).mimeType as string).startsWith("audio/"),
-      );
+      // Audio inlineData parts take priority over text. Key on the PRESENCE of
+      // `inlineData.data` rather than solely on the mimeType: an audio part can
+      // arrive with a missing or unexpected mimeType, and filtering strictly on
+      // an `audio/` prefix would then drop a part that genuinely carries audio
+      // bytes, producing an empty b64Json. A NON-audio mimeType (e.g. `image/`)
+      // still routes elsewhere, so image inlineData is not misclassified — only
+      // an explicit `audio/` prefix OR a missing/blank mimeType counts as audio.
+      const audioParts = parts.filter((p: Record<string, unknown>) => {
+        const inline = p.inlineData as Record<string, unknown> | undefined;
+        if (
+          inline === undefined ||
+          inline === null ||
+          typeof inline.data !== "string" ||
+          inline.data.length === 0
+        ) {
+          return false;
+        }
+        const mt = inline.mimeType;
+        if (typeof mt === "string" && mt.length > 0) {
+          return mt.startsWith("audio/");
+        }
+        // Missing/blank mimeType but data present → treat as audio.
+        return true;
+      });
       if (audioParts.length > 0) {
         const inlineData = audioParts[0].inlineData as Record<string, unknown>;
         return {
           audio: {
             b64Json: String(inlineData.data ?? ""),
-            contentType: String(inlineData.mimeType),
+            contentType:
+              typeof inlineData.mimeType === "string" && inlineData.mimeType.length > 0
+                ? inlineData.mimeType
+                : "audio/mpeg",
           },
         };
       }
@@ -1335,7 +1805,7 @@ function buildFixtureResponse(
           const fc = p.functionCall as Record<string, unknown>;
           return {
             name: String(fc.name),
-            arguments: typeof fc.args === "string" ? fc.args : JSON.stringify(fc.args),
+            arguments: toToolCallArguments(fc.args),
           };
         });
         if (hasContent) {
@@ -1386,7 +1856,7 @@ function buildFixtureResponse(
           const tu = b.toolUse as Record<string, unknown>;
           return {
             name: String(tu.name ?? ""),
-            arguments: typeof tu.input === "string" ? tu.input : JSON.stringify(tu.input),
+            arguments: toToolCallArguments(tu.input),
             ...(tu.toolUseId ? { id: String(tu.toolUseId) } : {}),
           };
         });
@@ -1421,8 +1891,13 @@ function buildFixtureResponse(
   ) {
     const msg = obj.message as Record<string, unknown>;
     const contentBlocks = msg.content as Array<Record<string, unknown>>;
-    const textBlock = contentBlocks.find((b) => b.type === "text" && typeof b.text === "string");
-    const hasContent = textBlock && typeof textBlock.text === "string" && textBlock.text.length > 0;
+    // Join ALL text blocks, not just the first — a multi-block Cohere response
+    // would otherwise be truncated to its leading segment.
+    const joinedText = contentBlocks
+      .filter((b) => b.type === "text" && typeof b.text === "string")
+      .map((b) => String(b.text ?? ""))
+      .join("");
+    const hasContent = joinedText.length > 0;
     const toolCallBlocks = contentBlocks.filter((b) => b.type === "tool_call");
 
     // Also check message-level tool_calls (Cohere v2 puts tool calls here, not in content blocks)
@@ -1440,11 +1915,11 @@ function buildFixtureResponse(
               ? JSON.stringify(b.parameters)
               : typeof (b.function as Record<string, unknown>)?.arguments === "string"
                 ? String((b.function as Record<string, unknown>).arguments)
-                : JSON.stringify((b.function as Record<string, unknown>)?.arguments),
+                : toToolCallArguments((b.function as Record<string, unknown>)?.arguments),
         ...(b.id ? { id: String(b.id) } : {}),
       }));
       if (hasContent) {
-        return { content: textBlock.text as string, toolCalls };
+        return { content: joinedText, toolCalls };
       }
       return { toolCalls };
     }
@@ -1460,18 +1935,23 @@ function buildFixtureResponse(
                 ? JSON.stringify(tc.parameters)
                 : typeof fn?.arguments === "string"
                   ? String(fn.arguments)
-                  : JSON.stringify(fn?.arguments),
+                  : toToolCallArguments(fn?.arguments),
           ...(tc.id ? { id: String(tc.id) } : {}),
         };
       });
       if (hasContent) {
-        return { content: textBlock.text as string, toolCalls };
+        return { content: joinedText, toolCalls };
       }
       return { toolCalls };
     }
     if (hasContent) {
-      return { content: textBlock.text as string };
+      return { content: joinedText };
     }
+    // Recognized Cohere v2 shape (finish_reason + message.content array) with
+    // no text and no tool calls. Own the empty turn here and return an
+    // empty-content fixture rather than falling through to the Ollama branch
+    // below, which would re-handle `message.content` and mis-route it.
+    return { content: "" };
   }
 
   // Ollama: { message: { content: "...", tool_calls: [...] } }
@@ -1487,8 +1967,7 @@ function buildFixtureResponse(
           const fn = tc.function as Record<string, unknown>;
           return {
             name: String(fn.name ?? ""),
-            arguments:
-              typeof fn.arguments === "string" ? fn.arguments : JSON.stringify(fn.arguments),
+            arguments: toToolCallArguments(fn.arguments),
           };
         });
       if (hasOllamaContent) {
@@ -1509,11 +1988,21 @@ function buildFixtureResponse(
   }
 
   // Ollama /api/generate: { response: "...", done: true/false }
-  if (typeof obj.response === "string" && "done" in obj) {
+  // Narrowed: require `done` to be a boolean — Ollama always sends a boolean
+  // here, and gating merely on `"done" in obj` would capture unrelated payloads
+  // that happen to carry a `response` string and some other `done`-keyed value.
+  if (typeof obj.response === "string" && typeof obj.done === "boolean") {
     return { content: obj.response };
   }
 
-  // Fallback: unknown format — save as error
+  // Fallback: unknown format — save as error. Log the observed top-level shape
+  // so an unrecognized/new provider response is diagnosable instead of silently
+  // becoming an opaque error fixture.
+  logger?.warn(
+    `Could not detect response format from upstream (status=${status}) — saving as error fixture; top-level keys: [${Object.keys(
+      obj,
+    ).join(", ")}]`,
+  );
   return {
     error: {
       message: "Could not detect response format from upstream",

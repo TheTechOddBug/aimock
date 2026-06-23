@@ -310,7 +310,7 @@ export function isEmbeddingResponse(r: FixtureResponse): r is EmbeddingResponse 
 
 export function isImageResponse(r: FixtureResponse): r is ImageResponse {
   return (
-    ("image" in r && r.image != null) ||
+    ("image" in r && typeof r.image === "object" && r.image != null) ||
     ("images" in r && Array.isArray((r as ImageResponse).images))
   );
 }
@@ -984,8 +984,15 @@ export function matchesPattern(text: string, pattern: string | RegExp): boolean 
   if (typeof pattern === "string") {
     return text.toLowerCase().includes(pattern.toLowerCase());
   }
+  // A global/sticky RegExp carries mutable `lastIndex` state that `.test()`
+  // advances. Save and restore it so callers reusing the same regex object
+  // (search/rerank/moderation filter loops) are not left with mutated state
+  // and get consistent results across repeated calls.
+  const savedLastIndex = pattern.lastIndex;
   pattern.lastIndex = 0;
-  return pattern.test(text);
+  const result = pattern.test(text);
+  pattern.lastIndex = savedLastIndex;
+  return result;
 }
 
 export function getTestId(req: http.IncomingMessage): string {
@@ -1028,6 +1035,24 @@ export function slugifyTestId(testId: string): string {
     .replace(/^.*?\.(?:spec|test|e2e)\.(?:tsx|ts|jsx|js|mjs|cjs)(?=\s|›|$)\s*›?\s*/i, "") // strip test file extension prefix
     .replace(/\s*[›>]\s*/g, "--") // Playwright titlePath separator → double dash
     .replace(/[^\w-]/g, "-") // non-word chars → dash
+    .replace(/-{3,}/g, "--") // collapse 3+ dashes to double
+    .replace(/^-+|-+$/g, "") // trim leading/trailing dashes
+    .toLowerCase();
+}
+
+/**
+ * Make a request context (the `X-AIMock-Context` header value) safe to use as
+ * a single directory segment in a recorded-fixture path. The header is
+ * attacker-controllable, so a raw value containing `../`, path separators, or
+ * an absolute-path prefix would let the written fixture escape the configured
+ * fixtures base directory. Mirrors `slugifyTestId`: non-word characters
+ * (including `/`, `\`, and `.`) collapse to dashes, so the result is always a
+ * single flat segment with no traversal semantics. Returns "" when the value
+ * sanitizes to nothing (caller treats that as "no context segment").
+ */
+export function slugifyContext(context: string): string {
+  return context
+    .replace(/[^\w-]/g, "-") // non-word chars (incl. / \ . :) → dash
     .replace(/-{3,}/g, "--") // collapse 3+ dashes to double
     .replace(/^-+|-+$/g, "") // trim leading/trailing dashes
     .toLowerCase();

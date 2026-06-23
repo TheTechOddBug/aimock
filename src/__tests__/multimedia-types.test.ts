@@ -4,6 +4,7 @@ import {
   isAudioResponse,
   isTranscriptionResponse,
   isVideoResponse,
+  matchesPattern,
 } from "../helpers.js";
 import { matchFixture } from "../router.js";
 import type { Fixture, ChatCompletionRequest, FixtureResponse } from "../types.js";
@@ -23,6 +24,11 @@ describe("multimedia type guards", () => {
 
   test("isImageResponse rejects text response", () => {
     const r: FixtureResponse = { content: "hello" };
+    expect(isImageResponse(r)).toBe(false);
+  });
+
+  test("isImageResponse rejects non-object image value", () => {
+    const r = { image: "not-an-object" } as unknown as FixtureResponse;
     expect(isImageResponse(r)).toBe(false);
   });
 
@@ -149,7 +155,54 @@ describe("endpoint filtering in matchFixture", () => {
       _endpointType: "image",
     };
 
-    const first = matchFixture(fixtures, imageReq, counts);
-    expect(first).toBe(fixtures[0]);
+    // Pin the FULL sequence ordering this test claims to verify. matchFixture
+    // gates a sequenced fixture on its match count equalling sequenceIndex but
+    // does not itself mutate the count — the caller (journal) increments after
+    // consuming a match, and crucially advances ALL sequenced siblings sharing
+    // the same match criteria so the group shares one logical counter. Mimic
+    // that here so each call advances to the next sequenceIndex, proving the
+    // sequence resolves 0 → 1 in order and then exhausts.
+    const advanceSequence = (matched: Fixture): void => {
+      for (const f of fixtures) {
+        if (f.match.sequenceIndex !== undefined) {
+          counts.set(f, (counts.get(f) ?? 0) + 1);
+        }
+      }
+      // (matched is part of the group; the loop above already advanced it)
+      void matched;
+    };
+    const resolve = (): Fixture | null => {
+      const f = matchFixture(fixtures, imageReq, counts);
+      if (f) advanceSequence(f);
+      return f;
+    };
+
+    expect(resolve()).toBe(fixtures[0]);
+    expect(resolve()).toBe(fixtures[1]);
+    // The sequence is exhausted: no fixture has a sequenceIndex matching the
+    // next shared count, so further requests no longer match.
+    expect(resolve()).toBeNull();
+  });
+});
+
+describe("matchesPattern", () => {
+  test("does not mutate the caller's RegExp lastIndex", () => {
+    // A global regex carries mutable `lastIndex` state. matchesPattern must
+    // not leave that state mutated, or callers reusing the same regex object
+    // (e.g. the search/rerank/moderation filter loops) get inconsistent
+    // results on subsequent uses.
+    const re = /guitar/g;
+    expect(matchesPattern("guitar", re)).toBe(true);
+    // After the call, the caller's own use of the same regex must behave as if
+    // matchesPattern never touched it.
+    expect(re.lastIndex).toBe(0);
+    expect(re.test("guitar")).toBe(true);
+  });
+
+  test("is consistent across repeated calls with the same global regex", () => {
+    const re = /g/g;
+    expect(matchesPattern("guitar", re)).toBe(true);
+    expect(matchesPattern("guitar", re)).toBe(true);
+    expect(matchesPattern("guitar", re)).toBe(true);
   });
 });
