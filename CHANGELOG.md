@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [1.33.0] - 2026-06-23
+
+### Added
+
+- `--max-proxy-buffer-bytes` / `--max-proxy-buffer-frames` flags to cap proxy buffering (#275)
+
+### Fixed
+
+- Proxy path no longer leaks memory on long-lived upstream streams (#275)
+- Oversized proxied responses no longer crash with `Invalid string length` (#275)
+- Sanitize `X-AIMock-Context` to prevent fixture path traversal (#272)
+- Scope one-shot error injection, improve recorder fixture fidelity, fix `matchesPattern` lastIndex (#272)
+
 ## [1.32.0] - 2026-06-22
 
 ### Added
