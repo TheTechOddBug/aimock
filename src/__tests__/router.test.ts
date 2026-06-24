@@ -99,9 +99,12 @@ describe("getTextContent", () => {
     expect(getTextContent([])).toBeNull();
   });
 
-  it("returns null for array with only empty-string text parts", () => {
+  it("returns the empty string (NOT null) for an array with a present-but-empty text part", () => {
+    // Symmetric with the string path: getTextContent("") returns "", so an
+    // array carrying a present-but-empty text part likewise returns "" — a
+    // present-but-empty body, distinct from `null` (no text content at all).
     const parts: ContentPart[] = [{ type: "text", text: "" }];
-    expect(getTextContent(parts)).toBeNull();
+    expect(getTextContent(parts)).toBe("");
   });
 });
 
@@ -959,7 +962,12 @@ describe("matchFixture — turnIndex", () => {
     expect(matchFixture([fixture], req)).toBe(fixture);
   });
 
-  it("skips when assistant message count does not equal turnIndex", () => {
+  it("a uniquely content-matching fixture matches even when the assistant count differs from turnIndex (content-anchored)", () => {
+    // turnIndex is a non-fatal disambiguator on replay: a fixture that is the
+    // ONLY content match must not be rejected because the request has an extra
+    // (or missing) assistant bubble vs the fixture's hardcoded turnIndex. This
+    // is the false-red ("empty assistant response") this matcher fixes —
+    // multi-step agents emit several assistant bubbles per logical turn.
     const fixture = makeFixture({ userMessage: "hello", turnIndex: 2 });
     const req = makeReq({
       messages: [
@@ -968,7 +976,7 @@ describe("matchFixture — turnIndex", () => {
         { role: "user", content: "hello" },
       ],
     });
-    expect(matchFixture([fixture], req)).toBeNull();
+    expect(matchFixture([fixture], req)).toBe(fixture);
   });
 
   it("turnIndex 0 matches when no assistant messages present", () => {
@@ -1013,7 +1021,12 @@ describe("matchFixture — turnIndex", () => {
     expect(matchFixture([turn0, turn1, turn2], req2)).toBe(turn2);
   });
 
-  it("falls through to non-turnIndex fixture when no turnIndex matches", () => {
+  it("a scripted turn at/before the assistant count wins over an unpositioned fallback (closest-turn disambiguation)", () => {
+    // Two content matches: a turnIndex:0 fixture and an unpositioned fallback.
+    // With assistantCount = 2, turnIndex:0 is the closest scripted turn at or
+    // before the conversation, so it disambiguates and wins. An overshooting
+    // run lands on the nearest scripted turn rather than missing (the
+    // content-anchored replacement for the old exact-equality fall-through).
     const turnOnly = makeFixture({ userMessage: "hello", turnIndex: 0 }, { content: "turn-0" });
     const fallback = makeFixture({ userMessage: "hello" }, { content: "fallback" });
     const req = makeReq({
@@ -1025,7 +1038,19 @@ describe("matchFixture — turnIndex", () => {
         { role: "user", content: "hello" },
       ],
     });
-    expect(matchFixture([turnOnly, fallback], req)).toBe(fallback);
+    expect(matchFixture([turnOnly, fallback], req)).toBe(turnOnly);
+  });
+
+  it("an unpositioned fallback wins when every scripted turn is still AHEAD of the conversation", () => {
+    // assistantCount = 0 but the only turnIndexed candidate is turnIndex:1.
+    // A future scripted turn must not answer an earlier point in the
+    // conversation, so the unpositioned fallback wins.
+    const futureTurn = makeFixture({ userMessage: "hello", turnIndex: 1 }, { content: "turn-1" });
+    const fallback = makeFixture({ userMessage: "hello" }, { content: "fallback" });
+    const req = makeReq({
+      messages: [{ role: "user", content: "hello" }],
+    });
+    expect(matchFixture([futureTurn, fallback], req)).toBe(fallback);
   });
 });
 

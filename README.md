@@ -122,6 +122,10 @@ docker run -d -p 4010:4010 -v "$(pwd)/fixtures:/fixtures" ghcr.io/copilotkit/aim
 
 Private and link-local addresses (loopback, RFC1918, CGNAT, cloud metadata, ULA, multicast) are rejected by default to prevent SSRF. For local development or tests that need to hit `127.0.0.1`, opt out with `AIMOCK_ALLOW_PRIVATE_URLS=1`. Tarball and zip URL support is intentionally deferred.
 
+### Replay matching & `AIMOCK_STRICT_TURN_INDEX`
+
+On replay, `turnIndex` is a non-fatal disambiguator, not a hard reject gate: a content-matching fixture is served even when its scripted `turnIndex` differs from the request's assistant-message count. This kills false "no fixture matched" misses for multi-bubble agent runs (multi-step agents emit several assistant bubbles per logical turn). When a served fixture diverges from its scripted `turnIndex`, the match diagnostic carries `turnIndexRelaxed: true` and aimock logs a one-shot warning (at the `warn` log level — silent by default). To restore the legacy strict behavior where a defined `turnIndex` must equal the assistant count exactly, set `AIMOCK_STRICT_TURN_INDEX=1`. The record path is always strict regardless of this flag.
+
 ## Framework Guides
 
 Test your AI agents with aimock — no API keys, no network calls: [LangChain](https://aimock.copilotkit.dev/integrate-langchain) · [CrewAI](https://aimock.copilotkit.dev/integrate-crewai) · [PydanticAI](https://aimock.copilotkit.dev/integrate-pydanticai) · [LlamaIndex](https://aimock.copilotkit.dev/integrate-llamaindex) · [Mastra](https://aimock.copilotkit.dev/integrate-mastra) · [Google ADK](https://aimock.copilotkit.dev/integrate-adk) · [Microsoft Agent Framework](https://aimock.copilotkit.dev/integrate-maf)

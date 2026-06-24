@@ -651,3 +651,105 @@ describe("turnIndex independence from sequenceIndex", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 7. Content-anchored matching — turnIndex is a non-fatal disambiguator
+//    (false-red kill + no-over-match safety + multi-fixture tiebreak)
+// ---------------------------------------------------------------------------
+
+describe("content-anchored turnIndex matching (replay)", () => {
+  let mock: LLMock;
+
+  beforeAll(async () => {
+    mock = new LLMock();
+    await mock.start();
+  });
+
+  afterAll(async () => {
+    await mock.stop();
+  });
+
+  it("false-red KILLED: a multi-bubble run with MORE assistant turns than turnIndex still matches", async () => {
+    mock.reset();
+    // Canonical fixture says turnIndex 1, but a multi-step agent emitted an
+    // extra assistant bubble, so the live request carries TWO assistant turns.
+    // Before the fix the exact turnIndex gate rejected this content match,
+    // yielding an empty body → "empty assistant response" → false RED.
+    mock.on({ userMessage: "ship it", turnIndex: 1 }, { content: "Shipped." });
+
+    const res = await chatPost(mock.url, [
+      { role: "user", content: "ship it" },
+      { role: "assistant", content: "thinking..." },
+      { role: "assistant", content: "still working..." },
+      { role: "user", content: "ship it" },
+    ]);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { choices: { message: { content: string } }[] };
+    // Non-empty response — the content match is honored despite the off-by-one
+    // assistant count.
+    expect(body.choices[0].message.content).toBe("Shipped.");
+  });
+
+  it("false-red KILLED: a run with FEWER assistant turns than turnIndex still matches", async () => {
+    mock.reset();
+    mock.on({ userMessage: "deploy now", turnIndex: 3 }, { content: "Deployed." });
+
+    // assistantCount 0, fixture turnIndex 3 — uniquely content-matching, so it
+    // matches instead of returning an empty body.
+    const res = await chatPost(mock.url, [{ role: "user", content: "deploy now" }]);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { choices: { message: { content: string } }[] };
+    expect(body.choices[0].message.content).toBe("Deployed.");
+  });
+
+  it("no over-match (safety): a request whose CONTENT matches no fixture still strict-misses", async () => {
+    const strict = new LLMock({ strict: true });
+    await strict.start();
+    try {
+      strict.on({ userMessage: "known phrase", turnIndex: 1 }, { content: "known answer" });
+
+      // Different content entirely — relaxing the position gate must NOT make a
+      // position-adjacent fixture match. Content still gates.
+      const res = await chatPost(strict.url, [
+        { role: "user", content: "a completely unrelated request" },
+        { role: "assistant", content: "x" },
+      ]);
+      expect(res.status).toBe(503);
+    } finally {
+      await strict.stop();
+    }
+  });
+
+  it("multi-fixture disambiguation: the position tiebreak picks the closest scripted turn", async () => {
+    mock.reset();
+    mock.on({ userMessage: "step", turnIndex: 0 }, { content: "answer-0" });
+    mock.on({ userMessage: "step", turnIndex: 1 }, { content: "answer-1" });
+    mock.on({ userMessage: "step", turnIndex: 2 }, { content: "answer-2" });
+
+    // assistantCount 1 → among the three content matches, turnIndex 1 is the
+    // closest scripted turn at/before the count → answer-1.
+    const res1 = await chatPost(mock.url, [
+      { role: "user", content: "step" },
+      { role: "assistant", content: "answer-0" },
+      { role: "user", content: "step" },
+    ]);
+    expect(res1.status).toBe(200);
+    const body1 = (await res1.json()) as { choices: { message: { content: string } }[] };
+    expect(body1.choices[0].message.content).toBe("answer-1");
+
+    // assistantCount 5 OVERSHOOTS the script (extra bubbles) → the highest
+    // scripted turn at/before the count (turnIndex 2) answers, NOT a miss.
+    const res2 = await chatPost(mock.url, [
+      { role: "user", content: "step" },
+      { role: "assistant", content: "a" },
+      { role: "assistant", content: "b" },
+      { role: "assistant", content: "c" },
+      { role: "assistant", content: "d" },
+      { role: "assistant", content: "e" },
+      { role: "user", content: "step" },
+    ]);
+    expect(res2.status).toBe(200);
+    const body2 = (await res2.json()) as { choices: { message: { content: string } }[] };
+    expect(body2.choices[0].message.content).toBe("answer-2");
+  });
+});

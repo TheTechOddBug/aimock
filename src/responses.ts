@@ -36,7 +36,7 @@ import {
   strictNoMatchMessage,
   strictNoMatchLogLine,
 } from "./helpers.js";
-import { matchFixtureDiagnostic } from "./router.js";
+import { matchFixtureDiagnostic, recordMatchOptions } from "./router.js";
 import { writeErrorResponse, delay, calculateDelay } from "./sse-writer.js";
 import { createInterruptionSignal } from "./interruption.js";
 import type { RecordedTimings } from "./types.js";
@@ -967,6 +967,10 @@ export async function handleResponses(
     completionReq,
     journal.getFixtureMatchCountsForTest(testId),
     defaults.requestTransform,
+    // Record mode proxies on a miss to capture a fresh turn (see record gate
+    // below), so keep turnIndex strict to prevent an earlier-turn fixture from
+    // shadowing a longer request and skipping the new turn's recording.
+    recordMatchOptions(!!defaults.record, defaults.logger),
   );
 
   if (fixture) {

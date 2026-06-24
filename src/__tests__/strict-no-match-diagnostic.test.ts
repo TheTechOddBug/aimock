@@ -99,13 +99,31 @@ describe("matchFixtureDiagnostic", () => {
     expect(result.skippedBySequenceOrTurn).toBe(1);
   });
 
-  it("counts a fixture that matched the shape but failed the turnIndex gate", () => {
+  it("does NOT skip a uniquely content-matching fixture on a turnIndex mismatch (content-anchored replay)", () => {
     const fixture: Fixture = {
       match: { userMessage: "hello", turnIndex: 1 },
       response: { content: "hi" },
     };
-    // Request has zero assistant turns, so turnIndex: 1 cannot match.
+    // Request has zero assistant turns, but turnIndex is a non-fatal
+    // disambiguator on the replay path — a fixture that is the only content
+    // match must not be rejected for an off-by-N assistant count. It matches,
+    // and nothing is "skipped by sequence/turn state".
     const result = matchFixtureDiagnostic([fixture], chatRequest("hello"));
+    expect(result.fixture).toBe(fixture);
+    expect(result.skippedBySequenceOrTurn).toBe(0);
+  });
+
+  it("keeps turnIndex a strict skip gate under strictTurnIndex (record mode)", () => {
+    const fixture: Fixture = {
+      match: { userMessage: "hello", turnIndex: 1 },
+      response: { content: "hi" },
+    };
+    // In record mode a miss proxies upstream to capture the new turn, so an
+    // earlier-turn capture must not shadow a longer request — turnIndex stays
+    // an exact reject gate and the shape-matching candidate is counted skipped.
+    const result = matchFixtureDiagnostic([fixture], chatRequest("hello"), undefined, undefined, {
+      strictTurnIndex: true,
+    });
     expect(result.fixture).toBeNull();
     expect(result.skippedBySequenceOrTurn).toBe(1);
   });
@@ -216,17 +234,19 @@ describe("strict-mode 503 sequence/turn disambiguation", () => {
     expect(body.error.type).toBe("invalid_request_error");
   });
 
-  it("turnIndex mismatch → skipped-by-state message (503, envelope intact)", async () => {
+  it("turnIndex mismatch on a unique content match → 200 (content-anchored replay, no false strict miss)", async () => {
     const fixtures: Fixture[] = [
       { match: { userMessage: "hello", turnIndex: 1 }, response: { content: "hi" } },
     ];
+    // No record config → replay path. The request has 0 assistant turns but the
+    // fixture is the only content match, so the relaxed turnIndex disambiguator
+    // matches it instead of producing a false strict-mode 503 ("empty assistant
+    // response"). This is the regression this matcher change fixes.
     server = await createServer(fixtures, { port: 0, strict: true });
-    // Request has 0 assistant turns, so turnIndex:1 is skipped by turn state.
     const res = await httpPost(`${server.url}/v1/chat/completions`, chatRequest("hello"));
-    expect(res.status).toBe(503);
+    expect(res.status).toBe(200);
     const body = JSON.parse(res.body);
-    expect(body.error.message).toMatch(SKIPPED_BY_STATE_RE);
-    expect(body.error.type).toBe("invalid_request_error");
+    expect(body.choices[0].message.content).toBe("hi");
   });
 
   it("invokes a stateful match.predicate EXACTLY ONCE on the strict no-match path", async () => {

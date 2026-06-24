@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Replay matching is content-anchored: `turnIndex` disambiguates, no longer a hard reject gate (#276)
+- Empirical over 9769 real requests: 3213 false-miss fixes, 0 new misses, 0 wrong-fixture (#276)
+- Diverges only on off-by-N assistant count in either direction (behind OR ahead of turn) (#276)
+- New `turnIndexRelaxed` match diagnostic + one-shot logger warn on a divergent relaxed serve (#276)
+- `AIMOCK_STRICT_TURN_INDEX=1` restores the legacy strict turnIndex gate for replay (#276)
+
 ### Fixed
 
 - Gemini Interactions mock now emits the SDK 2.x event protocol on both paths — streamed SSE (`step.*`, `interaction.created`/`completed`, tool args via `arguments_delta`) and non-streaming responses (`steps`/`output_text`); legacy 1.x recorded fixtures still parse (#279)
