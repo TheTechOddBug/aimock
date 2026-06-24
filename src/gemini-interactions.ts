@@ -446,25 +446,25 @@ export function buildInteractionsTextSSEEvents(
 ): InteractionsSSEEvent[] {
   const events: InteractionsSSEEvent[] = [];
 
-  // interaction.start
+  // interaction.created
   events.push({
-    event_type: "interaction.start",
+    event_type: "interaction.created",
     interaction: { id: interactionId, status: "in_progress" },
     event_id: nextEventId(),
   });
 
-  // content.start
+  // step.start — text step is the model_output
   events.push({
-    event_type: "content.start",
+    event_type: "step.start",
     index: 0,
-    content: { type: "text" },
+    step: { type: "model_output" },
     event_id: nextEventId(),
   });
 
-  // content.delta(s)
+  // step.delta(s) — inner delta shape is unchanged ({ type: "text", text })
   if (content.length === 0) {
     events.push({
-      event_type: "content.delta",
+      event_type: "step.delta",
       index: 0,
       delta: { type: "text", text: "" },
       event_id: nextEventId(),
@@ -473,7 +473,7 @@ export function buildInteractionsTextSSEEvents(
     for (let i = 0; i < content.length; i += chunkSize) {
       const slice = content.slice(i, i + chunkSize);
       events.push({
-        event_type: "content.delta",
+        event_type: "step.delta",
         index: 0,
         delta: { type: "text", text: slice },
         event_id: nextEventId(),
@@ -481,16 +481,16 @@ export function buildInteractionsTextSSEEvents(
     }
   }
 
-  // content.stop
+  // step.stop
   events.push({
-    event_type: "content.stop",
+    event_type: "step.stop",
     index: 0,
     event_id: nextEventId(),
   });
 
-  // interaction.complete
+  // interaction.completed
   events.push({
-    event_type: "interaction.complete",
+    event_type: "interaction.completed",
     interaction: {
       id: interactionId,
       status: "completed",
@@ -510,14 +510,17 @@ export function buildInteractionsToolCallSSEEvents(
 ): InteractionsSSEEvent[] {
   const events: InteractionsSSEEvent[] = [];
 
-  // interaction.start
+  // interaction.created
   events.push({
-    event_type: "interaction.start",
+    event_type: "interaction.created",
     interaction: { id: interactionId, status: "in_progress" },
     event_id: nextEventId(),
   });
 
-  // Each tool call gets its own content.start/delta/stop bracket
+  // Each tool call gets its own step.start/delta/stop bracket. In SDK 2.x the
+  // call identity (id, name) lives on step.start; the arguments stream as a
+  // dedicated `arguments_delta` carrying a JSON-string fragment, and step.start
+  // carries an empty `arguments: {}` placeholder.
   for (let idx = 0; idx < toolCalls.length; idx++) {
     const tc = toolCalls[idx];
     let argsObj: unknown;
@@ -531,34 +534,39 @@ export function buildInteractionsToolCallSSEEvents(
     }
 
     events.push({
-      event_type: "content.start",
+      event_type: "step.start",
       index: idx,
-      content: { type: "function_call" },
-      event_id: nextEventId(),
-    });
-
-    events.push({
-      event_type: "content.delta",
-      index: idx,
-      delta: {
+      step: {
         type: "function_call",
         id: tc.id || generateToolCallId(),
         name: tc.name,
-        arguments: argsObj,
+        arguments: {},
+      },
+      event_id: nextEventId(),
+    });
+
+    // arguments_delta.arguments is a string fragment; emitting the full
+    // serialized object as one fragment keeps the concatenation valid JSON.
+    events.push({
+      event_type: "step.delta",
+      index: idx,
+      delta: {
+        type: "arguments_delta",
+        arguments: JSON.stringify(argsObj),
       },
       event_id: nextEventId(),
     });
 
     events.push({
-      event_type: "content.stop",
+      event_type: "step.stop",
       index: idx,
       event_id: nextEventId(),
     });
   }
 
-  // interaction.complete
+  // interaction.completed
   events.push({
-    event_type: "interaction.complete",
+    event_type: "interaction.completed",
     interaction: {
       id: interactionId,
       status: "requires_action",
@@ -580,24 +588,24 @@ export function buildInteractionsContentWithToolCallsSSEEvents(
 ): InteractionsSSEEvent[] {
   const events: InteractionsSSEEvent[] = [];
 
-  // interaction.start
+  // interaction.created
   events.push({
-    event_type: "interaction.start",
+    event_type: "interaction.created",
     interaction: { id: interactionId, status: "in_progress" },
     event_id: nextEventId(),
   });
 
-  // Text content at index 0
+  // Text content at index 0 (model_output step)
   events.push({
-    event_type: "content.start",
+    event_type: "step.start",
     index: 0,
-    content: { type: "text" },
+    step: { type: "model_output" },
     event_id: nextEventId(),
   });
 
   if (content.length === 0) {
     events.push({
-      event_type: "content.delta",
+      event_type: "step.delta",
       index: 0,
       delta: { type: "text", text: "" },
       event_id: nextEventId(),
@@ -606,7 +614,7 @@ export function buildInteractionsContentWithToolCallsSSEEvents(
     for (let i = 0; i < content.length; i += chunkSize) {
       const slice = content.slice(i, i + chunkSize);
       events.push({
-        event_type: "content.delta",
+        event_type: "step.delta",
         index: 0,
         delta: { type: "text", text: slice },
         event_id: nextEventId(),
@@ -615,12 +623,12 @@ export function buildInteractionsContentWithToolCallsSSEEvents(
   }
 
   events.push({
-    event_type: "content.stop",
+    event_type: "step.stop",
     index: 0,
     event_id: nextEventId(),
   });
 
-  // Tool calls at index 1+
+  // Tool calls at index 1+ (identity on step.start, args as arguments_delta)
   for (let i = 0; i < toolCalls.length; i++) {
     const tc = toolCalls[i];
     const idx = i + 1; // offset by 1 because text is index 0
@@ -635,34 +643,37 @@ export function buildInteractionsContentWithToolCallsSSEEvents(
     }
 
     events.push({
-      event_type: "content.start",
+      event_type: "step.start",
       index: idx,
-      content: { type: "function_call" },
-      event_id: nextEventId(),
-    });
-
-    events.push({
-      event_type: "content.delta",
-      index: idx,
-      delta: {
+      step: {
         type: "function_call",
         id: tc.id || generateToolCallId(),
         name: tc.name,
-        arguments: argsObj,
+        arguments: {},
       },
       event_id: nextEventId(),
     });
 
     events.push({
-      event_type: "content.stop",
+      event_type: "step.delta",
+      index: idx,
+      delta: {
+        type: "arguments_delta",
+        arguments: JSON.stringify(argsObj),
+      },
+      event_id: nextEventId(),
+    });
+
+    events.push({
+      event_type: "step.stop",
       index: idx,
       event_id: nextEventId(),
     });
   }
 
-  // interaction.complete
+  // interaction.completed
   events.push({
-    event_type: "interaction.complete",
+    event_type: "interaction.completed",
     interaction: {
       id: interactionId,
       status: "requires_action",
@@ -711,10 +722,10 @@ export async function writeGeminiInteractionsSSEStream(
     if (res.writableEnded) return true;
     // Data-only SSE (no event: prefix, no [DONE])
     res.write(`data: ${JSON.stringify(event)}\n\n`);
-    // Only count content deltas for truncateAfterChunks — framing events
-    // (interaction.start, content.start, content.stop, interaction.complete)
+    // Only count step deltas for truncateAfterChunks — framing events
+    // (interaction.created, step.start, step.stop, interaction.completed)
     // should not consume chunk budget or trigger the chunk-sent callback.
-    if (event.event_type === "content.delta") {
+    if (event.event_type === "step.delta") {
       onChunkSent?.();
       chunkIndex++;
     }

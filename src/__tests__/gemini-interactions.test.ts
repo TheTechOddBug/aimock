@@ -830,19 +830,20 @@ describe("SSE event builders", () => {
     resetEventIdCounter();
   });
 
-  it("builds correct text SSE event sequence", () => {
+  it("builds correct text SSE event sequence (SDK 2.x)", () => {
     const events = buildInteractionsTextSSEEvents("Hello!", "aimock-int-0", 100);
-    expect(events[0].event_type).toBe("interaction.start");
-    expect(events[1].event_type).toBe("content.start");
+    expect(events[0].event_type).toBe("interaction.created");
+    expect(events[1].event_type).toBe("step.start");
     expect(events[1].index).toBe(0);
-    expect(events[2].event_type).toBe("content.delta");
+    expect((events[1].step as Record<string, unknown>).type).toBe("model_output");
+    expect(events[2].event_type).toBe("step.delta");
     expect((events[2].delta as Record<string, unknown>).type).toBe("text");
     expect((events[2].delta as Record<string, unknown>).text).toBe("Hello!");
-    expect(events[3].event_type).toBe("content.stop");
-    expect(events[4].event_type).toBe("interaction.complete");
+    expect(events[3].event_type).toBe("step.stop");
+    expect(events[4].event_type).toBe("interaction.completed");
   });
 
-  it("builds correct tool call SSE event sequence", () => {
+  it("builds correct tool call SSE event sequence (SDK 2.x)", () => {
     const events = buildInteractionsToolCallSSEEvents(
       [{ name: "get_weather", arguments: '{"city":"NYC"}', id: "call_1" }],
       "aimock-int-0",
@@ -850,19 +851,26 @@ describe("SSE event builders", () => {
     );
     const eventTypes = events.map((e) => e.event_type);
     expect(eventTypes).toEqual([
-      "interaction.start",
-      "content.start",
-      "content.delta",
-      "content.stop",
-      "interaction.complete",
+      "interaction.created",
+      "step.start",
+      "step.delta",
+      "step.stop",
+      "interaction.completed",
     ]);
+    // Identity (id/name) lives on step.start; arguments are an empty placeholder.
+    const step = events[1].step as Record<string, unknown>;
+    expect(step.type).toBe("function_call");
+    expect(step.id).toBe("call_1");
+    expect(step.name).toBe("get_weather");
+    expect(step.arguments).toEqual({});
+    // Arguments stream as a JSON-string fragment in an arguments_delta.
     const delta = events[2].delta as Record<string, unknown>;
-    expect(delta.type).toBe("function_call");
-    expect(delta.name).toBe("get_weather");
-    expect(delta.arguments).toEqual({ city: "NYC" });
+    expect(delta.type).toBe("arguments_delta");
+    expect(delta.arguments).toBe('{"city":"NYC"}');
+    expect(JSON.parse(delta.arguments as string)).toEqual({ city: "NYC" });
   });
 
-  it("builds content+tools SSE with correct indices", () => {
+  it("builds content+tools SSE with correct indices (SDK 2.x)", () => {
     const events = buildInteractionsContentWithToolCallsSSEEvents(
       "Text",
       [{ name: "fn", arguments: '{"a":1}', id: "call_1" }],
@@ -870,13 +878,14 @@ describe("SSE event builders", () => {
       100,
       logger,
     );
-    // Find content.start events — should have indices 0 and 1
-    const contentStarts = events.filter((e) => e.event_type === "content.start");
-    expect(contentStarts).toHaveLength(2);
-    expect(contentStarts[0].index).toBe(0); // text
-    expect((contentStarts[0].content as Record<string, unknown>).type).toBe("text");
-    expect(contentStarts[1].index).toBe(1); // function_call
-    expect((contentStarts[1].content as Record<string, unknown>).type).toBe("function_call");
+    // Find step.start events — should have indices 0 (text) and 1 (function_call)
+    const stepStarts = events.filter((e) => e.event_type === "step.start");
+    expect(stepStarts).toHaveLength(2);
+    expect(stepStarts[0].index).toBe(0); // text
+    expect((stepStarts[0].step as Record<string, unknown>).type).toBe("model_output");
+    expect(stepStarts[1].index).toBe(1); // function_call
+    expect((stepStarts[1].step as Record<string, unknown>).type).toBe("function_call");
+    expect((stepStarts[1].step as Record<string, unknown>).name).toBe("fn");
   });
 
   it("increments event_id correctly", () => {
@@ -885,11 +894,11 @@ describe("SSE event builders", () => {
     expect(ids).toEqual(["evt_1", "evt_2", "evt_3", "evt_4", "evt_5"]);
   });
 
-  it("includes usage in interaction.complete event", () => {
+  it("includes usage in interaction.completed event", () => {
     const events = buildInteractionsTextSSEEvents("Hi", "aimock-int-0", 100, {
       usage: { input_tokens: 10, output_tokens: 5 },
     });
-    const completeEvent = events.find((e) => e.event_type === "interaction.complete")!;
+    const completeEvent = events.find((e) => e.event_type === "interaction.completed")!;
     const interaction = completeEvent.interaction as Record<string, unknown>;
     expect(interaction.usage).toEqual({
       total_input_tokens: 10,
@@ -900,7 +909,7 @@ describe("SSE event builders", () => {
 
   it("chunks text by chunkSize", () => {
     const events = buildInteractionsTextSSEEvents("ABCDEFGH", "aimock-int-0", 3);
-    const deltas = events.filter((e) => e.event_type === "content.delta");
+    const deltas = events.filter((e) => e.event_type === "step.delta");
     expect(deltas).toHaveLength(3); // ABC, DEF, GH
     expect((deltas[0].delta as Record<string, unknown>).text).toBe("ABC");
     expect((deltas[1].delta as Record<string, unknown>).text).toBe("DEF");
@@ -1071,11 +1080,11 @@ describe("Gemini Interactions — streaming", () => {
     expect(events.length).toBeGreaterThanOrEqual(5);
 
     const eventTypes = (events as Array<Record<string, unknown>>).map((e) => e.event_type);
-    expect(eventTypes[0]).toBe("interaction.start");
-    expect(eventTypes[1]).toBe("content.start");
-    expect(eventTypes).toContain("content.delta");
-    expect(eventTypes).toContain("content.stop");
-    expect(eventTypes[eventTypes.length - 1]).toBe("interaction.complete");
+    expect(eventTypes[0]).toBe("interaction.created");
+    expect(eventTypes[1]).toBe("step.start");
+    expect(eventTypes).toContain("step.delta");
+    expect(eventTypes).toContain("step.stop");
+    expect(eventTypes[eventTypes.length - 1]).toBe("interaction.completed");
   });
 
   it("accumulates content from text deltas", async () => {
@@ -1093,14 +1102,13 @@ describe("Gemini Interactions — streaming", () => {
     });
     const events = parseInteractionsSSEEvents(res.body) as Array<Record<string, unknown>>;
     const textDeltas = events.filter(
-      (e) =>
-        e.event_type === "content.delta" && (e.delta as Record<string, unknown>).type === "text",
+      (e) => e.event_type === "step.delta" && (e.delta as Record<string, unknown>).type === "text",
     );
     const accumulated = textDeltas.map((e) => (e.delta as Record<string, unknown>).text).join("");
     expect(accumulated).toBe("ABCDEFGHIJ");
   });
 
-  it("streams tool call deltas", async () => {
+  it("streams tool call as step.start identity + arguments_delta", async () => {
     instance = await createServer([...allFixtures]);
     const res = await post(`${instance.url}/v1beta/interactions`, {
       model: "gemini-2.5-flash",
@@ -1108,15 +1116,23 @@ describe("Gemini Interactions — streaming", () => {
       stream: true,
     });
     const events = parseInteractionsSSEEvents(res.body) as Array<Record<string, unknown>>;
-    const funcDeltas = events.filter(
+    const stepStart = events.find(
       (e) =>
-        e.event_type === "content.delta" &&
-        (e.delta as Record<string, unknown>).type === "function_call",
+        e.event_type === "step.start" &&
+        (e.step as Record<string, unknown>).type === "function_call",
+    )!;
+    const step = stepStart.step as Record<string, unknown>;
+    expect(step.name).toBe("get_weather");
+    expect(step.id).toBe("call_1");
+
+    const argDeltas = events.filter(
+      (e) =>
+        e.event_type === "step.delta" &&
+        (e.delta as Record<string, unknown>).type === "arguments_delta",
     );
-    expect(funcDeltas).toHaveLength(1);
-    const delta = funcDeltas[0].delta as Record<string, unknown>;
-    expect(delta.name).toBe("get_weather");
-    expect(delta.arguments).toEqual({ city: "NYC" });
+    expect(argDeltas).toHaveLength(1);
+    const argsStr = (argDeltas[0].delta as Record<string, unknown>).arguments as string;
+    expect(JSON.parse(argsStr)).toEqual({ city: "NYC" });
   });
 
   it("assigns correct indices for content+tools stream", async () => {
@@ -1130,16 +1146,15 @@ describe("Gemini Interactions — streaming", () => {
 
     // Text at index 0, tool call at index 1
     const textDelta = events.find(
-      (e) =>
-        e.event_type === "content.delta" && (e.delta as Record<string, unknown>).type === "text",
+      (e) => e.event_type === "step.delta" && (e.delta as Record<string, unknown>).type === "text",
     );
-    const toolDelta = events.find(
+    const toolStart = events.find(
       (e) =>
-        e.event_type === "content.delta" &&
-        (e.delta as Record<string, unknown>).type === "function_call",
+        e.event_type === "step.start" &&
+        (e.step as Record<string, unknown>).type === "function_call",
     );
     expect(textDelta?.index).toBe(0);
-    expect(toolDelta?.index).toBe(1);
+    expect(toolStart?.index).toBe(1);
   });
 
   it("includes interactionId in lifecycle events", async () => {
@@ -1151,8 +1166,8 @@ describe("Gemini Interactions — streaming", () => {
     });
     const events = parseInteractionsSSEEvents(res.body) as Array<Record<string, unknown>>;
 
-    const startEvent = events.find((e) => e.event_type === "interaction.start")!;
-    const completeEvent = events.find((e) => e.event_type === "interaction.complete")!;
+    const startEvent = events.find((e) => e.event_type === "interaction.created")!;
+    const completeEvent = events.find((e) => e.event_type === "interaction.completed")!;
 
     const startInteraction = startEvent.interaction as Record<string, unknown>;
     const completeInteraction = completeEvent.interaction as Record<string, unknown>;
@@ -1303,69 +1318,97 @@ describe("Gemini Interactions — fixture matching", () => {
 // ─── Stream collapse ────────────────────────────────────────────────────
 
 describe("collapseGeminiInteractionsSSE", () => {
-  it("collapses text deltas", () => {
+  it("collapses text deltas (SDK 2.x)", () => {
     const sse = [
-      'data: {"event_type":"interaction.start","interaction":{"id":"int-0","status":"in_progress"},"event_id":"evt_1"}',
-      'data: {"event_type":"content.start","index":0,"content":{"type":"text"},"event_id":"evt_2"}',
-      'data: {"event_type":"content.delta","index":0,"delta":{"type":"text","text":"Hello "},"event_id":"evt_3"}',
-      'data: {"event_type":"content.delta","index":0,"delta":{"type":"text","text":"World"},"event_id":"evt_4"}',
-      'data: {"event_type":"content.stop","index":0,"event_id":"evt_5"}',
-      'data: {"event_type":"interaction.complete","interaction":{"id":"int-0","status":"completed","usage":{"total_input_tokens":10,"total_output_tokens":5,"total_tokens":15}},"event_id":"evt_6"}',
+      'data: {"event_type":"interaction.created","interaction":{"id":"int-0","status":"in_progress"},"event_id":"evt_1"}',
+      'data: {"event_type":"step.start","index":0,"step":{"type":"model_output"},"event_id":"evt_2"}',
+      'data: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"Hello "},"event_id":"evt_3"}',
+      'data: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"World"},"event_id":"evt_4"}',
+      'data: {"event_type":"step.stop","index":0,"event_id":"evt_5"}',
+      'data: {"event_type":"interaction.completed","interaction":{"id":"int-0","status":"completed","usage":{"total_input_tokens":10,"total_output_tokens":5,"total_tokens":15}},"event_id":"evt_6"}',
     ].join("\n\n");
     const result = collapseGeminiInteractionsSSE(sse);
     expect(result.content).toBe("Hello World");
     expect(result.toolCalls).toBeUndefined();
   });
 
-  it("collapses tool call deltas", () => {
+  it("collapses tool call via step.start identity + arguments_delta (SDK 2.x)", () => {
     const sse = [
-      'data: {"event_type":"interaction.start","interaction":{"id":"int-0"},"event_id":"evt_1"}',
-      'data: {"event_type":"content.start","index":0,"content":{"type":"function_call"},"event_id":"evt_2"}',
-      'data: {"event_type":"content.delta","index":0,"delta":{"type":"function_call","id":"call_1","name":"get_weather","arguments":{"city":"NYC"}},"event_id":"evt_3"}',
-      'data: {"event_type":"content.stop","index":0,"event_id":"evt_4"}',
-      'data: {"event_type":"interaction.complete","interaction":{"id":"int-0","status":"requires_action"},"event_id":"evt_5"}',
+      'data: {"event_type":"interaction.created","interaction":{"id":"int-0"},"event_id":"evt_1"}',
+      'data: {"event_type":"step.start","index":0,"step":{"type":"function_call","id":"call_1","name":"get_weather","arguments":{}},"event_id":"evt_2"}',
+      'data: {"event_type":"step.delta","index":0,"delta":{"type":"arguments_delta","arguments":"{\\"city\\":"},"event_id":"evt_3"}',
+      'data: {"event_type":"step.delta","index":0,"delta":{"type":"arguments_delta","arguments":"\\"NYC\\"}"},"event_id":"evt_4"}',
+      'data: {"event_type":"step.stop","index":0,"event_id":"evt_5"}',
+      'data: {"event_type":"interaction.completed","interaction":{"id":"int-0","status":"requires_action"},"event_id":"evt_6"}',
     ].join("\n\n");
     const result = collapseGeminiInteractionsSSE(sse);
     expect(result.toolCalls).toHaveLength(1);
     expect(result.toolCalls![0].name).toBe("get_weather");
+    // Fragments concatenate into valid JSON by step.stop.
     expect(result.toolCalls![0].arguments).toBe('{"city":"NYC"}');
     expect(result.toolCalls![0].id).toBe("call_1");
   });
 
-  it("collapses content + tool calls", () => {
+  it("uses step.start arguments object when no arguments_delta streams (SDK 2.x)", () => {
     const sse = [
-      'data: {"event_type":"content.delta","index":0,"delta":{"type":"text","text":"Help"},"event_id":"evt_1"}',
-      'data: {"event_type":"content.delta","index":1,"delta":{"type":"function_call","id":"c1","name":"fn","arguments":{"x":1}},"event_id":"evt_2"}',
+      'data: {"event_type":"step.start","index":0,"step":{"type":"function_call","id":"call_1","name":"fn","arguments":{"x":1}},"event_id":"evt_1"}',
+      'data: {"event_type":"step.stop","index":0,"event_id":"evt_2"}',
+    ].join("\n\n");
+    const result = collapseGeminiInteractionsSSE(sse);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0].arguments).toBe('{"x":1}');
+  });
+
+  it("collapses content + tool calls (SDK 2.x)", () => {
+    const sse = [
+      'data: {"event_type":"step.start","index":0,"step":{"type":"model_output"},"event_id":"evt_1"}',
+      'data: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"Help"},"event_id":"evt_2"}',
+      'data: {"event_type":"step.stop","index":0,"event_id":"evt_3"}',
+      'data: {"event_type":"step.start","index":1,"step":{"type":"function_call","id":"c1","name":"fn","arguments":{}},"event_id":"evt_4"}',
+      'data: {"event_type":"step.delta","index":1,"delta":{"type":"arguments_delta","arguments":"{\\"x\\":1}"},"event_id":"evt_5"}',
+      'data: {"event_type":"step.stop","index":1,"event_id":"evt_6"}',
     ].join("\n\n");
     const result = collapseGeminiInteractionsSSE(sse);
     expect(result.content).toBe("Help");
     expect(result.toolCalls).toHaveLength(1);
     expect(result.toolCalls![0].name).toBe("fn");
+    expect(result.toolCalls![0].arguments).toBe('{"x":1}');
   });
 
-  it("collapses thought_summary deltas as reasoning", () => {
+  it("collapses thought_summary deltas as reasoning (SDK 2.x nested content)", () => {
     const sse = [
-      'data: {"event_type":"content.delta","index":0,"delta":{"type":"thought_summary","text":"Thinking..."},"event_id":"evt_1"}',
-      'data: {"event_type":"content.delta","index":1,"delta":{"type":"text","text":"Answer"},"event_id":"evt_2"}',
+      'data: {"event_type":"step.delta","index":0,"delta":{"type":"thought_summary","content":{"text":"Thinking..."}},"event_id":"evt_1"}',
+      'data: {"event_type":"step.delta","index":1,"delta":{"type":"text","text":"Answer"},"event_id":"evt_2"}',
     ].join("\n\n");
     const result = collapseGeminiInteractionsSSE(sse);
     expect(result.reasoning).toBe("Thinking...");
     expect(result.content).toBe("Answer");
   });
 
+  it("drops arguments_delta with no correlating step.start", () => {
+    const sse = [
+      'data: {"event_type":"step.delta","index":4,"delta":{"type":"arguments_delta","arguments":"{}"},"event_id":"evt_1"}',
+      'data: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"ok"},"event_id":"evt_2"}',
+    ].join("\n\n");
+    const result = collapseGeminiInteractionsSSE(sse);
+    expect(result.content).toBe("ok");
+    expect(result.toolCalls).toBeUndefined();
+    expect(result.droppedChunks).toBe(1);
+  });
+
   it("handles malformed chunks gracefully", () => {
     const sse = [
       "data: not-json",
-      'data: {"event_type":"content.delta","index":0,"delta":{"type":"text","text":"ok"},"event_id":"evt_1"}',
+      'data: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"ok"},"event_id":"evt_1"}',
     ].join("\n\n");
     const result = collapseGeminiInteractionsSSE(sse);
     expect(result.content).toBe("ok");
     expect(result.droppedChunks).toBe(1);
   });
 
-  it("handles incomplete stream (no interaction.complete)", () => {
+  it("handles incomplete stream (no interaction.completed)", () => {
     const sse = [
-      'data: {"event_type":"content.delta","index":0,"delta":{"type":"text","text":"partial"},"event_id":"evt_1"}',
+      'data: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"partial"},"event_id":"evt_1"}',
     ].join("\n\n");
     const result = collapseGeminiInteractionsSSE(sse);
     expect(result.content).toBe("partial");
@@ -1374,6 +1417,54 @@ describe("collapseGeminiInteractionsSSE", () => {
   it("returns empty content for stream with no data events", () => {
     const result = collapseGeminiInteractionsSSE("");
     expect(result.content).toBe("");
+  });
+
+  it("round-trips emitter output back through the collapser", () => {
+    resetEventIdCounter();
+    const events = buildInteractionsContentWithToolCallsSSEEvents(
+      "Let me check",
+      [{ name: "get_weather", arguments: '{"city":"NYC"}', id: "call_1" }],
+      "aimock-int-0",
+      100,
+      new Logger("silent"),
+    );
+    const sse = events.map((e) => `data: ${JSON.stringify(e)}`).join("\n\n");
+    const result = collapseGeminiInteractionsSSE(sse);
+    expect(result.content).toBe("Let me check");
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0].name).toBe("get_weather");
+    expect(result.toolCalls![0].arguments).toBe('{"city":"NYC"}');
+    expect(result.toolCalls![0].id).toBe("call_1");
+  });
+
+  // ─── Backward compatibility: legacy SDK 1.x recorded fixtures ────────────
+
+  it("still collapses legacy 1.x content.delta text", () => {
+    const sse = [
+      'data: {"event_type":"content.delta","index":0,"delta":{"type":"text","text":"Hello "},"event_id":"evt_1"}',
+      'data: {"event_type":"content.delta","index":0,"delta":{"type":"text","text":"World"},"event_id":"evt_2"}',
+    ].join("\n\n");
+    const result = collapseGeminiInteractionsSSE(sse);
+    expect(result.content).toBe("Hello World");
+  });
+
+  it("still collapses legacy 1.x content.delta function_call", () => {
+    const sse = [
+      'data: {"event_type":"content.delta","index":0,"delta":{"type":"function_call","id":"call_1","name":"get_weather","arguments":{"city":"NYC"}},"event_id":"evt_1"}',
+    ].join("\n\n");
+    const result = collapseGeminiInteractionsSSE(sse);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0].name).toBe("get_weather");
+    expect(result.toolCalls![0].arguments).toBe('{"city":"NYC"}');
+    expect(result.toolCalls![0].id).toBe("call_1");
+  });
+
+  it("still collapses legacy 1.x flat thought_summary text", () => {
+    const sse = [
+      'data: {"event_type":"content.delta","index":0,"delta":{"type":"thought_summary","text":"Thinking..."},"event_id":"evt_1"}',
+    ].join("\n\n");
+    const result = collapseGeminiInteractionsSSE(sse);
+    expect(result.reasoning).toBe("Thinking...");
   });
 });
 
@@ -1450,7 +1541,7 @@ describe("Gemini Interactions — edge cases", () => {
       stream: true,
     });
     const events = parseInteractionsSSEEvents(res.body) as Array<Record<string, unknown>>;
-    const deltas = events.filter((e) => e.event_type === "content.delta");
+    const deltas = events.filter((e) => e.event_type === "step.delta");
     expect(deltas).toHaveLength(1);
     expect((deltas[0].delta as Record<string, unknown>).text).toBe("");
   });

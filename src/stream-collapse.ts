@@ -1190,9 +1190,16 @@ export function collapseBedrockEventStream(body: Buffer): CollapseResult {
 /**
  * Collapse Gemini Interactions SSE stream into a single response.
  *
- * Format (data-only, event_type inside JSON):
- *   data: {"event_type":"content.delta","index":0,"delta":{"type":"text","text":"Hello"}}\n\n
- *   data: {"event_type":"interaction.complete","interaction":{"id":"...","usage":{...}}}\n\n
+ * Handles the SDK 2.x event protocol (the "Interactions breaking changes,
+ * May 2026" shapes):
+ *   data: {"event_type":"step.start","index":1,"step":{"type":"function_call","id":"call_1","name":"fn","arguments":{}}}
+ *   data: {"event_type":"step.delta","index":0,"delta":{"type":"text","text":"Hello"}}
+ *   data: {"event_type":"step.delta","index":1,"delta":{"type":"arguments_delta","arguments":"{\"x\":1}"}}
+ *   data: {"event_type":"interaction.completed","interaction":{"id":"...","usage":{...}}}
+ *
+ * The legacy SDK 1.x shapes (`content.delta` with an inline `function_call`
+ * delta) are still accepted for backward compatibility with previously
+ * recorded fixtures.
  */
 export function collapseGeminiInteractionsSSE(body: string): CollapseResult {
   const lines = splitSSEEvents(body);
@@ -1200,7 +1207,14 @@ export function collapseGeminiInteractionsSSE(body: string): CollapseResult {
   let reasoning = "";
   let droppedChunks = 0;
   let firstDroppedSample: string | undefined;
+  // Legacy 1.x tool calls arrive fully formed in a single content.delta.
   const toolCalls: ToolCall[] = [];
+  // 2.x tool calls are assembled across step.start (identity) + arguments_delta
+  // (string fragments), keyed by step index.
+  const stepToolCalls = new Map<
+    number,
+    { id?: string; name: string; argsObj?: unknown; argsStr: string }
+  >();
 
   for (const line of lines) {
     const data = extractSSEData(splitSSELines(line));
@@ -1223,13 +1237,45 @@ export function collapseGeminiInteractionsSSE(body: string): CollapseResult {
     const eventType = parsed.event_type as string | undefined;
     if (!eventType) continue;
 
-    if (eventType === "content.delta") {
+    const index = typeof parsed.index === "number" ? parsed.index : undefined;
+
+    if (eventType === "step.start") {
+      // 2.x — tool-call identity lives on step.start, not in a delta.
+      const step = parsed.step as Record<string, unknown> | undefined;
+      if (step && step.type === "function_call" && index !== undefined) {
+        stepToolCalls.set(index, {
+          id: step.id ? String(step.id) : undefined,
+          name: String(step.name ?? ""),
+          // step.start may carry a fully-populated `arguments` object (non-
+          // streamed calls) or an empty `{}` placeholder (streamed calls).
+          argsObj: step.arguments,
+          argsStr: "",
+        });
+      }
+    } else if (eventType === "step.delta" || eventType === "content.delta") {
       const delta = parsed.delta as Record<string, unknown> | undefined;
       if (!delta) continue;
 
       if (delta.type === "text" && typeof delta.text === "string") {
         content += delta.text;
+      } else if (delta.type === "arguments_delta") {
+        // 2.x — argument fragment (a JSON string) keyed by step index.
+        const entry = index !== undefined ? stepToolCalls.get(index) : undefined;
+        if (entry) {
+          if (typeof delta.arguments === "string") {
+            entry.argsStr += delta.arguments;
+          }
+        } else {
+          droppedChunks++;
+          if (droppedChunks === 1) {
+            firstDroppedSample = `arguments_delta with no correlating step.start: ${surrogateSafeSlice(
+              payload,
+              200,
+            )}`;
+          }
+        }
       } else if (delta.type === "function_call") {
+        // Legacy 1.x — full tool call inline in a content.delta.
         toolCalls.push({
           name: String(delta.name ?? ""),
           arguments:
@@ -1238,10 +1284,27 @@ export function collapseGeminiInteractionsSSE(body: string): CollapseResult {
               : JSON.stringify(delta.arguments ?? {}),
           ...(delta.id ? { id: String(delta.id) } : {}),
         });
-      } else if (delta.type === "thought_summary" && typeof delta.text === "string") {
-        reasoning += delta.text;
+      } else if (delta.type === "thought_summary") {
+        // 2.x nests the text under `content.text`; 1.x used a flat `text`.
+        const summaryContent = delta.content as Record<string, unknown> | undefined;
+        if (summaryContent && typeof summaryContent.text === "string") {
+          reasoning += summaryContent.text;
+        } else if (typeof delta.text === "string") {
+          reasoning += delta.text;
+        }
       }
     }
+  }
+
+  // Finalize 2.x tool calls in step-index order.
+  for (const [, tc] of Array.from(stepToolCalls.entries()).sort(([a], [b]) => a - b)) {
+    const args =
+      tc.argsStr !== ""
+        ? tc.argsStr
+        : typeof tc.argsObj === "string"
+          ? tc.argsObj
+          : JSON.stringify(tc.argsObj ?? {});
+    toolCalls.push({ name: tc.name, arguments: args, ...(tc.id ? { id: tc.id } : {}) });
   }
 
   if (toolCalls.length > 0) {
