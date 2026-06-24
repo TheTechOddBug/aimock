@@ -337,8 +337,27 @@ export function buildInteractionsTextResponse(
     status: "completed",
     model: overrides?.model ?? model,
     role: "model",
-    outputs: [{ type: "text", text: content }],
+    output_text: content,
+    steps: [{ type: "model_output", content: [{ type: "text", text: content }] }],
     usage: interactionsUsage(overrides),
+  };
+}
+
+// Build a single SDK 2.x function_call step from a fixture tool call,
+// reusing the existing malformed-arguments guard (logger.warn + {} fallback).
+function buildFunctionCallStep(tc: ToolCall, logger: Logger): object {
+  let argsObj: unknown;
+  try {
+    argsObj = JSON.parse(tc.arguments || "{}");
+  } catch {
+    logger.warn(`Malformed JSON in fixture tool call arguments for "${tc.name}": ${tc.arguments}`);
+    argsObj = {};
+  }
+  return {
+    type: "function_call",
+    id: tc.id || generateToolCallId(),
+    name: tc.name,
+    arguments: argsObj,
   };
 }
 
@@ -354,23 +373,7 @@ export function buildInteractionsToolCallResponse(
     status: "requires_action",
     model: overrides?.model ?? model,
     role: "model",
-    outputs: toolCalls.map((tc) => {
-      let argsObj: unknown;
-      try {
-        argsObj = JSON.parse(tc.arguments || "{}");
-      } catch {
-        logger.warn(
-          `Malformed JSON in fixture tool call arguments for "${tc.name}": ${tc.arguments}`,
-        );
-        argsObj = {};
-      }
-      return {
-        type: "function_call",
-        id: tc.id || generateToolCallId(),
-        name: tc.name,
-        arguments: argsObj,
-      };
-    }),
+    steps: toolCalls.map((tc) => buildFunctionCallStep(tc, logger)),
     usage: interactionsUsage(overrides),
   };
 }
@@ -383,23 +386,9 @@ export function buildInteractionsContentWithToolCallsResponse(
   logger: Logger,
   overrides?: ResponseOverrides,
 ): object {
-  const outputs: object[] = [{ type: "text", text: content }];
+  const steps: object[] = [{ type: "model_output", content: [{ type: "text", text: content }] }];
   for (const tc of toolCalls) {
-    let argsObj: unknown;
-    try {
-      argsObj = JSON.parse(tc.arguments || "{}");
-    } catch {
-      logger.warn(
-        `Malformed JSON in fixture tool call arguments for "${tc.name}": ${tc.arguments}`,
-      );
-      argsObj = {};
-    }
-    outputs.push({
-      type: "function_call",
-      id: tc.id || generateToolCallId(),
-      name: tc.name,
-      arguments: argsObj,
-    });
+    steps.push(buildFunctionCallStep(tc, logger));
   }
 
   return {
@@ -407,7 +396,8 @@ export function buildInteractionsContentWithToolCallsResponse(
     status: "requires_action",
     model: overrides?.model ?? model,
     role: "model",
-    outputs,
+    output_text: content,
+    steps,
     usage: interactionsUsage(overrides),
   };
 }

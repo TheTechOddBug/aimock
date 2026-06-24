@@ -745,7 +745,10 @@ describe("response builders", () => {
     expect(resp.status).toBe("completed");
     expect(resp.model).toBe("gemini-2.5-flash");
     expect(resp.role).toBe("model");
-    expect(resp.outputs).toEqual([{ type: "text", text: "Hello!" }]);
+    expect(resp.output_text).toBe("Hello!");
+    expect(resp.steps).toEqual([
+      { type: "model_output", content: [{ type: "text", text: "Hello!" }] },
+    ]);
   });
 
   it("builds tool call response", () => {
@@ -756,11 +759,12 @@ describe("response builders", () => {
       logger,
     ) as Record<string, unknown>;
     expect(resp.status).toBe("requires_action");
-    const outputs = resp.outputs as Array<Record<string, unknown>>;
-    expect(outputs).toHaveLength(1);
-    expect(outputs[0].type).toBe("function_call");
-    expect(outputs[0].name).toBe("get_weather");
-    expect(outputs[0].arguments).toEqual({ city: "NYC" });
+    const steps = resp.steps as Array<Record<string, unknown>>;
+    expect(steps).toHaveLength(1);
+    expect(steps[0].type).toBe("function_call");
+    expect(steps[0].id).toBe("call_1");
+    expect(steps[0].name).toBe("get_weather");
+    expect(steps[0].arguments).toEqual({ city: "NYC" });
   });
 
   it("builds content+tools response", () => {
@@ -772,10 +776,13 @@ describe("response builders", () => {
       logger,
     ) as Record<string, unknown>;
     expect(resp.status).toBe("requires_action");
-    const outputs = resp.outputs as Array<Record<string, unknown>>;
-    expect(outputs).toHaveLength(2);
-    expect(outputs[0].type).toBe("text");
-    expect(outputs[1].type).toBe("function_call");
+    expect(resp.output_text).toBe("Here is the analysis");
+    const steps = resp.steps as Array<Record<string, unknown>>;
+    expect(steps).toHaveLength(2);
+    expect(steps[0].type).toBe("model_output");
+    expect(steps[0].content).toEqual([{ type: "text", text: "Here is the analysis" }]);
+    expect(steps[1].type).toBe("function_call");
+    expect(steps[1].name).toBe("analyze");
   });
 
   it("includes usage metadata", () => {
@@ -816,8 +823,8 @@ describe("response builders", () => {
       "id-0",
       logger,
     ) as Record<string, unknown>;
-    const outputs = resp.outputs as Array<Record<string, unknown>>;
-    expect(outputs[0].arguments).toEqual({});
+    const steps = resp.steps as Array<Record<string, unknown>>;
+    expect(steps[0].arguments).toEqual({});
   });
 });
 
@@ -1010,7 +1017,10 @@ describe("Gemini Interactions — non-streaming", () => {
     const body = JSON.parse(res.body);
     expect(body.status).toBe("completed");
     expect(body.role).toBe("model");
-    expect(body.outputs).toEqual([{ type: "text", text: "Hi there!" }]);
+    expect(body.output_text).toBe("Hi there!");
+    expect(body.steps).toEqual([
+      { type: "model_output", content: [{ type: "text", text: "Hi there!" }] },
+    ]);
     expect(body.id).toMatch(/^aimock-int-/);
   });
 
@@ -1024,11 +1034,11 @@ describe("Gemini Interactions — non-streaming", () => {
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body);
     expect(body.status).toBe("requires_action");
-    const outputs = body.outputs;
-    expect(outputs).toHaveLength(1);
-    expect(outputs[0].type).toBe("function_call");
-    expect(outputs[0].name).toBe("get_weather");
-    expect(outputs[0].arguments).toEqual({ city: "NYC" });
+    const steps = body.steps;
+    expect(steps).toHaveLength(1);
+    expect(steps[0].type).toBe("function_call");
+    expect(steps[0].name).toBe("get_weather");
+    expect(steps[0].arguments).toEqual({ city: "NYC" });
   });
 
   it("returns content + tool calls response", async () => {
@@ -1041,11 +1051,12 @@ describe("Gemini Interactions — non-streaming", () => {
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body);
     expect(body.status).toBe("requires_action");
-    expect(body.outputs).toHaveLength(2);
-    expect(body.outputs[0].type).toBe("text");
-    expect(body.outputs[0].text).toBe("Let me help you");
-    expect(body.outputs[1].type).toBe("function_call");
-    expect(body.outputs[1].name).toBe("analyze_data");
+    expect(body.output_text).toBe("Let me help you");
+    expect(body.steps).toHaveLength(2);
+    expect(body.steps[0].type).toBe("model_output");
+    expect(body.steps[0].content[0].text).toBe("Let me help you");
+    expect(body.steps[1].type).toBe("function_call");
+    expect(body.steps[1].name).toBe("analyze_data");
   });
 
   it("returns error response", async () => {
@@ -1122,7 +1133,10 @@ describe("Gemini Interactions — non-streaming", () => {
     });
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body);
-    expect(body.outputs).toEqual([{ type: "text", text: "Hi there!" }]);
+    expect(body.output_text).toBe("Hi there!");
+    expect(body.steps).toEqual([
+      { type: "model_output", content: [{ type: "text", text: "Hi there!" }] },
+    ]);
   });
 
   it("handles sequenceIndex for multi-turn", async () => {
@@ -1137,8 +1151,8 @@ describe("Gemini Interactions — non-streaming", () => {
       input: "step",
       stream: false,
     });
-    expect(JSON.parse(r1.body).outputs[0].text).toBe("First");
-    expect(JSON.parse(r2.body).outputs[0].text).toBe("Second");
+    expect(JSON.parse(r1.body).output_text).toBe("First");
+    expect(JSON.parse(r2.body).output_text).toBe("Second");
   });
 });
 
@@ -1334,7 +1348,7 @@ describe("Gemini Interactions — fixture matching", () => {
       input: "hello",
       stream: false,
     });
-    expect(JSON.parse(res.body).outputs[0].text).toBe("Hi there!");
+    expect(JSON.parse(res.body).output_text).toBe("Hi there!");
   });
 
   it("matches by sequenceIndex chaining", async () => {
@@ -1349,8 +1363,8 @@ describe("Gemini Interactions — fixture matching", () => {
       input: "step",
       stream: false,
     });
-    expect(JSON.parse(r1.body).outputs[0].text).toBe("First");
-    expect(JSON.parse(r2.body).outputs[0].text).toBe("Second");
+    expect(JSON.parse(r1.body).output_text).toBe("First");
+    expect(JSON.parse(r2.body).output_text).toBe("Second");
   });
 
   it("matches by model", async () => {
@@ -1360,7 +1374,7 @@ describe("Gemini Interactions — fixture matching", () => {
       input: "anything",
       stream: false,
     });
-    expect(JSON.parse(res.body).outputs[0].text).toBe("Pro response");
+    expect(JSON.parse(res.body).output_text).toBe("Pro response");
   });
 
   it("matches by predicate", async () => {
@@ -1370,7 +1384,7 @@ describe("Gemini Interactions — fixture matching", () => {
       input: "custom-check",
       stream: false,
     });
-    expect(JSON.parse(res.body).outputs[0].text).toBe("Predicate matched");
+    expect(JSON.parse(res.body).output_text).toBe("Predicate matched");
   });
 
   it("matches by toolName for tool-related fixtures", async () => {
@@ -1394,7 +1408,7 @@ describe("Gemini Interactions — fixture matching", () => {
     });
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body);
-    expect(body.outputs[0].name).toBe("search_tool");
+    expect(body.steps[0].name).toBe("search_tool");
   });
 });
 
@@ -1677,7 +1691,8 @@ describe("Gemini Interactions — edge cases", () => {
     });
     expect(res.status).toBe(200);
     const body = JSON.parse(res.body);
-    expect(body.outputs[0].text).toBe("");
+    expect(body.output_text).toBe("");
+    expect(body.steps[0].content[0].text).toBe("");
   });
 
   it("streams empty content correctly", async () => {

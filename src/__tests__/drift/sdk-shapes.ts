@@ -1587,7 +1587,8 @@ export function geminiInteractionsResponseShape(): ShapeNode {
     status: "completed",
     model: "gemini-2.5-flash",
     role: "model",
-    outputs: [{ type: "text", text: "Hello!" }],
+    output_text: "Hello!",
+    steps: [{ type: "model_output", content: [{ type: "text", text: "Hello!" }] }],
     usage: { total_input_tokens: 0, total_output_tokens: 0, total_tokens: 0 },
   });
 }
@@ -1598,7 +1599,7 @@ export function geminiInteractionsToolCallResponseShape(): ShapeNode {
     status: "requires_action",
     model: "gemini-2.5-flash",
     role: "model",
-    outputs: [
+    steps: [
       {
         type: "function_call",
         id: "call_abc123",
