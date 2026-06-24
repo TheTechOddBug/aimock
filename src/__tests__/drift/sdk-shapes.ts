@@ -1587,7 +1587,8 @@ export function geminiInteractionsResponseShape(): ShapeNode {
     status: "completed",
     model: "gemini-2.5-flash",
     role: "model",
-    outputs: [{ type: "text", text: "Hello!" }],
+    output_text: "Hello!",
+    steps: [{ type: "model_output", content: [{ type: "text", text: "Hello!" }] }],
     usage: { total_input_tokens: 0, total_output_tokens: 0, total_tokens: 0 },
   });
 }
@@ -1598,7 +1599,7 @@ export function geminiInteractionsToolCallResponseShape(): ShapeNode {
     status: "requires_action",
     model: "gemini-2.5-flash",
     role: "model",
-    outputs: [
+    steps: [
       {
         type: "function_call",
         id: "call_abc123",
@@ -1613,43 +1614,43 @@ export function geminiInteractionsToolCallResponseShape(): ShapeNode {
 export function geminiInteractionsStreamEventShapes(): SSEEventShape[] {
   return [
     {
-      type: "interaction.start",
+      type: "interaction.created",
       dataShape: extractShape({
-        event_type: "interaction.start",
+        event_type: "interaction.created",
         interaction: { id: "int_abc123", status: "in_progress" },
         event_id: "evt_1",
       }),
     },
     {
-      type: "content.start",
+      type: "step.start",
       dataShape: extractShape({
-        event_type: "content.start",
+        event_type: "step.start",
         index: 0,
-        content: { type: "text" },
+        step: { type: "model_output" },
         event_id: "evt_2",
       }),
     },
     {
-      type: "content.delta",
+      type: "step.delta",
       dataShape: extractShape({
-        event_type: "content.delta",
+        event_type: "step.delta",
         index: 0,
         delta: { type: "text", text: "Hello" },
         event_id: "evt_3",
       }),
     },
     {
-      type: "content.stop",
+      type: "step.stop",
       dataShape: extractShape({
-        event_type: "content.stop",
+        event_type: "step.stop",
         index: 0,
         event_id: "evt_4",
       }),
     },
     {
-      type: "interaction.complete",
+      type: "interaction.completed",
       dataShape: extractShape({
-        event_type: "interaction.complete",
+        event_type: "interaction.completed",
         interaction: {
           id: "int_abc123",
           status: "completed",
@@ -1664,48 +1665,51 @@ export function geminiInteractionsStreamEventShapes(): SSEEventShape[] {
 export function geminiInteractionsToolCallStreamEventShapes(): SSEEventShape[] {
   return [
     {
-      type: "interaction.start",
+      type: "interaction.created",
       dataShape: extractShape({
-        event_type: "interaction.start",
+        event_type: "interaction.created",
         interaction: { id: "int_abc123", status: "in_progress" },
         event_id: "evt_1",
       }),
     },
     {
-      type: "content.start",
+      type: "step.start",
       dataShape: extractShape({
-        event_type: "content.start",
+        event_type: "step.start",
         index: 0,
-        content: { type: "function_call" },
+        step: {
+          type: "function_call",
+          id: "call_abc123",
+          name: "get_weather",
+          arguments: {},
+        },
         event_id: "evt_2",
       }),
     },
     {
-      type: "content.delta",
+      type: "step.delta",
       dataShape: extractShape({
-        event_type: "content.delta",
+        event_type: "step.delta",
         index: 0,
         delta: {
-          type: "function_call",
-          id: "call_abc123",
-          name: "get_weather",
-          arguments: { city: "Paris" },
+          type: "arguments_delta",
+          arguments: '{"city":"Paris"}',
         },
         event_id: "evt_3",
       }),
     },
     {
-      type: "content.stop",
+      type: "step.stop",
       dataShape: extractShape({
-        event_type: "content.stop",
+        event_type: "step.stop",
         index: 0,
         event_id: "evt_4",
       }),
     },
     {
-      type: "interaction.complete",
+      type: "interaction.completed",
       dataShape: extractShape({
-        event_type: "interaction.complete",
+        event_type: "interaction.completed",
         interaction: {
           id: "int_abc123",
           status: "requires_action",
