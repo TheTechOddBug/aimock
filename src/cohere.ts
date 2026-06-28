@@ -328,12 +328,15 @@ function buildCohereContentWithToolCallsResponse(
   // (so a blocks-only fixture still produces correct output) but make no
   // ordering guarantee between the two fields. Legacy fixtures use the
   // `content` + `toolCalls` inputs unchanged.
-  const effectiveToolCalls: ToolCall[] =
-    blocks && blocks.length > 0
-      ? resolveFixtureBlocks(blocks)
-          .filter((b): b is Extract<FixtureBlock, { type: "toolCall" }> => b.type === "toolCall")
-          .map((b) => ({ name: b.name, arguments: b.arguments, id: b.id }))
-      : toolCalls;
+  // Resolve the blocks exactly once (pure: validate + copy, no id-gen) and
+  // reuse the single result for BOTH the tool-call and text derivation below.
+  const resolvedBlocks = blocks && blocks.length > 0 ? resolveFixtureBlocks(blocks) : undefined;
+
+  const effectiveToolCalls: ToolCall[] = resolvedBlocks
+    ? resolvedBlocks
+        .filter((b): b is Extract<FixtureBlock, { type: "toolCall" }> => b.type === "toolCall")
+        .map((b) => ({ name: b.name, arguments: b.arguments, id: b.id }))
+    : toolCalls;
 
   const cohereCalls = effectiveToolCalls.map((tc) => {
     let argsJson: string;
@@ -356,19 +359,25 @@ function buildCohereContentWithToolCallsResponse(
     };
   });
 
-  const effectiveContent: string =
-    blocks && blocks.length > 0
-      ? resolveFixtureBlocks(blocks)
-          .filter((b): b is Extract<FixtureBlock, { type: "text" }> => b.type === "text")
-          .map((b) => b.text)
-          .join("")
-      : content;
+  // For the blocks path, derive text only from actual text blocks. A tool-only
+  // blocks fixture has no text block, so it must NOT emit a spurious empty
+  // `{ type: "text", text: "" }` entry (real Cohere wouldn't). The legacy
+  // (no-blocks) path is unchanged: it always emits the `content` text entry.
+  const textBlocks = resolvedBlocks?.filter(
+    (b): b is Extract<FixtureBlock, { type: "text" }> => b.type === "text",
+  );
+  const hasTextEntry = resolvedBlocks ? (textBlocks?.length ?? 0) > 0 : true;
+  const effectiveContent: string = resolvedBlocks
+    ? (textBlocks ?? []).map((b) => b.text).join("")
+    : content;
 
   const contentBlocks: { type: string; text: string }[] = [];
   if (reasoning) {
     contentBlocks.push({ type: "text", text: reasoning });
   }
-  contentBlocks.push({ type: "text", text: effectiveContent });
+  if (hasTextEntry) {
+    contentBlocks.push({ type: "text", text: effectiveContent });
+  }
 
   return {
     id: overrides?.id ?? generateMessageId(),

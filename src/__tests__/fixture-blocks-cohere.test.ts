@@ -48,6 +48,32 @@ async function postCohereStream(mock: LLMock, userMessage: string): Promise<Cohe
   return parseCohereSSEEvents(await res.text());
 }
 
+interface CohereNonStreamResponse {
+  message: {
+    content: { type: string; text: string }[];
+    tool_calls: { function: { name: string; arguments: string } }[];
+  };
+}
+
+async function postCohereNonStream(
+  mock: LLMock,
+  userMessage: string,
+): Promise<CohereNonStreamResponse> {
+  const res = await fetch(`${mock.url}/v2/chat`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer test-key",
+    },
+    body: JSON.stringify({
+      model: "command-r-plus",
+      messages: [{ role: "user", content: userMessage }],
+      stream: false,
+    }),
+  });
+  return (await res.json()) as CohereNonStreamResponse;
+}
+
 describe("Cohere v2 Chat — ordered fixture blocks (tool-first)", () => {
   let mock: LLMock | null = null;
 
@@ -175,5 +201,66 @@ describe("Cohere v2 Chat — ordered fixture blocks (tool-first)", () => {
 
     const messageEnd = events.find((e) => e.type === "message-end");
     expect(messageEnd!.delta!.finish_reason).toBe("TOOL_CALL");
+  });
+});
+
+describe("Cohere v2 Chat — non-streaming fixture blocks", () => {
+  let mock: LLMock | null = null;
+
+  afterEach(async () => {
+    if (mock) {
+      await mock.stop();
+      mock = null;
+    }
+  });
+
+  it("tool-only blocks emit NO spurious empty text content entry", async () => {
+    mock = new LLMock({ port: 0 });
+    mock.addFixture({
+      match: { userMessage: "test cohere nonstream tool-only" },
+      response: {
+        blocks: [{ type: "toolCall", name: "get_weather", arguments: '{"city":"NYC"}' }],
+      },
+    });
+    await mock.start();
+
+    const body = await postCohereNonStream(mock, "test cohere nonstream tool-only");
+
+    // The tool call is present.
+    expect(body.message.tool_calls).toHaveLength(1);
+    expect(body.message.tool_calls[0].function.name).toBe("get_weather");
+    expect(body.message.tool_calls[0].function.arguments).toBe('{"city":"NYC"}');
+
+    // No content entry at all — and specifically no empty `{ text: "" }`.
+    expect(body.message.content).toHaveLength(0);
+    expect(body.message.content.some((c) => c.type === "text" && c.text === "")).toBe(false);
+  });
+
+  it("mixed blocks (text + tool) derive both content and tool calls correctly", async () => {
+    mock = new LLMock({ port: 0 });
+    mock.addFixture({
+      match: { userMessage: "test cohere nonstream mixed" },
+      response: {
+        blocks: [
+          { type: "text", text: "Here you go." },
+          { type: "toolCall", name: "get_weather", arguments: '{"city":"NYC"}' },
+        ],
+      },
+    });
+    await mock.start();
+
+    const body = await postCohereNonStream(mock, "test cohere nonstream mixed");
+
+    // Text content derived from the text block.
+    const text = body.message.content
+      .filter((c) => c.type === "text")
+      .map((c) => c.text)
+      .join("");
+    expect(text).toBe("Here you go.");
+
+    // Tool call derived from the tool block.
+    expect(body.message.tool_calls).toHaveLength(1);
+    expect(body.message.tool_calls[0].function.name).toBe("get_weather");
+    expect(body.message.tool_calls[0].function.arguments).toBe('{"city":"NYC"}');
   });
 });
