@@ -767,8 +767,8 @@ export async function handleConverse(
       response: { status: 200, fixture },
     });
     const body = buildConverseContentWithToolCallsResponse(
-      response.content,
-      response.toolCalls,
+      response.content ?? "",
+      response.toolCalls ?? [],
       logger,
       effReasoning,
       overrides,
@@ -1085,8 +1085,8 @@ export async function handleConverseStream(
       response: { status: 200, fixture },
     });
     const events = buildBedrockStreamContentWithToolCallsEvents(
-      response.content,
-      response.toolCalls,
+      response.content ?? "",
+      response.toolCalls ?? [],
       chunkSize,
       logger,
       effReasoning,

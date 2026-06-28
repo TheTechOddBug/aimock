@@ -289,12 +289,25 @@ export function isToolCallResponse(r: FixtureResponse): r is ToolCallResponse {
 export function isContentWithToolCallsResponse(
   r: FixtureResponse,
 ): r is ContentWithToolCallsResponse {
-  return (
+  const o = r as ContentWithToolCallsResponse;
+  // LEGACY / COMBINED shape — BOTH content (string) + toolCalls (array). This
+  // clause is byte-identical to the original guard, so every fixture that
+  // matched before still matches here and is classified exactly as before.
+  const hasContentAndToolCalls =
     "content" in r &&
-    typeof (r as ContentWithToolCallsResponse).content === "string" &&
+    typeof o.content === "string" &&
     "toolCalls" in r &&
-    Array.isArray((r as ContentWithToolCallsResponse).toolCalls)
-  );
+    Array.isArray(o.toolCalls);
+  // BLOCKS-ONLY shape (additive, #274 F0) — a non-empty `blocks` array with no
+  // content/toolCalls. This is a pure RELAXATION: it recognizes MORE, never
+  // reclassifies an existing fixture. A blocks-only fixture cannot be claimed by
+  // any earlier/looser guard in the dispatch order — `isTextResponse` requires a
+  // string `content` AND `!("toolCalls" in r)`, and `isToolCallResponse`
+  // requires a `toolCalls` array — so it would otherwise fall through to 500.
+  // `isAudioResponse` (checked first everywhere) requires an `audio` field, which
+  // blocks-only lacks, so there is no overlap there either.
+  const hasNonEmptyBlocks = Array.isArray(o.blocks) && o.blocks.length > 0;
+  return hasContentAndToolCalls || hasNonEmptyBlocks;
 }
 
 /**
@@ -349,7 +362,10 @@ export function resolveFixtureBlocks(blocks: FixtureBlock[]): FixtureBlock[] {
       );
     }
   });
-  return blocks;
+  // Return a COPY of the array (defensive): builders iterate the result and must
+  // not observe later mutations of — nor be able to mutate — the caller's stored
+  // fixture array. Block objects themselves are consumed read-only downstream.
+  return [...blocks];
 }
 
 export function isErrorResponse(r: FixtureResponse): r is ErrorResponse {

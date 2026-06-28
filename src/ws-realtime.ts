@@ -923,7 +923,7 @@ async function handleResponseCreate(
     );
 
     // response.output_text.delta (chunked) — GA name
-    const content = response.content;
+    const content = response.content ?? "";
     const replaySpeed = fixture.replaySpeed ?? defaults.replaySpeed;
     const { recordedTimings } = fixture;
     let eventIndex = 0;
@@ -1056,8 +1056,9 @@ async function handleResponseCreate(
     allOutputItems.push(textOutputItem);
 
     // ── Tool call parts ────────────────────────────────────────────
-    for (let tcIdx = 0; tcIdx < response.toolCalls.length; tcIdx++) {
-      const tc = response.toolCalls[tcIdx];
+    const toolCalls = response.toolCalls ?? [];
+    for (let tcIdx = 0; tcIdx < toolCalls.length; tcIdx++) {
+      const tc = toolCalls[tcIdx];
       const callId = tc.id ?? generateToolCallId();
       const itemId = realtimeId("item");
       const outputIndex = tcIdx + 1; // offset by 1 for the text item
@@ -1307,7 +1308,7 @@ async function handleResponseCreate(
     );
 
     // response.output_text.delta (chunked) — GA name
-    const content = response.content;
+    const content = response.content ?? "";
     const replaySpeed = fixture.replaySpeed ?? defaults.replaySpeed;
     const { recordedTimings } = fixture;
     const interruption = createInterruptionSignal(fixture);

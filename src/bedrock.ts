@@ -566,13 +566,13 @@ export async function handleBedrock(
       response: { status: 200, fixture },
     });
     const textBody = buildBedrockTextResponse(
-      response.content,
+      response.content ?? "",
       completionReq.model,
       effReasoning,
       overrides,
     );
     const toolBody = buildBedrockToolCallResponse(
-      response.toolCalls,
+      response.toolCalls ?? [],
       completionReq.model,
       logger,
       // Reasoning is rendered by the text response in this merged path; pass
@@ -1279,8 +1279,8 @@ export async function handleBedrockStream(
       response: { status: 200, fixture },
     });
     const events = buildBedrockStreamContentWithToolCallsEvents(
-      response.content,
-      response.toolCalls,
+      response.content ?? "",
+      response.toolCalls ?? [],
       completionReq.model,
       chunkSize,
       logger,

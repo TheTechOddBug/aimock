@@ -415,37 +415,47 @@ export function validateFixtures(fixtures: Fixture[]): ValidationResult[] {
 
       // ContentWithToolCalls response checks
       if (isContentWithToolCallsResponse(response)) {
-        if (response.content === "") {
-          results.push({
-            severity: "error",
-            fixtureIndex: i,
-            message: "content is empty string",
-          });
-        }
-        if (response.toolCalls.length === 0) {
-          results.push({
-            severity: "warning",
-            fixtureIndex: i,
-            message: "toolCalls array is empty — fixture will never produce tool calls",
-          });
-        }
-        for (let j = 0; j < response.toolCalls.length; j++) {
-          const tc = response.toolCalls[j];
-          if (!tc.name) {
+        // The guard now also matches a BLOCKS-ONLY fixture (non-empty `blocks`,
+        // no `content`/`toolCalls`). For that shape the content/toolCalls checks
+        // below don't apply (and `content`/`toolCalls` are undefined) — the
+        // ordered `blocks` array is validated separately by `validateBlocks`
+        // immediately after this block. So gate the legacy field checks on the
+        // fields actually being present, mirroring the builders' branch-on-blocks.
+        if (typeof response.content === "string") {
+          if (response.content === "") {
             results.push({
               severity: "error",
               fixtureIndex: i,
-              message: `toolCalls[${j}].name is empty`,
+              message: "content is empty string",
             });
           }
-          try {
-            JSON.parse(tc.arguments);
-          } catch {
+        }
+        if (Array.isArray(response.toolCalls)) {
+          if (response.toolCalls.length === 0) {
             results.push({
-              severity: "error",
+              severity: "warning",
               fixtureIndex: i,
-              message: `toolCalls[${j}].arguments is not valid JSON: ${tc.arguments}`,
+              message: "toolCalls array is empty — fixture will never produce tool calls",
             });
+          }
+          for (let j = 0; j < response.toolCalls.length; j++) {
+            const tc = response.toolCalls[j];
+            if (!tc.name) {
+              results.push({
+                severity: "error",
+                fixtureIndex: i,
+                message: `toolCalls[${j}].name is empty`,
+              });
+            }
+            try {
+              JSON.parse(tc.arguments);
+            } catch {
+              results.push({
+                severity: "error",
+                fixtureIndex: i,
+                message: `toolCalls[${j}].arguments is not valid JSON: ${tc.arguments}`,
+              });
+            }
           }
         }
         validateReasoning(response, i, results);

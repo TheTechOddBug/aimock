@@ -1026,8 +1026,8 @@ export async function handleCohere(
     });
     if (cohereReq.stream !== true) {
       const body = buildCohereContentWithToolCallsResponse(
-        response.content,
-        response.toolCalls,
+        response.content ?? "",
+        response.toolCalls ?? [],
         logger,
         effReasoning,
         overrides,
@@ -1036,8 +1036,8 @@ export async function handleCohere(
       res.end(JSON.stringify(body));
     } else {
       const events = buildCohereContentWithToolCallsStreamEvents(
-        response.content,
-        response.toolCalls,
+        response.content ?? "",
+        response.toolCalls ?? [],
         chunkSize,
         logger,
         effReasoning,

@@ -513,7 +513,7 @@ async function processMessage(
       response: { status: 200, fixture },
     });
 
-    const content = response.content;
+    const content = response.content ?? "";
     const chunkList: string[] = [];
     for (let i = 0; i < content.length; i += chunkSize) {
       chunkList.push(content.slice(i, i + chunkSize));
@@ -575,7 +575,7 @@ async function processMessage(
     }
 
     // Pre-compute tool calls with stable IDs so wire message and history match
-    const resolvedToolCalls = response.toolCalls.map((tc) => ({
+    const resolvedToolCalls = (response.toolCalls ?? []).map((tc) => ({
       ...tc,
       resolvedId: tc.id ?? generateToolCallId(),
     }));
@@ -782,7 +782,7 @@ async function processMessage(
     }
 
     // Pre-compute tool calls with stable IDs so wire message and history match
-    const resolvedToolCalls = response.toolCalls.map((tc) => ({
+    const resolvedToolCalls = (response.toolCalls ?? []).map((tc) => ({
       ...tc,
       resolvedId: tc.id ?? generateToolCallId(),
     }));

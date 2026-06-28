@@ -930,8 +930,8 @@ export async function handleGeminiInteractions(
     });
     if (!streaming) {
       const body = buildInteractionsContentWithToolCallsResponse(
-        response.content,
-        response.toolCalls,
+        response.content ?? "",
+        response.toolCalls ?? [],
         model,
         interactionId,
         logger,
@@ -941,8 +941,8 @@ export async function handleGeminiInteractions(
       res.end(JSON.stringify(body));
     } else {
       const events = buildInteractionsContentWithToolCallsSSEEvents(
-        response.content,
-        response.toolCalls,
+        response.content ?? "",
+        response.toolCalls ?? [],
         interactionId,
         chunkSize,
         logger,

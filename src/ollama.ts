@@ -829,8 +829,8 @@ export async function handleOllama(
     );
     if (!streaming) {
       const body = buildOllamaChatContentWithToolCallsResponse(
-        response.content,
-        response.toolCalls,
+        response.content ?? "",
+        response.toolCalls ?? [],
         completionReq.model,
         logger,
         effReasoning,
@@ -839,8 +839,8 @@ export async function handleOllama(
       res.end(JSON.stringify(body));
     } else {
       const chunks = buildOllamaChatContentWithToolCallsChunks(
-        response.content,
-        response.toolCalls,
+        response.content ?? "",
+        response.toolCalls ?? [],
         completionReq.model,
         chunkSize,
         logger,
