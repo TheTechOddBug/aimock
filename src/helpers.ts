@@ -334,7 +334,12 @@ export function resolveFixtureBlocks(blocks: FixtureBlock[]): FixtureBlock[] {
   if (!Array.isArray(blocks)) {
     throw new Error(`Invalid fixture blocks: expected an array, got ${typeof blocks}`);
   }
-  blocks.forEach((block, i) => {
+  // Validate each block and return a normalized COPY. Builders iterate the
+  // result and must not observe later mutations of — nor be able to mutate —
+  // the caller's stored fixture array, and block objects are consumed read-only
+  // downstream, so we never mutate the input in place: any normalization (e.g.
+  // stringifying object `arguments`) is applied to a fresh per-block copy.
+  return blocks.map((block, i) => {
     if (block === null || typeof block !== "object") {
       throw new Error(`Invalid fixture block at index ${i}: expected an object`);
     }
@@ -345,10 +350,11 @@ export function resolveFixtureBlocks(blocks: FixtureBlock[]): FixtureBlock[] {
           `Invalid fixture block at index ${i}: "text" block requires a string "text" field`,
         );
       }
+      return block;
     } else if (b.type === "toolCall") {
-      if (typeof b.name !== "string" || typeof b.arguments !== "string") {
+      if (typeof b.name !== "string") {
         throw new Error(
-          `Invalid fixture block at index ${i}: "toolCall" block requires string "name" and "arguments" fields`,
+          `Invalid fixture block at index ${i}: "toolCall" block requires a string "name" field`,
         );
       }
       if (b.id !== undefined && typeof b.id !== "string") {
@@ -356,16 +362,29 @@ export function resolveFixtureBlocks(blocks: FixtureBlock[]): FixtureBlock[] {
           `Invalid fixture block at index ${i}: "toolCall" block "id" must be a string when present`,
         );
       }
+      // `arguments` is a JSON string in normalized (file-load) form. The
+      // programmatic path (addFixture/addFixtures/prependFixture) stores RAW
+      // fixtures with no normalizeResponse pass, so an OBJECT `arguments` can
+      // reach here. Be tolerant: stringify an object/array (mirroring
+      // normalizeResponse's `JSON.stringify`) into a fresh block copy so the
+      // programmatic path is safe and the caller's stored fixture is untouched.
+      // A string stays byte-identical (file-load path unchanged); any other
+      // type is still rejected.
+      if (typeof b.arguments === "object" && b.arguments !== null) {
+        return { ...b, arguments: JSON.stringify(b.arguments) } as unknown as FixtureBlock;
+      }
+      if (typeof b.arguments !== "string") {
+        throw new Error(
+          `Invalid fixture block at index ${i}: "toolCall" block requires a string or object "arguments" field`,
+        );
+      }
+      return block;
     } else {
       throw new Error(
         `Invalid fixture block at index ${i}: unknown type ${JSON.stringify(b.type)} (expected "text" or "toolCall")`,
       );
     }
   });
-  // Return a COPY of the array (defensive): builders iterate the result and must
-  // not observe later mutations of — nor be able to mutate — the caller's stored
-  // fixture array. Block objects themselves are consumed read-only downstream.
-  return [...blocks];
 }
 
 export function isErrorResponse(r: FixtureResponse): r is ErrorResponse {

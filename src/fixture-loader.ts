@@ -466,9 +466,19 @@ export function validateFixtures(fixtures: Fixture[]): ValidationResult[] {
         });
       }
 
+      // When a non-empty ordered `blocks` array is present, the builders stream
+      // `blocks` and IGNORE the legacy `content` mirror (see validateBlocks's
+      // divergence note + isContentWithToolCallsResponse's BLOCKS-ONLY clause).
+      // So an empty-string `content` is harmless in that case and must NOT raise
+      // the "content is empty string" hard error. Fixtures WITHOUT blocks keep
+      // the error (an empty content with no blocks produces no output).
+      const hasNonEmptyBlocks =
+        Array.isArray((response as { blocks?: unknown }).blocks) &&
+        (response as { blocks: unknown[] }).blocks.length > 0;
+
       // Text response checks
       if (isTextResponse(response)) {
-        if (response.content === "") {
+        if (response.content === "" && !hasNonEmptyBlocks) {
           results.push({
             severity: "error",
             fixtureIndex: i,
@@ -488,7 +498,7 @@ export function validateFixtures(fixtures: Fixture[]): ValidationResult[] {
         // immediately after this block. So gate the legacy field checks on the
         // fields actually being present, mirroring the builders' branch-on-blocks.
         if (typeof response.content === "string") {
-          if (response.content === "") {
+          if (response.content === "" && !hasNonEmptyBlocks) {
             results.push({
               severity: "error",
               fixtureIndex: i,

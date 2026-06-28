@@ -83,7 +83,7 @@ describe("resolveFixtureBlocks", () => {
 
   it("rejects a toolCall block missing arguments", () => {
     const blocks = [{ type: "toolCall", name: "f" }] as unknown as FixtureBlock[];
-    expect(() => resolveFixtureBlocks(blocks)).toThrow(/index 0.*"name" and "arguments"/);
+    expect(() => resolveFixtureBlocks(blocks)).toThrow(/index 0.*string or object "arguments"/);
   });
 
   it("rejects a toolCall block with a non-string id", () => {
