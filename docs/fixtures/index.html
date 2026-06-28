@@ -890,12 +890,12 @@
               <td>Yes</td>
               <td>Yes</td>
               <td>Yes</td>
-              <td>&mdash;</td>
+              <td>Record only<sup>&dagger;</sup></td>
               <td>Yes</td>
               <td>Yes</td>
               <td>Yes</td>
               <td>Yes</td>
-              <td>&mdash;</td>
+              <td>Yes</td>
             </tr>
             <tr>
               <td>Web Searches</td>
@@ -928,6 +928,11 @@
         <p class="footnote">
           <sup>*</sup> Azure inherits OpenAI&rsquo;s override support because Azure OpenAI routes
           through the OpenAI Chat Completions response format internally.
+        </p>
+        <p class="footnote">
+          <sup>&dagger;</sup> Gemini Interactions captures reasoning on record (its collapser
+          assembles <code>thought_summary</code> deltas into <code>reasoning</code>), but its replay
+          builders do not re-emit reasoning, so a replayed turn carries none.
         </p>
       </main>
       <aside class="page-toc" id="page-toc"></aside>
