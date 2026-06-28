@@ -1621,7 +1621,12 @@ export function collapseGeminiInteractionsSSE(body: string): CollapseResult {
       // The arguments_delta fragments must concatenate into valid JSON by
       // step.stop. A truncated/interrupted stream can leave them malformed;
       // surface that via droppedChunks rather than writing a corrupt fixture
-      // silently (mirrors the per-chunk parse guard above).
+      // silently (mirrors the per-chunk parse guard above). On failure we MUST
+      // NOT persist the invalid-JSON string — it would fail `validateFixtures`
+      // on reload (the loader does `JSON.parse(tc.arguments)`). Fall back to
+      // "{}" so the persisted `arguments` is always valid JSON, exactly like
+      // the empty/unusable-args path below (mirrors the OpenAI/Anthropic
+      // sibling collapsers, which never persist unparseable tool args).
       try {
         JSON.parse(args);
       } catch {
@@ -1632,6 +1637,7 @@ export function collapseGeminiInteractionsSSE(body: string): CollapseResult {
             200,
           )}`;
         }
+        args = "{}";
       }
     } else {
       args = typeof tc.argsObj === "string" ? tc.argsObj : JSON.stringify(tc.argsObj ?? {});

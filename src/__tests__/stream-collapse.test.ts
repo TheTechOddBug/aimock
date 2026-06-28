@@ -11,6 +11,8 @@ import {
 } from "../stream-collapse.js";
 import { encodeEventStreamMessage, encodeEventStreamFrame } from "../aws-event-stream.js";
 import { parseHarmonyContent } from "../harmony.js";
+import { validateFixtures } from "../fixture-loader.js";
+import type { Fixture } from "../types.js";
 
 // ---------------------------------------------------------------------------
 // 1. OpenAI SSE
@@ -4232,6 +4234,64 @@ describe("stream block-order instrumentation (#274)", () => {
       ].join("\n\n");
       const result = collapseGeminiInteractionsSSE(body);
       expect(result.toolCalls![0].arguments).toBe('{"x":1}');
+    });
+
+    it("2.x truncated/unparseable accumulated args → arguments '{}' (never persists invalid JSON)", () => {
+      // arguments_delta fragments accumulate to a truncated, INVALID-JSON
+      // string (`{"city":`). The finalizer must NOT persist that — it would
+      // fail validateFixtures on reload (the loader does JSON.parse(arguments)).
+      const body = [
+        data({
+          event_type: "step.start",
+          index: 0,
+          step: { type: "function_call", id: "s1", name: "get_weather" },
+        }),
+        data({
+          event_type: "step.delta",
+          index: 0,
+          delta: { type: "arguments_delta", arguments: '{"city":' },
+        }),
+      ].join("\n\n");
+      const result = collapseGeminiInteractionsSSE(body);
+      expect(result.toolCalls).toHaveLength(1);
+      // RED before fix: persisted as the invalid '{"city":' string.
+      expect(result.toolCalls![0].arguments).toBe("{}");
+      expect(() => JSON.parse(result.toolCalls![0].arguments)).not.toThrow();
+      // The malformed assembly is still surfaced via droppedChunks accounting.
+      expect(result.droppedChunks).toBeGreaterThanOrEqual(1);
+
+      // The persisted fixture must reload cleanly: validateFixtures JSON.parses
+      // every toolCalls[].arguments and errors on unparseable JSON.
+      const fixture: Fixture = {
+        match: { userMessage: "weather", model: "gemini-2.0-flash" },
+        response: { toolCalls: result.toolCalls! },
+      };
+      const errors = validateFixtures([fixture]).filter((r) => r.severity === "error");
+      expect(errors).toEqual([]);
+    });
+
+    it("valid accumulated args reload cleanly through validateFixtures (no regression)", () => {
+      const body = [
+        data({
+          event_type: "step.start",
+          index: 0,
+          step: { type: "function_call", id: "s1", name: "get_weather" },
+        }),
+        data({
+          event_type: "step.delta",
+          index: 0,
+          delta: { type: "arguments_delta", arguments: '{"city":"SF"}' },
+        }),
+      ].join("\n\n");
+      const result = collapseGeminiInteractionsSSE(body);
+      expect(result.toolCalls![0].arguments).toBe('{"city":"SF"}');
+      expect(result.droppedChunks).toBeUndefined();
+      const fixture: Fixture = {
+        match: { userMessage: "weather", model: "gemini-2.0-flash" },
+        response: { toolCalls: result.toolCalls! },
+      };
+      const errors = validateFixtures([fixture]).filter((r) => r.severity === "error");
+      expect(errors).toEqual([]);
     });
 
     it("interleaved 2.x stream yields NO blocks (deliberate no-block decision)", () => {
