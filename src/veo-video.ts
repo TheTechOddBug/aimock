@@ -32,7 +32,7 @@ import {
   sanitizeHeaderValue,
 } from "./recorder.js";
 import { resolveUpstreamUrl } from "./url.js";
-import { readEnvelopeText, upstreamTimeoutSignal } from "./video-proxy-shared.js";
+import { readEnvelopeText, testIdSuffix, upstreamTimeoutSignal } from "./video-proxy-shared.js";
 
 /**
  * Google Veo async video lifecycle mock. Submit
@@ -461,8 +461,12 @@ export async function handleVeoVideoCreate(
     );
   }
 
+  // Embed the testId in the RETURNED name (not the stored key) so a multi-tenant
+  // client can poll the opaque name without an x-test-id header — the testId
+  // travels via getTestId's `?testId=` fallback. Mirrors OpenRouter's polling_url
+  // treatment; testIdSuffix is "" for the default testId, keeping the name bare.
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ name: operationName }));
+  res.end(JSON.stringify({ name: operationName + testIdSuffix(testId, "?") }));
 }
 
 // ─── GET /v1beta/operations/{name} — status poll ─────────────────────────────
@@ -801,8 +805,11 @@ async function proxyVeoVideoSubmit(args: {
     },
   });
 
+  // Embed the testId in the RETURNED name (see the replay submit) so record-mode
+  // multi-tenant polls resolve via `?testId=`; the upstream poll still uses the
+  // bare job.operationName / job.upstreamPollingUrl, untouched by the suffix.
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ name: operationName }));
+  res.end(JSON.stringify({ name: operationName + testIdSuffix(testId, "?") }));
   return "handled";
 }
 
