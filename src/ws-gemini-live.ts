@@ -596,20 +596,13 @@ async function processMessage(
           const text = block.text;
           historyContent += text;
           if (text.length === 0) {
-            if (ws.isClosed) break;
-            try {
-              ws.send(
-                JSON.stringify({
-                  serverContent: { modelTurn: { parts: [{ text: "" }] } },
-                }),
-              );
-            } catch (err) {
-              defaults.logger.debug(
-                "[gemini-live] send failed during blocks streaming, closing",
-                err,
-              );
-              break;
-            }
+            // An empty text block carries no wire content, so emit nothing and
+            // spend no chunk: the old guard sent a useless empty `modelTurn`
+            // message and `continue`d WITHOUT `chunkIndex++`/`interruption.tick()`,
+            // which leaked the next block past `truncateAfterChunks` and shifted
+            // `recordedTimings` indexing for every following block. Skipping
+            // keeps non-empty-block output byte-identical and the chunk/timing
+            // accounting correct.
             continue;
           }
           for (let i = 0; i < text.length; i += chunkSize) {

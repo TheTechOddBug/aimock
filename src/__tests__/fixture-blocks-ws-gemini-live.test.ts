@@ -28,7 +28,49 @@ const legacyCombinedFixture: Fixture = {
   },
 };
 
-const allFixtures: Fixture[] = [blocksOnlyFixture, legacyCombinedFixture];
+// Empty-text-block leak fixture: an empty text block FIRST, then a toolCall,
+// with truncateAfterChunks:1. The empty-text guard used to emit a (useless)
+// empty wire message and `continue` WITHOUT spending a truncate tick, so the
+// toolCall leaked through — 2 messages emitted instead of the 1 truncation
+// should have allowed.
+// NB: match keys are chosen so neither is a substring of the other (the
+// userMessage matcher matches by inclusion).
+const emptyTextThenToolTruncateFixture: Fixture = {
+  match: { userMessage: "blocks-emptytext-trunc" },
+  truncateAfterChunks: 1,
+  response: {
+    blocks: [
+      { type: "text", text: "" },
+      { type: "toolCall", name: "get_weather", arguments: '{"city":"NYC"}' },
+      // Second toolCall behind the allotted slot — it must always be truncated.
+      // Pre-fix the empty-text block spent NO truncate tick, so BOTH toolCalls
+      // (plus the empty text message) leaked; post-fix the first toolCall is the
+      // single allotted chunk and this one is truncated away.
+      { type: "toolCall", name: "leaked_tool", arguments: "{}" },
+    ],
+  },
+};
+
+// Control: identical shape but a NON-empty leading text block. Truncation at 1
+// must still fire after the first text chunk, so the toolCall never emits. This
+// guards that the fix does not alter non-empty-block truncation accounting.
+const nonEmptyTextThenToolTruncateFixture: Fixture = {
+  match: { userMessage: "blocks-filledtext-trunc" },
+  truncateAfterChunks: 1,
+  response: {
+    blocks: [
+      { type: "text", text: "Hi" },
+      { type: "toolCall", name: "get_weather", arguments: '{"city":"NYC"}' },
+    ],
+  },
+};
+
+const allFixtures: Fixture[] = [
+  blocksOnlyFixture,
+  legacyCombinedFixture,
+  emptyTextThenToolTruncateFixture,
+  nonEmptyTextThenToolTruncateFixture,
+];
 
 // --- helpers ---
 
@@ -100,6 +142,70 @@ describe("WebSocket Gemini Live — blocks-only fixtures (#274)", () => {
     // Terminal turnComplete.
     const last = msgs[msgs.length - 1];
     expect(last.serverContent.turnComplete).toBe(true);
+
+    ws.close();
+  });
+
+  it("truncateAfterChunks:1 — empty leading text block must not leak the following toolCall", async () => {
+    instance = await createServer(allFixtures);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1); // setupComplete
+
+    ws.send(clientContentMsg("blocks-emptytext-trunc"));
+
+    // Truncation closes the socket; wait for it, then inspect everything that
+    // arrived. Pre-fix the empty-text block emitted a useless empty message
+    // WITHOUT spending the single truncate tick, so BOTH toolCalls leaked
+    // behind it (3 post-setup messages). Post-fix the empty block produces
+    // nothing and the FIRST toolCall is the single allotted chunk.
+    await ws.waitForClose();
+    const msgs = ws
+      .getMessages()
+      .slice(1)
+      .map((r) => JSON.parse(r));
+
+    // Exactly one message survives truncation, and it is the first toolCall —
+    // the empty text emitted nothing and the second toolCall was truncated.
+    expect(msgs).toHaveLength(1);
+    const toolCallMsgs = msgs.filter((m) => m.toolCall);
+    expect(toolCallMsgs).toHaveLength(1);
+    expect(toolCallMsgs[0].toolCall.functionCalls[0].name).toBe("get_weather");
+
+    // The block behind the allotted slot must NOT leak.
+    const leaked = msgs.some((m) => m.toolCall?.functionCalls?.[0]?.name === "leaked_tool");
+    expect(leaked).toBe(false);
+
+    // No spurious empty-text message may precede the toolCall.
+    const emptyTextMsgs = msgs.filter((m) => m.serverContent?.modelTurn?.parts?.[0]?.text === "");
+    expect(emptyTextMsgs).toHaveLength(0);
+
+    ws.close();
+  });
+
+  it("truncateAfterChunks:1 — non-empty leading text block truncates the following toolCall (control)", async () => {
+    instance = await createServer(allFixtures);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1); // setupComplete
+
+    ws.send(clientContentMsg("blocks-filledtext-trunc"));
+
+    await ws.waitForClose();
+    const msgs = ws
+      .getMessages()
+      .slice(1)
+      .map((r) => JSON.parse(r));
+
+    // The single text chunk is emitted, then truncation fires — toolCall gone.
+    const toolCallMsgs = msgs.filter((m) => m.toolCall);
+    expect(toolCallMsgs).toHaveLength(0);
+
+    const textMsgs = msgs.filter((m) => m.serverContent?.modelTurn?.parts?.[0]?.text);
+    const fullText = textMsgs.map((m) => m.serverContent.modelTurn.parts[0].text).join("");
+    expect(fullText).toBe("Hi");
 
     ws.close();
   });
