@@ -363,6 +363,90 @@ describe("GET /v1/videos/{id} dispatch journals handler errors as 500 (Grok-firs
   });
 });
 
+// ─── Multi-tenant poll isolation (#278) ──────────────────────────────────────
+// Submit stores the job keyed `${testId}:${requestId}`, but the returned
+// request_id is opaque. A multi-tenant client polls the returned id WITHOUT an
+// x-test-id header, so the testId must travel in the returned id (via
+// testIdSuffix) for getTestId's `?testId=` fallback to resolve the scope —
+// mirroring OpenRouter's polling_url treatment.
+
+describe("Grok video — testId scoping of returned request_id", () => {
+  let mock: LLMock | undefined;
+
+  afterEach(async () => {
+    await mock?.stop();
+    mock = undefined;
+  });
+
+  test("returned request_id carries testId and resolves the poll without the header", async () => {
+    mock = new LLMock({ port: 0 });
+    mock.addFixture({
+      match: { userMessage: "scoped poll", endpoint: "video" },
+      response: { video: { id: "vid_scoped", status: "completed", url: "https://cdn.x.ai/s.mp4" } },
+    });
+    await mock.start();
+
+    const submit = await fetch(`${mock.url}/v1/videos/generations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Test-Id": "test-a" },
+      body: JSON.stringify({ model: "grok-imagine-video", prompt: "scoped poll" }),
+    });
+    const { request_id } = (await submit.json()) as { request_id: string };
+    expect(request_id).toContain("testId=test-a");
+
+    // Bare poll of the returned id — no X-Test-Id header — must still resolve
+    // via the embedded query parameter.
+    const poll = await fetch(`${mock.url}/v1/videos/${request_id}`);
+    expect(poll.status).toBe(200);
+    const data = await poll.json();
+    expect(data.status).toBe("done");
+  });
+
+  test("job submitted under one testId is invisible to another", async () => {
+    mock = new LLMock({ port: 0 });
+    mock.addFixture({
+      match: { userMessage: "isolated", endpoint: "video" },
+      response: { video: { id: "vid_iso", status: "completed", url: "https://cdn.x.ai/i.mp4" } },
+    });
+    await mock.start();
+
+    const submit = await fetch(`${mock.url}/v1/videos/generations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Test-Id": "test-a" },
+      body: JSON.stringify({ model: "grok-imagine-video", prompt: "isolated" }),
+    });
+    const { request_id } = (await submit.json()) as { request_id: string };
+
+    // Strip the testId suffix to recover the bare request_id, then poll it under
+    // a DIFFERENT tenant. Grok misses fall through to Sora status, which 404s an
+    // unknown id — so a cross-tenant poll must NOT return a Grok "done" body.
+    const bareId = request_id.split("?")[0];
+    const crossPoll = await fetch(`${mock.url}/v1/videos/${bareId}`, {
+      headers: { "X-Test-Id": "test-b" },
+    });
+    expect(crossPoll.status).toBe(404);
+  });
+
+  test("default testId returns the bare request_id (no testId param)", async () => {
+    mock = new LLMock({ port: 0 });
+    mock.addFixture({
+      match: { userMessage: "clean id", endpoint: "video" },
+      response: { video: { id: "vid_clean", status: "completed", url: "https://cdn.x.ai/c.mp4" } },
+    });
+    await mock.start();
+
+    const submit = await fetch(`${mock.url}/v1/videos/generations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "grok-imagine-video", prompt: "clean id" }),
+    });
+    const { request_id } = (await submit.json()) as { request_id: string };
+    // Byte-identical to pre-fix behaviour: bare uuid, no query.
+    expect(request_id).not.toContain("testId=");
+    expect(request_id).not.toContain("?");
+  });
+});
+
 // Type-only smoke: the stored video status union remains the 3-value set
 // (no "done"); the Grok wire "done" is derived at serialization.
 describe("VideoResponse stored status", () => {

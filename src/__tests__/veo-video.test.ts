@@ -278,3 +278,93 @@ describe("GET /v1beta/operations/{name} dispatch journals handler errors as 500 
     expect(failed[0].method).toBe("GET");
   });
 });
+
+// ─── Multi-tenant poll isolation (#278) ──────────────────────────────────────
+// Submit stores the job keyed `${testId}:${operationName}`, but the returned
+// operation name is opaque. A multi-tenant client polls the returned name
+// WITHOUT an x-test-id header, so the testId must travel in the returned name
+// (via testIdSuffix) for getTestId's `?testId=` fallback to resolve the scope —
+// mirroring OpenRouter's polling_url treatment.
+
+describe("Veo video — testId scoping of returned operation name", () => {
+  let mock: LLMock | undefined;
+
+  afterEach(async () => {
+    await mock?.stop();
+    mock = undefined;
+  });
+
+  test("returned name carries testId and resolves the poll without the header", async () => {
+    mock = new LLMock({ port: 0 });
+    mock.addFixture({
+      match: { userMessage: "scoped poll", endpoint: "video" },
+      response: {
+        video: { id: "veo_scoped", status: "completed", url: "https://files.example/s.mp4" },
+      },
+    });
+    await mock.start();
+
+    const submit = await fetch(submitUrl(mock.url), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Test-Id": "test-a" },
+      body: JSON.stringify({ instances: [{ prompt: "scoped poll" }] }),
+    });
+    const { name } = (await submit.json()) as { name: string };
+    expect(name).toContain("testId=test-a");
+
+    // Bare poll of the returned name — no X-Test-Id header — must still resolve
+    // via the embedded query parameter.
+    const poll = await fetch(`${mock.url}/v1beta/${name}`);
+    expect(poll.status).toBe(200);
+    const data = await poll.json();
+    expect(data.done).toBe(true);
+  });
+
+  test("job submitted under one testId is invisible to another", async () => {
+    mock = new LLMock({ port: 0 });
+    mock.addFixture({
+      match: { userMessage: "isolated", endpoint: "video" },
+      response: {
+        video: { id: "veo_iso", status: "completed", url: "https://files.example/i.mp4" },
+      },
+    });
+    await mock.start();
+
+    const submit = await fetch(submitUrl(mock.url), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Test-Id": "test-a" },
+      body: JSON.stringify({ instances: [{ prompt: "isolated" }] }),
+    });
+    const { name } = (await submit.json()) as { name: string };
+
+    // Strip the testId suffix to recover the bare operation name, then poll it
+    // under a DIFFERENT tenant — must 404 (cross-tenant leak otherwise).
+    const bareName = name.split("?")[0];
+    const crossPoll = await fetch(`${mock.url}/v1beta/${bareName}`, {
+      headers: { "X-Test-Id": "test-b" },
+    });
+    expect(crossPoll.status).toBe(404);
+  });
+
+  test("default testId returns the bare operation name (no testId param)", async () => {
+    mock = new LLMock({ port: 0 });
+    mock.addFixture({
+      match: { userMessage: "clean name", endpoint: "video" },
+      response: {
+        video: { id: "veo_clean", status: "completed", url: "https://files.example/c.mp4" },
+      },
+    });
+    await mock.start();
+
+    const submit = await fetch(submitUrl(mock.url), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ instances: [{ prompt: "clean name" }] }),
+    });
+    const { name } = (await submit.json()) as { name: string };
+    // Byte-identical to pre-fix behaviour: bare `operations/{uuid}`, no query.
+    expect(name).not.toContain("testId=");
+    expect(name).not.toContain("?");
+    expect(name.startsWith("operations/")).toBe(true);
+  });
+});

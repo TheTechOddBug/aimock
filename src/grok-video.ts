@@ -33,7 +33,7 @@ import {
 } from "./recorder.js";
 import { resolveUpstreamUrl } from "./url.js";
 import { handleVideoStatus, type VideoStateMap } from "./video.js";
-import { readEnvelopeText, upstreamTimeoutSignal } from "./video-proxy-shared.js";
+import { readEnvelopeText, testIdSuffix, upstreamTimeoutSignal } from "./video-proxy-shared.js";
 
 /**
  * xAI Grok Imagine async video lifecycle mock. Submit
@@ -555,8 +555,12 @@ export async function handleGrokVideoCreate(
     );
   }
 
+  // Embed the testId in the RETURNED request_id (not the stored key) so a
+  // multi-tenant client can poll the opaque id without an x-test-id header — the
+  // testId travels via getTestId's `?testId=` fallback. Mirrors OpenRouter's
+  // polling_url treatment; testIdSuffix is "" for the default testId (bare id).
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ request_id: requestId }));
+  res.end(JSON.stringify({ request_id: requestId + testIdSuffix(testId, "?") }));
 }
 
 // ─── GET /v1/videos/{id} — status poll (Grok-first, Sora fall-through) ───────
@@ -872,8 +876,11 @@ async function proxyGrokVideoSubmit(args: {
     },
   });
 
+  // Embed the testId in the RETURNED request_id (see the replay submit) so
+  // record-mode multi-tenant polls resolve via `?testId=`; the upstream poll
+  // still uses the bare job.requestId / job.upstreamPollingUrl, untouched.
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ request_id: requestId }));
+  res.end(JSON.stringify({ request_id: requestId + testIdSuffix(testId, "?") }));
   return "handled";
 }
 
