@@ -11,6 +11,7 @@ import { extractShape, compareSSESequences, formatDriftReport } from "./schema.j
 import { openaiRealtimeTextEventShapes, openaiRealtimeToolCallEventShapes } from "./sdk-shapes.js";
 import { openaiRealtimeWS } from "./ws-providers.js";
 import { listOpenAIModels } from "./providers.js";
+import { detectVoiceModelDrift } from "./voice-models.js";
 import { startDriftServer, stopDriftServer, collectMockWSMessages } from "./helpers.js";
 import { connectWebSocket } from "../ws-test-client.js";
 
@@ -74,41 +75,11 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Realtime API drift", () => {
     // silently skipped the one check this whole suite exists to run.
     const models = await listOpenAIModels(OPENAI_API_KEY!);
 
-    const gaModels = [
-      "gpt-realtime",
-      "gpt-realtime-2",
-      "gpt-realtime-2.1",
-      "gpt-realtime-2.1-mini",
-      "gpt-realtime-2025-08-28",
-      "gpt-realtime-1.5",
-      "gpt-realtime-mini",
-      "gpt-realtime-mini-2025-10-06",
-      "gpt-realtime-mini-2025-12-15",
-    ];
-    const knownModels = new Set([
-      ...gaModels,
-      // Translate/whisper models (also contain "realtime" in some variants)
-      "gpt-realtime-translate",
-      "gpt-realtime-whisper",
-      // Audio models also valid in realtime sessions
-      "gpt-audio-1.5",
-      "gpt-audio-mini",
-      "gpt-audio-mini-2025-10-06",
-      "gpt-audio-mini-2025-12-15",
-      // Transcription/translation models
-      "gpt-4o-transcribe",
-      "gpt-4o-mini-transcribe",
-      "whisper-1",
-      // Legacy preview models (may still appear)
-      "gpt-4o-realtime-preview",
-      "gpt-4o-mini-realtime-preview",
-      "gpt-4o-realtime-preview-2024-10-01",
-      "gpt-4o-realtime-preview-2024-12-17",
-      "gpt-4o-realtime-preview-2025-06-03",
-      "gpt-4o-mini-realtime-preview-2024-12-17",
-    ]);
-
-    const realtimeModels = models.filter((m) => m.includes("realtime"));
+    // Run the SHARED detection code path (also driven directly by the unit test
+    // in ws-realtime-canary.test.ts). The voice/audio family matcher is broader
+    // than the old `includes("realtime")` filter so a NEW voice family whose id
+    // lacks the "realtime" substring (e.g. gpt-live-1) is still flagged.
+    const { candidateModels: realtimeModels, unknown, hasGA } = detectVoiceModelDrift(models);
 
     // Compute the unknown-model list BEFORE the hasGA assertion. A run can be
     // BOTH GA-family-gone AND carry new unknown models; because the hasGA
@@ -116,9 +87,8 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Realtime API drift", () => {
     // never run and its list would be lost from the NO_GA failure message (and
     // therefore from the auto-fix prompt). So we carry the unknown list into the
     // NO_GA marker too — no information is lost in the combined case.
-    const unknown = realtimeModels.filter((m) => !knownModels.has(m));
     if (unknown.length > 0) {
-      console.warn(`[DRIFT] Unknown realtime models detected: ${unknown.join(", ")}`);
+      console.warn(`[DRIFT] Unknown voice/audio models detected: ${unknown.join(", ")}`);
     }
 
     // At least one GA model should exist. Carry the OBSERVED realtime models in
@@ -134,7 +104,6 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Realtime API drift", () => {
     // segment so the combined (no-GA AND unknown-models-present) case does not
     // lose the unknown list when this assertion short-circuits the one below.
     // The collector splits the two markers apart; each list stays clean.
-    const hasGA = realtimeModels.some((m) => gaModels.includes(m));
     expect(
       hasGA,
       `NO_GA_REALTIME_MODELS=${realtimeModels.join(",")} | UNKNOWN_REALTIME_MODELS=${unknown.join(",")}`,
