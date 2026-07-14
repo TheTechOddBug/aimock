@@ -517,17 +517,61 @@
               <td><code>Authorization: Bearer &lt;key&gt;</code></td>
             </tr>
             <tr>
+              <td><code>AIMOCK_PROVIDER_OPENROUTER_KEY</code></td>
+              <td>OpenRouter</td>
+              <td><code>Authorization: Bearer &lt;key&gt;</code></td>
+            </tr>
+            <tr>
+              <td><code>AIMOCK_PROVIDER_COHERE_KEY</code></td>
+              <td>Cohere</td>
+              <td><code>Authorization: Bearer &lt;key&gt;</code></td>
+            </tr>
+            <tr>
+              <td><code>AIMOCK_PROVIDER_GROK_KEY</code></td>
+              <td>Grok (xAI)</td>
+              <td><code>Authorization: Bearer &lt;key&gt;</code></td>
+            </tr>
+            <tr>
+              <td><code>AIMOCK_PROVIDER_OLLAMA_KEY</code></td>
+              <td>Ollama (Cloud / bearer-gated)</td>
+              <td><code>Authorization: Bearer &lt;key&gt;</code></td>
+            </tr>
+            <tr>
               <td><code>AIMOCK_PROVIDER_ANTHROPIC_KEY</code></td>
               <td>Anthropic</td>
               <td><code>x-api-key: &lt;key&gt;</code></td>
             </tr>
             <tr>
               <td><code>AIMOCK_PROVIDER_GEMINI_KEY</code></td>
-              <td>Gemini</td>
+              <td>Gemini (and Gemini Interactions)</td>
               <td><code>x-goog-api-key: &lt;key&gt;</code></td>
+            </tr>
+            <tr>
+              <td><code>AIMOCK_PROVIDER_VEO_KEY</code></td>
+              <td>Veo</td>
+              <td><code>x-goog-api-key: &lt;key&gt;</code></td>
+            </tr>
+            <tr>
+              <td><code>AIMOCK_PROVIDER_AZURE_KEY</code></td>
+              <td>Azure OpenAI</td>
+              <td><code>api-key: &lt;key&gt;</code></td>
+            </tr>
+            <tr>
+              <td><code>AIMOCK_PROVIDER_ELEVENLABS_KEY</code></td>
+              <td>ElevenLabs</td>
+              <td><code>xi-api-key: &lt;key&gt;</code></td>
+            </tr>
+            <tr>
+              <td><code>AIMOCK_PROVIDER_FAL_KEY</code></td>
+              <td>fal.ai</td>
+              <td><code>Authorization: Key &lt;key&gt;</code></td>
             </tr>
           </tbody>
         </table>
+        <p>
+          <code>gemini-interactions</code> reuses <code>AIMOCK_PROVIDER_GEMINI_KEY</code> (same
+          upstream API as Gemini). An empty-string value is treated as unset.
+        </p>
         <p>Injection fires only when both of these hold:</p>
         <ul>
           <li>

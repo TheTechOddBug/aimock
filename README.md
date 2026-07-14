@@ -129,9 +129,25 @@ On replay, `turnIndex` is a non-fatal disambiguator, not a hard reject gate: a c
 
 ### aimock-owned upstream keys — `AIMOCK_PROVIDER_*_KEY`
 
-In record or `--proxy-only` mode, aimock forwards the caller's auth header to the real provider unchanged. If your tests can only send a dummy placeholder key (e.g. an SDK that refuses to start without a non-empty API key), aimock can inject its own configured upstream key on a fixture-miss passthrough so the proxied call actually authenticates. Set any of `AIMOCK_PROVIDER_OPENAI_KEY`, `AIMOCK_PROVIDER_ANTHROPIC_KEY`, or `AIMOCK_PROVIDER_GEMINI_KEY` — each is independent, and the key is applied with the provider-correct scheme (`Authorization: Bearer` for OpenAI, `x-api-key` for Anthropic, `x-goog-api-key` header for Gemini).
+In record or `--proxy-only` mode, aimock forwards the caller's auth header to the real provider unchanged. If your tests can only send a dummy placeholder key (e.g. an SDK that refuses to start without a non-empty API key), aimock can inject its own configured upstream key on a fixture-miss passthrough so the proxied call actually authenticates. Each provider has an independent env var, and the key is applied with the provider-correct wire scheme:
 
-This is opt-in and backward-compatible: with no key configured the feature is inert and the caller's header passes through as-is. Injection fires only when the caller sent no credential **or** a dummy credential prefixed with `sk-aimock-` (overridable via `AIMOCK_DUMMY_KEY_MARKER`); a real caller key never starting with that marker is always forwarded verbatim, so the caller overrides aimock. Signed and exchanged credentials (AWS Bedrock SigV4, Vertex AI, Azure AD) are never rewritten and always forwarded unchanged.
+| Env var                          | Provider                         | Injected header               |
+| -------------------------------- | -------------------------------- | ----------------------------- |
+| `AIMOCK_PROVIDER_OPENAI_KEY`     | OpenAI                           | `Authorization: Bearer <key>` |
+| `AIMOCK_PROVIDER_OPENROUTER_KEY` | OpenRouter                       | `Authorization: Bearer <key>` |
+| `AIMOCK_PROVIDER_COHERE_KEY`     | Cohere                           | `Authorization: Bearer <key>` |
+| `AIMOCK_PROVIDER_GROK_KEY`       | Grok (xAI)                       | `Authorization: Bearer <key>` |
+| `AIMOCK_PROVIDER_OLLAMA_KEY`     | Ollama (Cloud / bearer-gated)    | `Authorization: Bearer <key>` |
+| `AIMOCK_PROVIDER_ANTHROPIC_KEY`  | Anthropic                        | `x-api-key: <key>`            |
+| `AIMOCK_PROVIDER_GEMINI_KEY`     | Gemini (and Gemini Interactions) | `x-goog-api-key: <key>`       |
+| `AIMOCK_PROVIDER_VEO_KEY`        | Veo                              | `x-goog-api-key: <key>`       |
+| `AIMOCK_PROVIDER_AZURE_KEY`      | Azure OpenAI                     | `api-key: <key>`              |
+| `AIMOCK_PROVIDER_ELEVENLABS_KEY` | ElevenLabs                       | `xi-api-key: <key>`           |
+| `AIMOCK_PROVIDER_FAL_KEY`        | fal.ai                           | `Authorization: Key <key>`    |
+
+`gemini-interactions` reuses `AIMOCK_PROVIDER_GEMINI_KEY` (same upstream API as Gemini). An empty-string value is treated as unset.
+
+This is opt-in and backward-compatible: with no key configured the feature is inert and the caller's header passes through as-is. Injection fires only when the caller sent no credential **or** a dummy credential prefixed with `sk-aimock-` (overridable via `AIMOCK_DUMMY_KEY_MARKER`); a real caller key never starting with that marker is always forwarded verbatim, so the caller overrides aimock. Signed and exchanged credentials — AWS Bedrock (SigV4) and Vertex AI (OAuth) — are never rewritten and always forwarded unchanged. (Azure's static `api-key` is injected; a real Microsoft Entra ID `Authorization: Bearer` token from the caller is never dummy-prefixed, so it too passes through verbatim.)
 
 ## Framework Guides
 

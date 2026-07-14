@@ -36,6 +36,7 @@ import {
   sanitizeHeaderValue,
 } from "./recorder.js";
 import { resolveUpstreamUrl } from "./url.js";
+import { applyProviderAuth } from "./provider-auth.js";
 import type { Journal } from "./journal.js";
 import { audioToFalFile } from "./fal-audio.js";
 
@@ -885,6 +886,14 @@ export async function walkFalQueue(args: {
   fallbackResultPath: (requestId: string) => string;
   /** Warn sink for the same-origin envelope-URL gate (omitting it only mutes the warns). */
   logger?: Logger;
+  /**
+   * aimock's built-in fal key, when configured. Injected as `Authorization: Key
+   * <key>` on every walk fetch (submit/status/result) if the caller sent no
+   * credential or a dummy placeholder; a real caller credential overrides. This
+   * is the single chokepoint for all fal queue walks — the queue path doesn't
+   * route through `proxyAndRecord`, so own-key injection lives here.
+   */
+  builtinKey?: string;
 }): Promise<FalQueueWalkResult> {
   const {
     upstreamBase,
@@ -897,7 +906,13 @@ export async function walkFalQueue(args: {
     fallbackStatusPath,
     fallbackResultPath,
     logger,
+    builtinKey,
   } = args;
+
+  // Inject aimock's own fal credential onto the walk headers up front so every
+  // fetch below (submit + polls) carries it. fal's scheme ignores the target
+  // URL, so any resolvable URL suffices.
+  applyProviderAuth(headers, resolveUpstreamUrl(upstreamBase, submitPath), "fal", builtinKey);
 
   const deadline = Date.now() + timeoutMs;
   const perFetchTimeoutMs = clampTimeout(upstreamTimeoutMs, DEFAULT_FAL_FETCH_TIMEOUT_MS);
@@ -1065,6 +1080,9 @@ async function proxyAndRecordFalQueueSubmit(args: {
       submitPath: strippedPath,
       body,
       headers: buildForwardHeaders(req),
+      // aimock's built-in fal key (Authorization: Key), injected by the walk on
+      // a no/dummy caller credential; a real caller key overrides.
+      builtinKey: record.providerKeys?.fal,
       pollIntervalMs: record.fal?.pollIntervalMs,
       timeoutMs: record.fal?.timeoutMs,
       upstreamTimeoutMs: record.upstreamTimeoutMs,

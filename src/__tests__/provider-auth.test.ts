@@ -199,6 +199,140 @@ describe("applyProviderAuth — aimock owns the upstream key", () => {
     });
   });
 
+  describe("Cohere (bearer, via /v2/chat)", () => {
+    const COHERE_PATH = "/v2/chat";
+    const COHERE_BODY = {
+      model: "command-r",
+      messages: [{ role: "user", content: "unmatched-miss" }],
+    };
+
+    it("built-in key set + caller sends dummy → injects Bearer", async () => {
+      const { recorderUrl } = await setup("cohere", REAL);
+      await post(recorderUrl + COHERE_PATH, COHERE_BODY, {
+        Authorization: `Bearer ${DUMMY}`,
+      });
+      expect(upstream!.last().authorization).toBe(`Bearer ${REAL}`);
+    });
+
+    it("caller sends a real Bearer key → forwarded unchanged", async () => {
+      const callerReal = "co-caller-real-abc";
+      const { recorderUrl } = await setup("cohere", REAL);
+      await post(recorderUrl + COHERE_PATH, COHERE_BODY, {
+        Authorization: `Bearer ${callerReal}`,
+      });
+      expect(upstream!.last().authorization).toBe(`Bearer ${callerReal}`);
+    });
+
+    it("inert when no built-in key set → dummy forwarded verbatim", async () => {
+      const { recorderUrl } = await setup("cohere"); // feature OFF
+      await post(recorderUrl + COHERE_PATH, COHERE_BODY, {
+        Authorization: `Bearer ${DUMMY}`,
+      });
+      expect(upstream!.last().authorization).toBe(`Bearer ${DUMMY}`);
+    });
+  });
+
+  describe("Ollama (bearer, via /api/chat)", () => {
+    const OLLAMA_PATH = "/api/chat";
+    const OLLAMA_BODY = {
+      model: "llama3",
+      messages: [{ role: "user", content: "unmatched-miss" }],
+    };
+
+    it("built-in key set + caller sends dummy → injects Bearer", async () => {
+      const { recorderUrl } = await setup("ollama", REAL);
+      await post(recorderUrl + OLLAMA_PATH, OLLAMA_BODY, {
+        Authorization: `Bearer ${DUMMY}`,
+      });
+      expect(upstream!.last().authorization).toBe(`Bearer ${REAL}`);
+    });
+
+    it("inert when no built-in key set → dummy forwarded verbatim", async () => {
+      const { recorderUrl } = await setup("ollama"); // feature OFF
+      await post(recorderUrl + OLLAMA_PATH, OLLAMA_BODY, {
+        Authorization: `Bearer ${DUMMY}`,
+      });
+      expect(upstream!.last().authorization).toBe(`Bearer ${DUMMY}`);
+    });
+  });
+
+  describe("Azure OpenAI (api-key, via /openai/deployments/{id}/chat/completions)", () => {
+    const AZURE_PATH = "/openai/deployments/my-deploy/chat/completions";
+
+    it("built-in key set + caller sends dummy → injects api-key", async () => {
+      const { recorderUrl } = await setup("azure", REAL);
+      await post(recorderUrl + AZURE_PATH, CHAT_BODY, { "api-key": DUMMY });
+      expect(upstream!.last()["api-key"]).toBe(REAL);
+    });
+
+    it("caller sends a real api-key → forwarded unchanged", async () => {
+      const callerReal = "azure-caller-real-xyz";
+      const { recorderUrl } = await setup("azure", REAL);
+      await post(recorderUrl + AZURE_PATH, CHAT_BODY, { "api-key": callerReal });
+      expect(upstream!.last()["api-key"]).toBe(callerReal);
+    });
+
+    it("inert when no built-in key set → dummy forwarded verbatim", async () => {
+      const { recorderUrl } = await setup("azure"); // feature OFF
+      await post(recorderUrl + AZURE_PATH, CHAT_BODY, { "api-key": DUMMY });
+      expect(upstream!.last()["api-key"]).toBe(DUMMY);
+    });
+  });
+
+  describe("ElevenLabs (xi-api-key, via /v1/text-to-speech/{voice})", () => {
+    const EL_PATH = "/v1/text-to-speech/voice-123";
+    const EL_BODY = { text: "unmatched-miss speak this" };
+
+    it("built-in key set + caller sends dummy → injects xi-api-key", async () => {
+      const { recorderUrl } = await setup("elevenlabs", REAL);
+      await post(recorderUrl + EL_PATH, EL_BODY, { "xi-api-key": DUMMY });
+      expect(upstream!.last()["xi-api-key"]).toBe(REAL);
+    });
+
+    it("caller sends a real xi-api-key → forwarded unchanged", async () => {
+      const callerReal = "el-caller-real-777";
+      const { recorderUrl } = await setup("elevenlabs", REAL);
+      await post(recorderUrl + EL_PATH, EL_BODY, { "xi-api-key": callerReal });
+      expect(upstream!.last()["xi-api-key"]).toBe(callerReal);
+    });
+
+    it("inert when no built-in key set → dummy forwarded verbatim", async () => {
+      const { recorderUrl } = await setup("elevenlabs"); // feature OFF
+      await post(recorderUrl + EL_PATH, EL_BODY, { "xi-api-key": DUMMY });
+      expect(upstream!.last()["xi-api-key"]).toBe(DUMMY);
+    });
+  });
+
+  describe("fal.ai (Authorization: Key, via /fal/queue/submit)", () => {
+    const FAL_PATH = "/fal/queue/submit/fal-ai/some-model";
+    const FAL_BODY = { prompt: "unmatched-miss render this" };
+
+    it("built-in key set + caller sends dummy → injects Authorization: Key", async () => {
+      const { recorderUrl } = await setup("fal", REAL);
+      await post(recorderUrl + FAL_PATH, FAL_BODY, {
+        Authorization: `Key ${DUMMY}`,
+      });
+      expect(upstream!.last().authorization).toBe(`Key ${REAL}`);
+    });
+
+    it("caller sends a real Key credential → forwarded unchanged", async () => {
+      const callerReal = "fal-caller-real-555";
+      const { recorderUrl } = await setup("fal", REAL);
+      await post(recorderUrl + FAL_PATH, FAL_BODY, {
+        Authorization: `Key ${callerReal}`,
+      });
+      expect(upstream!.last().authorization).toBe(`Key ${callerReal}`);
+    });
+
+    it("inert when no built-in key set → dummy forwarded verbatim", async () => {
+      const { recorderUrl } = await setup("fal"); // feature OFF
+      await post(recorderUrl + FAL_PATH, FAL_BODY, {
+        Authorization: `Key ${DUMMY}`,
+      });
+      expect(upstream!.last().authorization).toBe(`Key ${DUMMY}`);
+    });
+  });
+
   describe("fixture MATCH short-circuits injection", () => {
     it("a matched request never reaches the proxy, so no injection happens", async () => {
       upstream = await createFakeUpstream();
@@ -233,11 +367,22 @@ describe("applyProviderAuth — aimock owns the upstream key", () => {
 });
 
 describe("readProviderKeysFromEnv", () => {
+  const ALL_ENV_VARS = [
+    "AIMOCK_PROVIDER_OPENAI_KEY",
+    "AIMOCK_PROVIDER_ANTHROPIC_KEY",
+    "AIMOCK_PROVIDER_GEMINI_KEY",
+    "AIMOCK_PROVIDER_OPENROUTER_KEY",
+    "AIMOCK_PROVIDER_COHERE_KEY",
+    "AIMOCK_PROVIDER_GROK_KEY",
+    "AIMOCK_PROVIDER_OLLAMA_KEY",
+    "AIMOCK_PROVIDER_VEO_KEY",
+    "AIMOCK_PROVIDER_AZURE_KEY",
+    "AIMOCK_PROVIDER_ELEVENLABS_KEY",
+    "AIMOCK_PROVIDER_FAL_KEY",
+  ] as const;
   const saved = { ...process.env };
   beforeEach(() => {
-    delete process.env.AIMOCK_PROVIDER_OPENAI_KEY;
-    delete process.env.AIMOCK_PROVIDER_ANTHROPIC_KEY;
-    delete process.env.AIMOCK_PROVIDER_GEMINI_KEY;
+    for (const name of ALL_ENV_VARS) delete process.env[name];
   });
   afterEach(() => {
     process.env = { ...saved };
@@ -248,13 +393,43 @@ describe("readProviderKeysFromEnv", () => {
     expect(readProviderKeysFromEnv({})).toBeUndefined();
   });
 
-  it("reads each provider key from its env var", async () => {
+  it("reads every wired provider key from its env var", async () => {
     const { readProviderKeysFromEnv } = await import("../provider-auth.js");
     const keys = readProviderKeysFromEnv({
       AIMOCK_PROVIDER_OPENAI_KEY: "o",
       AIMOCK_PROVIDER_ANTHROPIC_KEY: "a",
       AIMOCK_PROVIDER_GEMINI_KEY: "g",
+      AIMOCK_PROVIDER_OPENROUTER_KEY: "or",
+      AIMOCK_PROVIDER_COHERE_KEY: "co",
+      AIMOCK_PROVIDER_GROK_KEY: "gr",
+      AIMOCK_PROVIDER_OLLAMA_KEY: "ol",
+      AIMOCK_PROVIDER_VEO_KEY: "ve",
+      AIMOCK_PROVIDER_AZURE_KEY: "az",
+      AIMOCK_PROVIDER_ELEVENLABS_KEY: "el",
+      AIMOCK_PROVIDER_FAL_KEY: "fa",
     } as NodeJS.ProcessEnv);
-    expect(keys).toEqual({ openai: "o", anthropic: "a", gemini: "g" });
+    expect(keys).toEqual({
+      openai: "o",
+      anthropic: "a",
+      gemini: "g",
+      openrouter: "or",
+      cohere: "co",
+      grok: "gr",
+      ollama: "ol",
+      veo: "ve",
+      azure: "az",
+      elevenlabs: "el",
+      fal: "fa",
+    });
+  });
+
+  it("treats an empty-string env var as unset (feature stays inert)", async () => {
+    const { readProviderKeysFromEnv } = await import("../provider-auth.js");
+    const keys = readProviderKeysFromEnv({
+      AIMOCK_PROVIDER_OPENAI_KEY: "o",
+      AIMOCK_PROVIDER_COHERE_KEY: "",
+      AIMOCK_PROVIDER_FAL_KEY: "",
+    } as NodeJS.ProcessEnv);
+    expect(keys).toEqual({ openai: "o" });
   });
 });

@@ -699,10 +699,12 @@ export interface RecordConfig {
    * backward-compatible: when set for a provider, aimock injects the key on a
    * fixture-miss passthrough IF the caller sent no credential or a dummy
    * placeholder (see `applyProviderAuth`); a real caller key always overrides.
-   * Only simple bearer/api-key providers are eligible (OpenAI/OpenRouter/Cohere
-   * bearer, Anthropic x-api-key, Gemini x-goog-api-key); signed/OAuth providers
-   * (Bedrock/Vertex/Azure-AD) are never rewritten. Sourced from
-   * AIMOCK_PROVIDER_*_KEY env vars by the CLI (secrets stay out of `ps`).
+   * Only static-key providers are eligible: OpenAI/OpenRouter/Cohere/Grok/Ollama
+   * (bearer), Anthropic (x-api-key), Gemini/Gemini-Interactions/Veo
+   * (x-goog-api-key), Azure OpenAI (api-key), ElevenLabs (xi-api-key), and fal
+   * (Authorization: Key). Signed/OAuth providers (Bedrock SigV4, Vertex AI
+   * OAuth) are never rewritten. Sourced from AIMOCK_PROVIDER_*_KEY env vars by
+   * the CLI (secrets stay out of `ps`).
    */
   providerKeys?: Partial<Record<RecordProviderKey, string>>;
   fixturePath?: string;

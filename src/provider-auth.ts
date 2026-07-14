@@ -23,28 +23,51 @@ export function getDummyKeyMarker(): string {
  * How a given provider carries its API credential on the wire. aimock injects
  * its built-in key using the provider's native scheme so the upstream accepts
  * it. Providers whose auth is a signed/exchanged credential (Bedrock SigV4,
- * Vertex/Azure-AD OAuth) are deliberately absent — those are NOT simple
- * bearer/api-key schemes, so aimock never rewrites their auth and always
- * forwards the caller's credential unchanged.
+ * Vertex AI OAuth) are deliberately absent — those are NOT simple static-key
+ * schemes, so aimock never rewrites their auth and always forwards the caller's
+ * credential unchanged.
+ *
+ * Scheme kinds (all static long-lived keys):
+ *   - bearer          `Authorization: Bearer <key>`  (OpenAI, OpenRouter, Cohere, Grok/xAI, Ollama)
+ *   - fal-key         `Authorization: Key <key>`     (fal.ai — note the `Key ` prefix, NOT `Bearer`)
+ *   - x-api-key       `x-api-key: <key>`             (Anthropic)
+ *   - x-goog-api-key  `x-goog-api-key: <key>`        (Gemini, Gemini Interactions, Veo)
+ *   - api-key         `api-key: <key>`               (Azure OpenAI static-key auth)
+ *   - xi-api-key      `xi-api-key: <key>`            (ElevenLabs)
+ *
+ * Note on Azure: Azure OpenAI also supports Microsoft Entra ID `Authorization:
+ * Bearer <token>` OAuth. aimock only ever injects the static `api-key` header,
+ * and a real Entra bearer token from the caller is never dummy-prefixed, so it
+ * is always forwarded verbatim (the caller overrides aimock).
  */
 type AuthScheme =
   | { kind: "bearer" } // Authorization: Bearer <key>
+  | { kind: "fal-key" } // Authorization: Key <key>
   | { kind: "x-api-key" } // x-api-key: <key>
-  | { kind: "x-goog-api-key" }; // x-goog-api-key: <key>
+  | { kind: "x-goog-api-key" } // x-goog-api-key: <key>
+  | { kind: "api-key" } // api-key: <key>
+  | { kind: "xi-api-key" }; // xi-api-key: <key>
 
 const PROVIDER_AUTH_SCHEMES: Partial<Record<RecordProviderKey, AuthScheme>> = {
+  // Bearer-token providers.
   openai: { kind: "bearer" },
   openrouter: { kind: "bearer" },
   cohere: { kind: "bearer" },
+  grok: { kind: "bearer" }, // xAI
+  ollama: { kind: "bearer" }, // Ollama Cloud / bearer-gated Ollama servers
+  // Anthropic.
   anthropic: { kind: "x-api-key" },
-  gemini: { kind: "bearer" }, // placeholder, overridden below
-  "gemini-interactions": { kind: "bearer" }, // placeholder, overridden below
+  // Google (Gemini + Veo) use the x-goog-api-key header scheme.
+  gemini: { kind: "x-goog-api-key" },
+  "gemini-interactions": { kind: "x-goog-api-key" },
+  veo: { kind: "x-goog-api-key" },
+  // Azure OpenAI static-key auth.
+  azure: { kind: "api-key" },
+  // ElevenLabs.
+  elevenlabs: { kind: "xi-api-key" },
+  // fal.ai — uses the `Key ` prefix on Authorization, NOT `Bearer `.
+  fal: { kind: "fal-key" },
 };
-
-// Gemini uses Google's x-goog-api-key header scheme. Declared separately to keep
-// the map above readable; both Gemini keys resolve to the same scheme.
-PROVIDER_AUTH_SCHEMES.gemini = { kind: "x-goog-api-key" };
-PROVIDER_AUTH_SCHEMES["gemini-interactions"] = { kind: "x-goog-api-key" };
 
 /**
  * Case-insensitively delete a header from a forward-header map, returning the
@@ -71,16 +94,36 @@ function readCallerCredential(
   headers: Record<string, string>,
   scheme: AuthScheme,
 ): string | undefined {
-  if (scheme.kind === "bearer") {
-    const auth = headers["authorization"] ?? headers["Authorization"];
-    // Fall back to a case-insensitive scan for non-standard casing.
-    const raw = auth ?? scanHeader(headers, "authorization");
+  if (scheme.kind === "bearer" || scheme.kind === "fal-key") {
+    const raw = scanHeader(headers, "authorization");
     if (raw === undefined) return undefined;
-    const match = /^\s*Bearer\s+(.+)$/i.exec(raw);
+    // Strip the scheme prefix (`Bearer ` for bearer, `Key ` for fal) if present,
+    // otherwise treat the whole value as the credential.
+    const prefix = scheme.kind === "fal-key" ? "Key" : "Bearer";
+    const match = new RegExp(`^\\s*${prefix}\\s+(.+)$`, "i").exec(raw);
     return match ? match[1].trim() : raw.trim();
   }
-  const headerName = scheme.kind === "x-api-key" ? "x-api-key" : "x-goog-api-key";
-  return scanHeader(headers, headerName);
+  return scanHeader(headers, authHeaderName(scheme));
+}
+
+/**
+ * The wire header name a non-Authorization scheme carries its credential in.
+ * (bearer/fal-key both use `Authorization` and are handled separately.)
+ */
+function authHeaderName(scheme: AuthScheme): string {
+  switch (scheme.kind) {
+    case "x-api-key":
+      return "x-api-key";
+    case "x-goog-api-key":
+      return "x-goog-api-key";
+    case "api-key":
+      return "api-key";
+    case "xi-api-key":
+      return "xi-api-key";
+    case "bearer":
+    case "fal-key":
+      return "authorization";
+  }
 }
 
 /** Case-insensitive header lookup that does not mutate the map. */
@@ -109,8 +152,8 @@ function shouldOverride(callerCredential: string | undefined, marker: string): b
  * and may mutate `target` (query-param schemes; none currently).
  *
  * Precedence:
- *   - No built-in key configured for this provider  → no-op (forward verbatim).
- *   - Provider not a simple bearer/api-key scheme    → no-op (Bedrock/Vertex/Azure-AD).
+ *   - No built-in key configured for this provider    → no-op (forward verbatim).
+ *   - Provider not a static-key scheme                → no-op (Bedrock SigV4 / Vertex AI OAuth).
  *   - Caller credential absent or dummy-prefixed      → inject built-in key.
  *   - Caller credential is a real key                 → forward it unchanged.
  *
@@ -142,6 +185,10 @@ export function applyProviderAuth(
       takeHeader(forwardHeaders, "authorization");
       forwardHeaders["Authorization"] = `Bearer ${builtinKey}`;
       break;
+    case "fal-key":
+      takeHeader(forwardHeaders, "authorization");
+      forwardHeaders["Authorization"] = `Key ${builtinKey}`;
+      break;
     case "x-api-key":
       takeHeader(forwardHeaders, "x-api-key");
       forwardHeaders["x-api-key"] = builtinKey;
@@ -150,12 +197,27 @@ export function applyProviderAuth(
       takeHeader(forwardHeaders, "x-goog-api-key");
       forwardHeaders["x-goog-api-key"] = builtinKey;
       break;
+    case "api-key":
+      takeHeader(forwardHeaders, "api-key");
+      forwardHeaders["api-key"] = builtinKey;
+      break;
+    case "xi-api-key":
+      takeHeader(forwardHeaders, "xi-api-key");
+      forwardHeaders["xi-api-key"] = builtinKey;
+      break;
   }
 }
 
 /**
  * Read per-provider built-in keys from the environment. Returns undefined when
  * no provider key is configured so the feature stays fully inert by default.
+ *
+ * Each wired static-key provider reads `AIMOCK_PROVIDER_<PROVIDER>_KEY`. An
+ * empty-string value is treated as unset (existing truthiness pattern), keeping
+ * the feature inert. `gemini-interactions` is not read here: it reuses the
+ * Gemini key via the lookup-key remap in `proxyAndRecord`. Signed/OAuth
+ * providers (`bedrock`, `vertexai`) have no env var — aimock never rewrites
+ * their auth.
  */
 export function readProviderKeysFromEnv(
   env: NodeJS.ProcessEnv = process.env,
@@ -164,5 +226,13 @@ export function readProviderKeysFromEnv(
   if (env.AIMOCK_PROVIDER_OPENAI_KEY) keys.openai = env.AIMOCK_PROVIDER_OPENAI_KEY;
   if (env.AIMOCK_PROVIDER_ANTHROPIC_KEY) keys.anthropic = env.AIMOCK_PROVIDER_ANTHROPIC_KEY;
   if (env.AIMOCK_PROVIDER_GEMINI_KEY) keys.gemini = env.AIMOCK_PROVIDER_GEMINI_KEY;
+  if (env.AIMOCK_PROVIDER_OPENROUTER_KEY) keys.openrouter = env.AIMOCK_PROVIDER_OPENROUTER_KEY;
+  if (env.AIMOCK_PROVIDER_COHERE_KEY) keys.cohere = env.AIMOCK_PROVIDER_COHERE_KEY;
+  if (env.AIMOCK_PROVIDER_GROK_KEY) keys.grok = env.AIMOCK_PROVIDER_GROK_KEY;
+  if (env.AIMOCK_PROVIDER_OLLAMA_KEY) keys.ollama = env.AIMOCK_PROVIDER_OLLAMA_KEY;
+  if (env.AIMOCK_PROVIDER_VEO_KEY) keys.veo = env.AIMOCK_PROVIDER_VEO_KEY;
+  if (env.AIMOCK_PROVIDER_AZURE_KEY) keys.azure = env.AIMOCK_PROVIDER_AZURE_KEY;
+  if (env.AIMOCK_PROVIDER_ELEVENLABS_KEY) keys.elevenlabs = env.AIMOCK_PROVIDER_ELEVENLABS_KEY;
+  if (env.AIMOCK_PROVIDER_FAL_KEY) keys.fal = env.AIMOCK_PROVIDER_FAL_KEY;
   return Object.keys(keys).length > 0 ? keys : undefined;
 }
