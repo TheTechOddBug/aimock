@@ -14,7 +14,7 @@ import { listOpenAIModels, listAnthropicModels, listGeminiModels } from "./provi
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, "..", "..", "..");
 
-function scrapeModels(pattern: RegExp, files: string[]): string[] {
+export function scrapeModels(pattern: RegExp, files: string[]): string[] {
   const models = new Set<string>();
   for (const file of files) {
     const filePath = path.join(PROJECT_ROOT, file);
@@ -29,7 +29,7 @@ function scrapeModels(pattern: RegExp, files: string[]): string[] {
   return [...models];
 }
 
-const sourceFiles = [
+export const sourceFiles = [
   "src/__tests__/api-conformance.test.ts",
   "src/__tests__/ws-api-conformance.test.ts",
   "README.md",
@@ -37,6 +37,35 @@ const sourceFiles = [
   "fixtures/example-multi-turn.json",
   "fixtures/example-tool-call.json",
 ];
+
+// Regex used to scrape Gemini model ids from the source files above. Greedy
+// on purpose so we catch versioned/dated ids (e.g. gemini-2.5-flash), but that
+// greed also grabs any `gemini-*` token appearing in prose — see the stable
+// filter below for what gets excluded.
+export const GEMINI_MODEL_PATTERN = /\b(gemini-(?:[\w.-]+))\b/g;
+
+// aimock exposes "provider modes" — internal names that route to a real
+// upstream API but are NOT themselves model ids exposed by that provider. The
+// README documents them (e.g. `gemini-interactions` reuses the Gemini upstream
+// key), so the greedy scraper above grabs them as if they were Gemini models.
+// They will never appear in Google's model list, so checking them for drift is
+// a guaranteed false positive. Exclude them explicitly.
+const AIMOCK_GEMINI_PROVIDER_MODES = new Set(["gemini-interactions"]);
+
+// Narrow a raw scrape of `gemini-*` tokens down to real, checkable model ids by
+// dropping (a) experimental/live/preview ids, (b) markdown anchor-link
+// fragments, and (c) aimock provider-mode names that are documentation prose,
+// not provider model ids. Exported so the regression suite can exercise the
+// exact filtering the drift check relies on.
+export function filterStableGeminiModels(referenced: string[]): string[] {
+  return referenced.filter(
+    (m) =>
+      !m.includes("-exp") &&
+      !m.includes("-live") &&
+      !m.includes("bidigeneratecontent") &&
+      !AIMOCK_GEMINI_PROVIDER_MODES.has(m),
+  );
+}
 
 // ---------------------------------------------------------------------------
 // OpenAI
@@ -85,15 +114,13 @@ describe.skipIf(!process.env.ANTHROPIC_API_KEY)("Anthropic model availability", 
 describe.skipIf(!process.env.GOOGLE_API_KEY)("Gemini model availability", () => {
   it("models used in aimock tests are still available", async () => {
     const models = await listGeminiModels(process.env.GOOGLE_API_KEY!);
-    const referenced = scrapeModels(/\b(gemini-(?:[\w.-]+))\b/g, sourceFiles);
+    const referenced = scrapeModels(GEMINI_MODEL_PATTERN, sourceFiles);
 
     if (referenced.length === 0) return;
 
-    // Skip experimental models, live-only models, and anchor-link fragments
-    // scraped from markdown (e.g., "gemini-live-bidigeneratecontent")
-    const stable = referenced.filter(
-      (m) => !m.includes("-exp") && !m.includes("-live") && !m.includes("bidigeneratecontent"),
-    );
+    // Drop experimental/live ids, markdown anchor fragments, and aimock
+    // provider-mode names (see filterStableGeminiModels).
+    const stable = filterStableGeminiModels(referenced);
 
     for (const m of stable) {
       const found = models.some((available) => available === m || available.startsWith(m));
