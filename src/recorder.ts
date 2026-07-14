@@ -20,6 +20,7 @@ import type { Logger } from "./logger.js";
 import { collapseStreamingResponse, capturedRedactedData } from "./stream-collapse.js";
 import { writeErrorResponse } from "./sse-writer.js";
 import { resolveUpstreamUrl } from "./url.js";
+import { applyProviderAuth } from "./provider-auth.js";
 import { getTestId, slugifyTestId, slugifyContext } from "./helpers.js";
 import { DEFAULT_TEST_ID } from "./constants.js";
 
@@ -430,6 +431,12 @@ export async function proxyAndRecord(
 
   // Forward all request headers except hop-by-hop and client-set ones.
   const forwardHeaders = buildForwardHeaders(req);
+
+  // If aimock owns a built-in upstream key for this provider, inject it now
+  // (opt-in, backward-compatible). A real caller credential overrides it; an
+  // absent or dummy-prefixed caller credential is replaced. gemini-interactions
+  // reuses the Gemini key, mirroring the upstream-URL remap above.
+  applyProviderAuth(forwardHeaders, target, providerKey, record.providerKeys?.[lookupKey]);
 
   const requestBody = rawBody ?? JSON.stringify(request);
 

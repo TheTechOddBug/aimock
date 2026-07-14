@@ -694,6 +694,17 @@ export type RecordProviderKey =
 
 export interface RecordConfig {
   providers: Partial<Record<RecordProviderKey, string>>;
+  /**
+   * aimock's own built-in upstream API keys, keyed by provider. Opt-in and
+   * backward-compatible: when set for a provider, aimock injects the key on a
+   * fixture-miss passthrough IF the caller sent no credential or a dummy
+   * placeholder (see `applyProviderAuth`); a real caller key always overrides.
+   * Only simple bearer/api-key providers are eligible (OpenAI/OpenRouter/Cohere
+   * bearer, Anthropic x-api-key, Gemini x-goog-api-key); signed/OAuth providers
+   * (Bedrock/Vertex/Azure-AD) are never rewritten. Sourced from
+   * AIMOCK_PROVIDER_*_KEY env vars by the CLI (secrets stay out of `ps`).
+   */
+  providerKeys?: Partial<Record<RecordProviderKey, string>>;
   fixturePath?: string;
   /** Proxy unmatched requests without saving fixtures or caching in memory. */
   proxyOnly?: boolean;

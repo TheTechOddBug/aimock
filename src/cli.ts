@@ -8,6 +8,7 @@ import { Logger, type LogLevel } from "./logger.js";
 import { watchFixtures } from "./watcher.js";
 import { AGUIMock } from "./agui-mock.js";
 import { resolveFixturesValue } from "./fixtures-remote.js";
+import { readProviderKeysFromEnv } from "./provider-auth.js";
 import type { Fixture, ChaosConfig, RecordConfig } from "./types.js";
 
 const HELP = `
@@ -276,6 +277,10 @@ if (values.record || values["proxy-only"]) {
   }
   record = {
     providers,
+    // aimock's own upstream keys, sourced from AIMOCK_PROVIDER_*_KEY env vars
+    // (not CLI flags — secrets must not appear in `ps`). Injected on a
+    // fixture-miss passthrough when the caller sent no/dummy credential.
+    providerKeys: readProviderKeysFromEnv(),
     // In proxy-only mode with only URL sources, fixturePath is never consumed
     // (recorder.ts skips disk writes when proxyOnly is set). Leave it undefined
     // rather than resolving a URL string as a filesystem path.
