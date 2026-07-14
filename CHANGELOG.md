@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [1.36.0] - 2026-07-13
+
+### Added
+
+- On a fixture-miss passthrough (record/proxy mode), aimock can inject its own configured upstream provider key instead of forwarding a caller's dummy placeholder key. Every static-key provider aimock proxies is wired end-to-end, each with an independent `AIMOCK_PROVIDER_<PROVIDER>_KEY` env var applied with the provider-correct wire scheme: `Authorization: Bearer` for OpenAI (`_OPENAI_KEY`), OpenRouter (`_OPENROUTER_KEY`), Cohere (`_COHERE_KEY`), Grok/xAI (`_GROK_KEY`), and Ollama (`_OLLAMA_KEY`); `x-api-key` for Anthropic (`_ANTHROPIC_KEY`); `x-goog-api-key` for Gemini (`_GEMINI_KEY`, also used for Gemini Interactions) and Veo (`_VEO_KEY`); `api-key` for Azure OpenAI (`_AZURE_KEY`); `xi-api-key` for ElevenLabs (`_ELEVENLABS_KEY`); and `Authorization: Key` for fal.ai (`_FAL_KEY`). Injection fires only when the caller credential is absent or dummy-prefixed (`sk-aimock-`, overridable via `AIMOCK_DUMMY_KEY_MARKER`); a real caller key is always forwarded unchanged, an empty-string env var is treated as unset, and with no built-in key configured the feature is inert. Signed/exchanged credentials — AWS Bedrock (SigV4) and Vertex AI (OAuth) — are never rewritten (#293)
+
 ## [1.35.1] - 2026-07-06
 
 ### Fixed

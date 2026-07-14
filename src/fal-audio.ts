@@ -577,6 +577,9 @@ async function tryRecordAudioQueueWalk(args: {
       submitPath: pathname,
       body,
       headers: buildForwardHeaders(req),
+      // aimock's built-in fal key (Authorization: Key), injected by the walk on
+      // a no/dummy caller credential; a real caller key overrides.
+      builtinKey: record.providerKeys?.fal,
       pollIntervalMs: record.fal?.pollIntervalMs,
       timeoutMs: record.fal?.timeoutMs,
       upstreamTimeoutMs: record.upstreamTimeoutMs,

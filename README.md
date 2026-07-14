@@ -127,6 +127,28 @@ Private and link-local addresses (loopback, RFC1918, CGNAT, cloud metadata, ULA,
 
 On replay, `turnIndex` is a non-fatal disambiguator, not a hard reject gate: a content-matching fixture is served even when its scripted `turnIndex` differs from the request's assistant-message count. This kills false "no fixture matched" misses for multi-bubble agent runs (multi-step agents emit several assistant bubbles per logical turn). When a served fixture diverges from its scripted `turnIndex`, the match diagnostic carries `turnIndexRelaxed: true` and aimock logs a one-shot warning (at the `warn` log level — silent by default). To restore the legacy strict behavior where a defined `turnIndex` must equal the assistant count exactly, set `AIMOCK_STRICT_TURN_INDEX=1`. The record path is always strict regardless of this flag.
 
+### aimock-owned upstream keys — `AIMOCK_PROVIDER_*_KEY`
+
+In record or `--proxy-only` mode, aimock forwards the caller's auth header to the real provider unchanged. If your tests can only send a dummy placeholder key (e.g. an SDK that refuses to start without a non-empty API key), aimock can inject its own configured upstream key on a fixture-miss passthrough so the proxied call actually authenticates. Each provider has an independent env var, and the key is applied with the provider-correct wire scheme:
+
+| Env var                          | Provider                         | Injected header               |
+| -------------------------------- | -------------------------------- | ----------------------------- |
+| `AIMOCK_PROVIDER_OPENAI_KEY`     | OpenAI                           | `Authorization: Bearer <key>` |
+| `AIMOCK_PROVIDER_OPENROUTER_KEY` | OpenRouter                       | `Authorization: Bearer <key>` |
+| `AIMOCK_PROVIDER_COHERE_KEY`     | Cohere                           | `Authorization: Bearer <key>` |
+| `AIMOCK_PROVIDER_GROK_KEY`       | Grok (xAI)                       | `Authorization: Bearer <key>` |
+| `AIMOCK_PROVIDER_OLLAMA_KEY`     | Ollama (Cloud / bearer-gated)    | `Authorization: Bearer <key>` |
+| `AIMOCK_PROVIDER_ANTHROPIC_KEY`  | Anthropic                        | `x-api-key: <key>`            |
+| `AIMOCK_PROVIDER_GEMINI_KEY`     | Gemini (and Gemini Interactions) | `x-goog-api-key: <key>`       |
+| `AIMOCK_PROVIDER_VEO_KEY`        | Veo                              | `x-goog-api-key: <key>`       |
+| `AIMOCK_PROVIDER_AZURE_KEY`      | Azure OpenAI                     | `api-key: <key>`              |
+| `AIMOCK_PROVIDER_ELEVENLABS_KEY` | ElevenLabs                       | `xi-api-key: <key>`           |
+| `AIMOCK_PROVIDER_FAL_KEY`        | fal.ai                           | `Authorization: Key <key>`    |
+
+`gemini-interactions` reuses `AIMOCK_PROVIDER_GEMINI_KEY` (same upstream API as Gemini). An empty-string value is treated as unset.
+
+This is opt-in and backward-compatible: with no key configured the feature is inert and the caller's header passes through as-is. Injection fires only when the caller sent no credential **or** a dummy credential prefixed with `sk-aimock-` (overridable via `AIMOCK_DUMMY_KEY_MARKER`); a real caller key never starting with that marker is always forwarded verbatim, so the caller overrides aimock. Signed and exchanged credentials — AWS Bedrock (SigV4) and Vertex AI (OAuth) — are never rewritten and always forwarded unchanged. (Azure's static `api-key` is injected; a real Microsoft Entra ID `Authorization: Bearer` token from the caller is never dummy-prefixed, so it too passes through verbatim.)
+
 ## Framework Guides
 
 Test your AI agents with aimock — no API keys, no network calls: [LangChain](https://aimock.copilotkit.dev/integrate-langchain) · [CrewAI](https://aimock.copilotkit.dev/integrate-crewai) · [PydanticAI](https://aimock.copilotkit.dev/integrate-pydanticai) · [LlamaIndex](https://aimock.copilotkit.dev/integrate-llamaindex) · [Mastra](https://aimock.copilotkit.dev/integrate-mastra) · [Google ADK](https://aimock.copilotkit.dev/integrate-adk) · [Microsoft Agent Framework](https://aimock.copilotkit.dev/integrate-maf)
