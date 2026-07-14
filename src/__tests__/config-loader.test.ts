@@ -794,11 +794,8 @@ describe("startFromConfig", () => {
               {
                 pattern: "stream",
                 events: [
-                  {
-                    kind: "status-update",
-                    taskId: "t1",
-                    status: { state: "working", message: { parts: [{ text: "streaming..." }] } },
-                  },
+                  { type: "status", state: "TASK_STATE_WORKING" },
+                  { type: "artifact", parts: [{ text: "streaming..." }], name: "out" },
                 ],
                 delayMs: 0,
               },
@@ -815,6 +812,28 @@ describe("startFromConfig", () => {
     expect(cardRes.status).toBe(200);
     const card = await cardRes.json();
     expect(card.name).toBe("stream-agent");
+
+    // Verify the streaming task actually streams the configured events over SSE
+    const streamRes = await fetch(`${url}/a2a`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "SendStreamingMessage",
+        params: { message: { parts: [{ text: "please stream" }] } },
+        id: 1,
+      }),
+    });
+    expect(streamRes.status).toBe(200);
+    expect(streamRes.headers.get("content-type")).toBe("text/event-stream");
+    const streamBody = await streamRes.text();
+    const events = streamBody
+      .split("\n\n")
+      .filter((frame) => frame.startsWith("data: "))
+      .map((frame) => JSON.parse(frame.slice("data: ".length)));
+    expect(events.length).toBe(2);
+    expect(events[0].result.task.status.state).toBe("TASK_STATE_WORKING");
+    expect(events[1].result.artifact.parts[0].text).toBe("streaming...");
   });
 
   it("with a2a custom path, mounts at specified path for tasks", async () => {
