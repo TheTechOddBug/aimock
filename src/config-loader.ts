@@ -90,6 +90,10 @@ export interface VectorConfig {
 export interface AimockConfig {
   llm?: {
     fixtures?: string;
+    latency?: number;
+    chunkSize?: number;
+    replaySpeed?: number;
+    logLevel?: "silent" | "warn" | "info" | "debug";
     chaos?: ChaosConfig;
     record?: RecordConfig;
   };
@@ -115,10 +119,22 @@ export async function startFromConfig(
 ): Promise<{ llmock: LLMock; url: string }> {
   const logger = new Logger("info");
 
+  // A non-positive replaySpeed fails calculateDelay's `speed > 0` check and applies the
+  // full delay rather than none. Mirrors the fixture-level guard in fixture-loader.ts.
+  let replaySpeed = config.llm?.replaySpeed;
+  if (replaySpeed != null && (!Number.isFinite(replaySpeed) || replaySpeed <= 0)) {
+    logger.warn(`llm.replaySpeed must be a positive number, got ${replaySpeed}. Ignoring.`);
+    replaySpeed = undefined;
+  }
+
   // Load fixtures if specified
   const llmock = new LLMock({
     port: overrides?.port ?? config.port ?? 0,
     host: overrides?.host ?? config.host ?? "127.0.0.1",
+    latency: config.llm?.latency,
+    chunkSize: config.llm?.chunkSize,
+    replaySpeed,
+    logLevel: config.llm?.logLevel,
     chaos: config.llm?.chaos,
     record: config.llm?.record,
     metrics: config.metrics,
