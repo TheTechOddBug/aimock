@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- `aimock.json` now honours `llm.latency`, `llm.chunkSize`, `llm.replaySpeed` and `llm.logLevel`, which the config loader previously accepted and ignored. Each behaves as its `llmock` CLI flag and `createMockSuite({ llm })` equivalent. `llm.replaySpeed` divides every delay source (recorded timings, streaming profiles, `latency`), so a fixture suite can replay recorded inter-chunk timings faster than they were recorded; a fixture's own `replaySpeed` still takes precedence. A non-positive `llm.replaySpeed` is ignored with a warning, matching the existing fixture-level guard (#NNN)
+- `aimock.json` now honours `llm.latency`, `llm.chunkSize`, `llm.replaySpeed` and `llm.logLevel`, which the config loader previously accepted and ignored. Each behaves as its `llmock` CLI flag and `createMockSuite({ llm })` equivalent. `llm.replaySpeed` divides every delay source (recorded timings, streaming profiles, `latency`), so a fixture suite can replay recorded inter-chunk timings faster than they were recorded; a fixture's own `replaySpeed` still takes precedence. A non-positive `llm.replaySpeed` is ignored with a warning, matching the existing fixture-level guard (#294)
 
 ## [1.36.0] - 2026-07-13
 
