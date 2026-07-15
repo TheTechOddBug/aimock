@@ -358,6 +358,115 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
 
+      # ---- PR preflight — per-provider key triage (graceful degradation) ---
+      # The PR-scoped live leg must NOT hard-block a drift-code PR merely because
+      # a provider key is absent or a provider is transiently down — that would
+      # re-introduce the live-key coupling the whole delta design set out to
+      # reduce. So classify each provider independently, keying off the numeric
+      # InfraError.status (401/403), NEVER the prose message:
+      #
+      #   - NO key configured        → SKIP that provider's live leg with a
+      #                                NEUTRAL ::notice:: advisory. Not a failure.
+      #   - key present but 401/403  → LOUD `stale-key` ::error:: → block. A
+      #                                configured key that is dead is a real
+      #                                failure (rotate it) — this is the one case
+      #                                that stays red (the InfraError.status
+      #                                contract, mirroring the daily preflight).
+      #   - transient (429/5xx/net)  → warn + continue; the collector's own retry
+      #                                path handles a transient blip.
+      #
+      # `live_legs_ran` records whether ANY provider had a usable key. When it is
+      # `false` (all skipped for no-key — e.g. a fork PR with no secrets), the
+      # delta gate below is a neutral pass with a "live drift leg skipped — no
+      # keys" advisory, and the maintainer-dry-run fallback (documented at the
+      # bottom of this job) applies.
+      - name: PR preflight — per-provider key triage
+        id: preflight
+        run: |
+          set -uo pipefail
+          # Written at the checkout root (cwd) so the relative provider import
+          # resolves against the repo — ESM relative specifiers key off the
+          # module's own location, not the process cwd. Cleaned up on exit.
+          PREFLIGHT_FILE="$GITHUB_WORKSPACE/.drift-pr-preflight.mts"
+          trap 'rm -f "$PREFLIGHT_FILE"' EXIT
+          cat > "$PREFLIGHT_FILE" <<'PREFLIGHT'
+          import { appendFileSync } from "node:fs";
+          import {
+            InfraError,
+            listOpenAIModels,
+            listAnthropicModels,
+            listGeminiModels,
+          } from "./src/__tests__/drift/providers.js";
+
+          const PROVIDERS: {
+            name: string;
+            keyEnv: string;
+            list: (key: string) => Promise<string[]>;
+          }[] = [
+            { name: "OpenAI", keyEnv: "OPENAI_API_KEY", list: listOpenAIModels },
+            { name: "Anthropic", keyEnv: "ANTHROPIC_API_KEY", list: listAnthropicModels },
+            { name: "Gemini", keyEnv: "GOOGLE_API_KEY", list: listGeminiModels },
+          ];
+
+          const stale: string[] = [];
+          let liveLegs = 0;
+
+          for (const p of PROVIDERS) {
+            const key = process.env[p.keyEnv];
+            if (!key) {
+              // NO key configured → SKIP this provider's live leg. Neutral
+              // advisory, NOT a failure (the drift suite's own describe.skipIf
+              // already drops the provider's tests when the key is absent).
+              console.log(
+                `::notice title=drift-live skipped (no key)::${p.name} live drift leg skipped — ${p.keyEnv} not configured`,
+              );
+              continue;
+            }
+            try {
+              await p.list(key);
+              liveLegs++;
+              console.log(`preflight: ${p.name} key OK`);
+            } catch (err) {
+              const status = err instanceof InfraError ? err.status : 0;
+              if (status === 401 || status === 403) {
+                // stale-key: a CONFIGURED key is dead/expired/revoked. LOUD,
+                // classified, blocking — this stays a real failure.
+                console.error(
+                  `::error title=stale-key::${p.name} preflight got HTTP ${status} — rotate ${p.keyEnv}`,
+                );
+                stale.push(p.keyEnv);
+              } else {
+                // Transient (429/5xx/network) is NOT a stale key — don't block;
+                // count it as a live leg and let the collector's retry handle it.
+                liveLegs++;
+                const msg = err instanceof Error ? err.message : String(err);
+                console.warn(
+                  `preflight: ${p.name} non-auth error (status ${status}), continuing: ${msg}`,
+                );
+              }
+            }
+          }
+
+          const out = process.env.GITHUB_OUTPUT;
+          if (out) {
+            appendFileSync(out, `live_legs_ran=${liveLegs > 0 ? "true" : "false"}\n`);
+          }
+
+          if (stale.length > 0) {
+            console.error(
+              `::error::PR preflight failed (stale-key): rotate ${stale.join(", ")} — a configured key is dead`,
+            );
+            process.exit(1);
+          }
+          if (liveLegs === 0) {
+            console.log(
+              "::notice title=drift-live skipped::no provider keys configured — live drift leg skipped (neutral); maintainer-dry-run fallback applies",
+            );
+          }
+          console.log(`preflight: ${liveLegs} live provider leg(s) will run`);
+          PREFLIGHT
+          npx tsx "$PREFLIGHT_FILE"
+
       # ---- BASE leg -------------------------------------------------------
       # Prefer reusing the most recent same-UTC-day, well-formed `main`
       # scheduled drift report as the delta base — a same-day main baseline
@@ -375,8 +484,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
+          LIVE_LEGS_RAN: ${{ steps.preflight.outputs.live_legs_ran }}
         run: |
           set -euo pipefail
+          # No provider key had a usable credential (fork PR / all keys absent).
+          # The live legs are skipped — write an empty, well-formed base report so
+          # the delta gate has a stable file to read, and stop here (neutral).
+          if [ "${LIVE_LEGS_RAN:-true}" != "true" ]; then
+            echo "base: live legs skipped (no keys) — writing empty base report"
+            printf '%s\n' '{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","entries":[]}' \
+              > drift-report-base.json
+            echo "reused=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Attempt reuse: download the most recent successful scheduled
           # `main` run's drift-report artifact, then let isBaseReportReusable
           # (D6.1) decide if it is a trustworthy same-UTC-day baseline. On any
@@ -421,18 +541,64 @@ jobs:
             # Check main out into a sibling worktree and run the collector
             # there, writing the base report back into the workspace root.
             git worktree add ../base-main origin/main
-            ( cd ../base-main \
-              && pnpm install --frozen-lockfile \
-              && npx tsx scripts/drift-report-collector.ts \
-                   --out "$GITHUB_WORKSPACE/drift-report-base.json" )
+            cd ../base-main
+            pnpm install --frozen-lockfile
+            # The collector exits 2 when it finds critical drift — that is the
+            # NORMAL "drift present" signal, NOT a step failure. The delta gate
+            # (not this leg) decides block-vs-advisory, so exit 2 here must be
+            # tolerated. Exit 5 (quarantine) and any other non-zero are genuine
+            # collector faults and DO fail the leg. `set +e` around the run so an
+            # exit 2 does not abort under `set -euo pipefail`.
+            set +e
+            npx tsx scripts/drift-report-collector.ts \
+              --out "$GITHUB_WORKSPACE/drift-report-base.json"
+            BASE_EXIT=$?
+            set -e
+            cd "$GITHUB_WORKSPACE"
+            if [ "$BASE_EXIT" -ne 0 ] && [ "$BASE_EXIT" -ne 2 ]; then
+              echo "::error::Base collector faulted (exit $BASE_EXIT) — not a drift signal"
+              exit "$BASE_EXIT"
+            fi
           fi
           echo "reused=$REUSED" >> "$GITHUB_OUTPUT"
 
       # ---- HEAD leg -------------------------------------------------------
-      # Always run the collector live against the PR head (the checked-out
-      # ref) to produce the head report the delta compares against the base.
+      # Run the collector live against the PR head (the checked-out ref) to
+      # produce the head report the delta compares against the base.
+      #
+      # CRITICAL (this was the wiring bug that hard-failed the required check):
+      # the collector exits 2 whenever it finds ANY critical drift — that is the
+      # EXPECTED "drift present" signal on the head leg, NOT a step failure. The
+      # whole point of the two-report + delta design is that `computeDelta`
+      # (the delta gate below) decides block-vs-advisory by KEY PRESENCE — a
+      # both-present critical is advisory, only a new-in-head key blocks. Letting
+      # the collector's exit 2 fail THIS step meant the delta gate was skipped
+      # and the check died for the wrong reason (every drift-code PR would
+      # red-fail regardless of whether its diff introduced the drift). So exit 2
+      # here is tolerated; the report file is the signal. Exit 5 (quarantine) and
+      # any other non-zero are genuine collector faults and DO fail the leg.
+      #
+      # When no provider key had a usable credential (fork PR / all keys absent),
+      # skip the live head run and write an empty, well-formed head report so the
+      # delta gate has a stable file — it will then neutral-pass with an advisory.
       - name: Head drift report — run live on PR ref
-        run: npx tsx scripts/drift-report-collector.ts --out drift-report-head.json
+        env:
+          LIVE_LEGS_RAN: ${{ steps.preflight.outputs.live_legs_ran }}
+        run: |
+          set -uo pipefail
+          if [ "${LIVE_LEGS_RAN:-true}" != "true" ]; then
+            echo "head: live legs skipped (no keys) — writing empty head report"
+            printf '%s\n' '{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","entries":[]}' \
+              > drift-report-head.json
+            exit 0
+          fi
+          npx tsx scripts/drift-report-collector.ts --out drift-report-head.json
+          HEAD_EXIT=$?
+          if [ "$HEAD_EXIT" -ne 0 ] && [ "$HEAD_EXIT" -ne 2 ]; then
+            echo "::error::Head collector faulted (exit $HEAD_EXIT) — not a drift signal"
+            exit "$HEAD_EXIT"
+          fi
+          echo "head: collector exit $HEAD_EXIT (0 clean / 2 drift-present — both non-fatal here)"
 
       - name: Upload base drift report
         if: always()
@@ -468,8 +634,25 @@ jobs:
       # The block-only-on-new-in-head decision is the incident-3 / M-1 backstop:
       # a PR is blamed strictly for drift its diff introduced.
       - name: Delta gate - block new-in-head, advisory-annotate base-present
+        env:
+          LIVE_LEGS_RAN: ${{ steps.preflight.outputs.live_legs_ran }}
         run: |
           set -euo pipefail
+          # When no provider key had a usable credential (fork PR / all keys
+          # absent), no live leg ran — there is no diff-attributable drift to
+          # evaluate. Neutral-pass with a "live drift leg skipped — no keys"
+          # advisory (the maintainer-dry-run fallback documented below applies),
+          # rather than blocking a drift-code PR on absent keys.
+          if [ "${LIVE_LEGS_RAN:-true}" != "true" ]; then
+            echo "::notice title=drift-live skipped (no keys)::live drift leg skipped — no provider keys configured; delta gate is a neutral pass (maintainer-dry-run fallback applies)"
+            {
+              echo "## Drift delta"
+              echo ""
+              echo "_Live drift leg skipped — no provider keys configured. Neutral pass; the maintainer-dry-run fallback applies._"
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "Drift gate PASSED (neutral): live legs skipped — no keys."
+            exit 0
+          fi
           # Written at the checkout root (cwd) so the relative drift-delta
           # import resolves against the repo — same rationale as the preflight
           # step (ESM relative specifiers key off the module's own location).
