@@ -54,7 +54,7 @@ Multi-part content (e.g., `[{type: "text", text: "hello"}]`) is automatically ex
 | `toolCallId`         | Yes        | Matching specific tool result IDs in the conversation history                                             |
 | `toolResultContains` | Yes        | Same tool call id, different outcomes — match on the tool-result payload (approve vs cancel legs)         |
 
-**Prefer stateless approaches** (`turnIndex`, `hasToolResult`) for shared aimock instances (deployed via Docker, used by multiple test runners). Use `sequenceIndex` only in isolated single-client unit tests where the counter won't be corrupted by concurrent requests.
+**Prefer stateless approaches** (`turnIndex`, `hasToolResult`, `toolResultContains`) for shared aimock instances (deployed via Docker, used by multiple test runners). Use `sequenceIndex` only in isolated single-client unit tests where the counter won't be corrupted by concurrent requests.
 
 ### Multi-turn fixture examples
 
