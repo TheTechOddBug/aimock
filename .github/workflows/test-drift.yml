@@ -544,17 +544,25 @@ jobs:
             cd ../base-main
             pnpm install --frozen-lockfile
             # The collector exits 2 when it finds critical drift — that is the
-            # NORMAL "drift present" signal, NOT a step failure. The delta gate
-            # (not this leg) decides block-vs-advisory, so exit 2 here must be
-            # tolerated. Exit 5 (quarantine) and any other non-zero are genuine
-            # collector faults and DO fail the leg. `set +e` around the run so an
-            # exit 2 does not abort under `set -euo pipefail`.
+            # NORMAL "drift present" signal that feeds the delta gate, NOT a step
+            # failure. The delta gate (not this leg) decides block-vs-advisory,
+            # so exit 2 here must be tolerated. `set +e`/`set -e` around the run
+            # captures the exit code as DATA so an exit 2 does not abort under
+            # the step's `set -euo pipefail`:
+            #   exit 0 → clean, continue.
+            #   exit 2 → drift present, NON-FATAL (report feeds the delta gate).
+            #   exit 5 → quarantine (unparseable output) — genuine fault, FAIL.
+            #   any other non-{0,2} → genuine collector fault, FAIL.
             set +e
             npx tsx scripts/drift-report-collector.ts \
               --out "$GITHUB_WORKSPACE/drift-report-base.json"
             BASE_EXIT=$?
             set -e
             cd "$GITHUB_WORKSPACE"
+            if [ "$BASE_EXIT" -eq 5 ]; then
+              echo "::error::Base collector quarantined unparseable output (exit 5) — manual triage required"
+              exit "$BASE_EXIT"
+            fi
             if [ "$BASE_EXIT" -ne 0 ] && [ "$BASE_EXIT" -ne 2 ]; then
               echo "::error::Base collector faulted (exit $BASE_EXIT) — not a drift signal"
               exit "$BASE_EXIT"
@@ -592,8 +600,25 @@ jobs:
               > drift-report-head.json
             exit 0
           fi
+          # The collector exits 2 when it finds critical drift — that is the
+          # NORMAL "drift present" signal that feeds the delta gate below, NOT a
+          # step failure. GitHub runs `run:` under `bash -e`, so without an
+          # explicit `set +e` guard the `-e` would abort THIS step the instant
+          # the collector returns 2 (never reaching the capture below) — that is
+          # the #297 wiring bug this leg must avoid. So capture the exit code
+          # with `set +e`/`set -e` and treat it as DATA:
+          #   exit 0 → clean, continue.
+          #   exit 2 → drift present, NON-FATAL (report feeds the delta gate).
+          #   exit 5 → quarantine (unparseable output) — genuine fault, FAIL.
+          #   any other non-{0,2} → genuine collector fault, FAIL.
+          set +e
           npx tsx scripts/drift-report-collector.ts --out drift-report-head.json
           HEAD_EXIT=$?
+          set -e
+          if [ "$HEAD_EXIT" -eq 5 ]; then
+            echo "::error::Head collector quarantined unparseable output (exit 5) — manual triage required"
+            exit "$HEAD_EXIT"
+          fi
           if [ "$HEAD_EXIT" -ne 0 ] && [ "$HEAD_EXIT" -ne 2 ]; then
             echo "::error::Head collector faulted (exit $HEAD_EXIT) — not a drift signal"
             exit "$HEAD_EXIT"
