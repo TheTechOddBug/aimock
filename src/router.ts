@@ -99,6 +99,19 @@ export function getLastUserText(messages: ChatMessage[]): string | null {
 }
 
 /**
+ * Test a matcher RegExp against a string WITHOUT mutating the caller-supplied
+ * regex. `RegExp.prototype.test` advances `lastIndex` as a side effect on
+ * `/g` and `/y` regexes; fixtures hold caller-owned RegExp objects, so testing
+ * them in place would clobber the caller's positional state (and a `/g` regex
+ * reused across match calls would match intermittently). We test a fresh clone
+ * (same source + flags) so the caller's object is never touched and every test
+ * starts from index 0.
+ */
+function regexTest(re: RegExp, text: string): boolean {
+  return new RegExp(re.source, re.flags).test(text);
+}
+
+/**
  * Result of {@link matchFixtureDiagnostic}: the matched fixture (or `null`) plus
  * the number of fixtures that matched the request SHAPE (every predicate above
  * the sequenceIndex/turnIndex gates) but were rejected ONLY by the
@@ -320,8 +333,7 @@ export function matchFixtureDiagnostic(
           if (!text.includes(match.userMessage)) continue;
         }
       } else {
-        match.userMessage.lastIndex = 0;
-        if (!match.userMessage.test(text)) continue;
+        if (!regexTest(match.userMessage, text)) continue;
       }
     }
 
@@ -375,8 +387,7 @@ export function matchFixtureDiagnostic(
             if (!text.includes(sm)) continue;
           }
         } else {
-          sm.lastIndex = 0;
-          if (!sm.test(text)) continue;
+          if (!regexTest(sm, text)) continue;
         }
       }
     }
@@ -412,8 +423,7 @@ export function matchFixtureDiagnostic(
           if (!embeddingInput.includes(match.inputText)) continue;
         }
       } else {
-        match.inputText.lastIndex = 0;
-        if (!match.inputText.test(embeddingInput)) continue;
+        if (!regexTest(match.inputText, embeddingInput)) continue;
       }
     }
 
@@ -434,8 +444,7 @@ export function matchFixtureDiagnostic(
           if (!/^-\d/.test(rest)) continue;
         }
       } else {
-        match.model.lastIndex = 0;
-        if (!match.model.test(effective.model ?? "")) continue;
+        if (!regexTest(match.model, effective.model ?? "")) continue;
       }
     }
 

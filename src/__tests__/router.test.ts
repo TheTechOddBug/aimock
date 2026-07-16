@@ -1309,3 +1309,65 @@ describe("matchFixture — systemMessage empty behavior unchanged", () => {
     expect(matchFixture([fx], req, undefined, (r) => r)).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Item 3 — matcher must not mutate caller-supplied RegExp lastIndex
+// ---------------------------------------------------------------------------
+
+describe("matchFixture — does not mutate caller's RegExp lastIndex", () => {
+  it("leaves a /g userMessage regex lastIndex at 0 after a match", () => {
+    const re = /hello/g;
+    const fx = makeFixture({ userMessage: re });
+    matchFixture([fx], makeReq({ messages: [{ role: "user", content: "hello" }] }));
+    expect(re.lastIndex).toBe(0);
+  });
+  it("a /g regex reused across TWO match calls matches BOTH times (no leaked lastIndex)", () => {
+    const re = /world/g;
+    const fx = makeFixture({ userMessage: re });
+    const req = makeReq({ messages: [{ role: "user", content: "world" }] });
+    // Advance the caller's own lastIndex the way an external re.exec would:
+    re.exec("world world"); // lastIndex now > 0
+    expect(matchFixture([fx], req)).toBe(fx);
+    re.exec("world world");
+    expect(matchFixture([fx], req)).toBe(fx);
+  });
+  it("does not clobber the caller's mid-scan lastIndex (userMessage /g)", () => {
+    const re = /a/g;
+    re.exec("aaa"); // caller mid-scan, lastIndex === 1
+    const fx = makeFixture({ userMessage: re });
+    matchFixture([fx], makeReq({ messages: [{ role: "user", content: "a" }] }));
+    expect(re.lastIndex).toBe(1);
+  });
+  it("systemMessage /g regex lastIndex preserved", () => {
+    const re = /ctx/g;
+    re.exec("ctx ctx");
+    const before = re.lastIndex;
+    matchFixture(
+      [makeFixture({ systemMessage: re })],
+      makeReq({
+        messages: [
+          { role: "system", content: "ctx" },
+          { role: "user", content: "x" },
+        ],
+      }),
+    );
+    expect(re.lastIndex).toBe(before);
+  });
+  it("inputText /g regex lastIndex preserved", () => {
+    const re = /q/g;
+    re.exec("q q");
+    const before = re.lastIndex;
+    matchFixture(
+      [makeFixture({ inputText: re }, { embedding: [0.1] })],
+      makeReq({ embeddingInput: "q" }),
+    );
+    expect(re.lastIndex).toBe(before);
+  });
+  it("model /g regex lastIndex preserved", () => {
+    const re = /gpt/g;
+    re.exec("gpt gpt");
+    const before = re.lastIndex;
+    matchFixture([makeFixture({ model: re })], makeReq({ model: "gpt-4o" }));
+    expect(re.lastIndex).toBe(before);
+  });
+});
