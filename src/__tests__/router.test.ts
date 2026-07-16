@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { matchFixture, getLastMessageByRole, getSystemText, getTextContent } from "../router.js";
+import {
+  matchFixture,
+  getLastMessageByRole,
+  getSystemText,
+  getTextContent,
+  getLastUserText,
+} from "../router.js";
 import type { ChatCompletionRequest, ChatMessage, ContentPart, Fixture } from "../types.js";
 
 // ---------------------------------------------------------------------------
@@ -212,6 +218,42 @@ describe("matchFixture — userMessage (array content)", () => {
       ],
     });
     expect(matchFixture([fixture], req)).toBeNull();
+  });
+
+  it("matches the text prompt when a trailing user message is attachment-only (multimodal image split)", () => {
+    // Some SDKs (e.g. Microsoft Agent Framework's agent_framework_openai image
+    // path) serialise a single multimodal turn into a text-only user message
+    // FOLLOWED by a separate attachment-only user message. The trailing
+    // image-only message must not shadow the real prompt.
+    const fixture = makeFixture({ userMessage: "describe this image" });
+    const req = makeReq({
+      messages: [
+        { role: "user", content: "please describe this image" },
+        {
+          role: "user",
+          content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } }],
+        },
+      ],
+    });
+    expect(matchFixture([fixture], req)).toBe(fixture);
+  });
+
+  it("keeps matching a trailing user message that HAS text (does not skip a flattened attachment)", () => {
+    // Contrast with the image split above: when the trailing user message
+    // carries text (e.g. a pdf flattened to `[Attached document]\n…` by the
+    // agent) it is NOT skipped — it is the match target. Fixtures for such a
+    // turn therefore key on the flattened body, not the original prompt.
+    const fixture = makeFixture({ userMessage: "CopilotKit Quickstart" });
+    const req = makeReq({
+      messages: [
+        { role: "user", content: "can you tell me what is in this demo pdf I just attached" },
+        {
+          role: "user",
+          content: "[Attached document]\nCopilotKit Quickstart\nAdd AI copilots to your app.",
+        },
+      ],
+    });
+    expect(matchFixture([fixture], req)).toBe(fixture);
   });
 });
 
@@ -1307,5 +1349,146 @@ describe("matchFixture — first-match-wins", () => {
     const match = makeFixture({ userMessage: "hello" }, { content: "right" });
     const req = makeReq({ messages: [{ role: "user", content: "hello" }] });
     expect(matchFixture([noMatch, match], req)).toBe(match);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Item 1 — null-vs-"" empty-body matching
+// ---------------------------------------------------------------------------
+
+describe("getLastUserText — empty-string user message", () => {
+  it("returns '' for an explicit empty-text user message", () => {
+    expect(getLastUserText([{ role: "user", content: "" }])).toBe("");
+  });
+  it("still skips a trailing attachment-only (null-text) user message", () => {
+    const msgs: ChatMessage[] = [
+      { role: "user", content: "describe this" },
+      { role: "user", content: [{ type: "image_url", image_url: { url: "x" } }] as ContentPart[] },
+    ];
+    expect(getLastUserText(msgs)).toBe("describe this");
+  });
+  it("returns null when no user message has any text part", () => {
+    const msgs: ChatMessage[] = [
+      { role: "user", content: [{ type: "image_url", image_url: { url: "x" } }] as ContentPart[] },
+    ];
+    expect(getLastUserText(msgs)).toBeNull();
+  });
+});
+
+describe("matchFixture — empty userMessage", () => {
+  it("matches userMessage:'' against an empty user message (exact)", () => {
+    const fx = makeFixture({ userMessage: "" });
+    const req = makeReq({ messages: [{ role: "user", content: "" }] });
+    expect(matchFixture([fx], req, undefined, (r) => r)).toBe(fx);
+  });
+  it("matches userMessage:/^$/ against an empty user message", () => {
+    const fx = makeFixture({ userMessage: /^$/ });
+    const req = makeReq({ messages: [{ role: "user", content: "" }] });
+    expect(matchFixture([fx], req)).toBe(fx);
+  });
+  it("does NOT match empty userMessage against a non-empty message", () => {
+    const fx = makeFixture({ userMessage: "" });
+    const req = makeReq({ messages: [{ role: "user", content: "hello" }] });
+    expect(matchFixture([fx], req, undefined, (r) => r)).toBeNull();
+  });
+  it("truly-absent user text still skips (attachment-only turn, no fixture match)", () => {
+    const fx = makeFixture({ userMessage: "" });
+    const req = makeReq({
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "image_url", image_url: { url: "x" } }] as ContentPart[],
+        },
+      ],
+    });
+    expect(matchFixture([fx], req, undefined, (r) => r)).toBeNull();
+  });
+});
+
+describe("matchFixture — empty inputText", () => {
+  it("matches inputText:'' against embeddingInput:'' (exact)", () => {
+    const fx = makeFixture({ inputText: "" }, { embedding: [0.1] });
+    const req = makeReq({ embeddingInput: "" });
+    expect(matchFixture([fx], req, undefined, (r) => r)).toBe(fx);
+  });
+  it("matches inputText:/^$/ against embeddingInput:''", () => {
+    const fx = makeFixture({ inputText: /^$/ }, { embedding: [0.1] });
+    const req = makeReq({ embeddingInput: "" });
+    expect(matchFixture([fx], req)).toBe(fx);
+  });
+  it("skips when embeddingInput is undefined (absent)", () => {
+    const fx = makeFixture({ inputText: "" }, { embedding: [0.1] });
+    const req = makeReq({});
+    expect(matchFixture([fx], req, undefined, (r) => r)).toBeNull();
+  });
+});
+
+describe("matchFixture — systemMessage empty behavior unchanged", () => {
+  it("systemMessage:'' does NOT match a request with no system message (documented catch-all avoidance)", () => {
+    const fx = makeFixture({ systemMessage: "" });
+    const req = makeReq({ messages: [{ role: "user", content: "hi" }] });
+    expect(matchFixture([fx], req, undefined, (r) => r)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Item 3 — matcher must not mutate caller-supplied RegExp lastIndex
+// ---------------------------------------------------------------------------
+
+describe("matchFixture — does not mutate caller's RegExp lastIndex", () => {
+  it("leaves a /g userMessage regex lastIndex at 0 after a match", () => {
+    const re = /hello/g;
+    const fx = makeFixture({ userMessage: re });
+    matchFixture([fx], makeReq({ messages: [{ role: "user", content: "hello" }] }));
+    expect(re.lastIndex).toBe(0);
+  });
+  it("a /g regex reused across TWO match calls matches BOTH times (no leaked lastIndex)", () => {
+    const re = /world/g;
+    const fx = makeFixture({ userMessage: re });
+    const req = makeReq({ messages: [{ role: "user", content: "world" }] });
+    // Advance the caller's own lastIndex the way an external re.exec would:
+    re.exec("world world"); // lastIndex now > 0
+    expect(matchFixture([fx], req)).toBe(fx);
+    re.exec("world world");
+    expect(matchFixture([fx], req)).toBe(fx);
+  });
+  it("does not clobber the caller's mid-scan lastIndex (userMessage /g)", () => {
+    const re = /a/g;
+    re.exec("aaa"); // caller mid-scan, lastIndex === 1
+    const fx = makeFixture({ userMessage: re });
+    matchFixture([fx], makeReq({ messages: [{ role: "user", content: "a" }] }));
+    expect(re.lastIndex).toBe(1);
+  });
+  it("systemMessage /g regex lastIndex preserved", () => {
+    const re = /ctx/g;
+    re.exec("ctx ctx");
+    const before = re.lastIndex;
+    matchFixture(
+      [makeFixture({ systemMessage: re })],
+      makeReq({
+        messages: [
+          { role: "system", content: "ctx" },
+          { role: "user", content: "x" },
+        ],
+      }),
+    );
+    expect(re.lastIndex).toBe(before);
+  });
+  it("inputText /g regex lastIndex preserved", () => {
+    const re = /q/g;
+    re.exec("q q");
+    const before = re.lastIndex;
+    matchFixture(
+      [makeFixture({ inputText: re }, { embedding: [0.1] })],
+      makeReq({ embeddingInput: "q" }),
+    );
+    expect(re.lastIndex).toBe(before);
+  });
+  it("model /g regex lastIndex preserved", () => {
+    const re = /gpt/g;
+    re.exec("gpt gpt");
+    const before = re.lastIndex;
+    matchFixture([makeFixture({ model: re })], makeReq({ model: "gpt-4o" }));
+    expect(re.lastIndex).toBe(before);
   });
 });
