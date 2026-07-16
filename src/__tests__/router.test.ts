@@ -213,6 +213,42 @@ describe("matchFixture — userMessage (array content)", () => {
     });
     expect(matchFixture([fixture], req)).toBeNull();
   });
+
+  it("matches the text prompt when a trailing user message is attachment-only (multimodal image split)", () => {
+    // Some SDKs (e.g. Microsoft Agent Framework's agent_framework_openai image
+    // path) serialise a single multimodal turn into a text-only user message
+    // FOLLOWED by a separate attachment-only user message. The trailing
+    // image-only message must not shadow the real prompt.
+    const fixture = makeFixture({ userMessage: "describe this image" });
+    const req = makeReq({
+      messages: [
+        { role: "user", content: "please describe this image" },
+        {
+          role: "user",
+          content: [{ type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } }],
+        },
+      ],
+    });
+    expect(matchFixture([fixture], req)).toBe(fixture);
+  });
+
+  it("keeps matching a trailing user message that HAS text (does not skip a flattened attachment)", () => {
+    // Contrast with the image split above: when the trailing user message
+    // carries text (e.g. a pdf flattened to `[Attached document]\n…` by the
+    // agent) it is NOT skipped — it is the match target. Fixtures for such a
+    // turn therefore key on the flattened body, not the original prompt.
+    const fixture = makeFixture({ userMessage: "CopilotKit Quickstart" });
+    const req = makeReq({
+      messages: [
+        { role: "user", content: "can you tell me what is in this demo pdf I just attached" },
+        {
+          role: "user",
+          content: "[Attached document]\nCopilotKit Quickstart\nAdd AI copilots to your app.",
+        },
+      ],
+    });
+    expect(matchFixture([fixture], req)).toBe(fixture);
+  });
 });
 
 describe("matchFixture — userMessage (RegExp)", () => {

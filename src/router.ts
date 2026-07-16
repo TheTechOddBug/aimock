@@ -71,6 +71,31 @@ export function getTextContent(content: string | ContentPart[] | null): string |
 }
 
 /**
+ * Text of the last user message, for `userMessage` fixture matching. Normally
+ * this is the text of the final `user` message. But some SDKs serialise a
+ * single multimodal user turn (prompt text + attachment) into TWO consecutive
+ * user messages — a text-only one FOLLOWED by an attachment-only one, e.g.
+ * `[{role:"user", content:"describe this"}, {role:"user", content:[{type:"image_url",...}]}]`
+ * (observed with Microsoft Agent Framework's `agent_framework_openai` image
+ * path). The trailing attachment-only message has NO extractable text, so the
+ * naive "last user message" lookup returns `null` and — because no fixture can
+ * key on empty text — every such multimodal fixture misses. We therefore skip
+ * trailing user messages that carry no text and use the nearest preceding user
+ * message that does. This is deliberately narrow: it only skips text-LESS user
+ * messages, so a genuine multi-message user turn (each message HAS text) is
+ * unaffected and still matched on its final message. Returns `null` when no
+ * user message carries text.
+ */
+export function getLastUserText(messages: ChatMessage[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role !== "user") continue;
+    const text = getTextContent(messages[i].content);
+    if (text !== null && text !== "") return text;
+  }
+  return null;
+}
+
+/**
  * Result of {@link matchFixtureDiagnostic}: the matched fixture (or `null`) plus
  * the number of fixtures that matched the request SHAPE (every predicate above
  * the sequenceIndex/turnIndex gates) but were rejected ONLY by the
@@ -276,8 +301,10 @@ export function matchFixtureDiagnostic(
     // matchesPattern() in helpers.ts, which is used for search/rerank/moderation
     // where exact casing rarely matters.
     if (match.userMessage !== undefined) {
-      const msg = getLastMessageByRole(effective.messages, "user");
-      const text = msg ? getTextContent(msg.content) : null;
+      // Use the last user message that actually carries text — see
+      // getLastUserText for why a trailing attachment-only user message
+      // (multimodal serialisation split) must not shadow the real prompt.
+      const text = getLastUserText(effective.messages);
       if (!text) continue;
       if (typeof match.userMessage === "string") {
         if (useExactMatch) {
