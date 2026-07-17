@@ -32,11 +32,12 @@ const wf = readFileSync(WORKFLOW_PATH, "utf-8");
 const wfFlat = wf.replace(/\s+/g, " ");
 
 describe("fix-drift.yml — F1: post-fix re-collect + args wired into --create-pr", () => {
-  it("has an authoritative post-fix re-collect step writing a DISTINCT report path", () => {
+  it("has an authoritative post-fix re-collect step writing a DISTINCT report path OUTSIDE the repo (FIX #F3)", () => {
     expect(wf).toContain("Re-collect drift (authoritative)");
-    expect(wf).toContain(
-      "npx tsx scripts/drift-report-collector.ts --out drift-report.post-fix.json",
-    );
+    // FIX #F3 — the re-collect writes to $RUNNER_TEMP (via the POST_FIX_REPORT
+    // env), NOT the repo cwd, so it is never scored by the predicate's git scan.
+    expect(wf).toContain('npx tsx scripts/drift-report-collector.ts --out "$POST_FIX_REPORT"');
+    expect(wf).toContain("POST_FIX_REPORT: ${{ runner.temp }}/drift-report.post-fix.json");
   });
 
   it("captures the post-fix collector exit code as a step output", () => {
@@ -46,14 +47,14 @@ describe("fix-drift.yml — F1: post-fix re-collect + args wired into --create-p
   it("passes BOTH --post-fix-report and --post-fix-exit into `fix-drift.ts --create-pr`", () => {
     expect(wfFlat).toContain("npx tsx scripts/fix-drift.ts --create-pr");
     expect(wfFlat).toMatch(
-      /fix-drift\.ts --create-pr[^]*?--post-fix-report drift-report\.post-fix\.json[^]*?--post-fix-exit "\$\{POST_FIX_EXIT\}"/,
+      /fix-drift\.ts --create-pr[^]*?--post-fix-report "\$\{POST_FIX_REPORT\}"[^]*?--post-fix-exit "\$\{POST_FIX_EXIT\}"/,
     );
   });
 
   it("the Assert step runs the predicate with post-fix args (the happy-path gate)", () => {
     expect(wf).toContain("Assert drift truly resolved");
     expect(wfFlat).toMatch(
-      /drift-success-predicate\.ts[^]*?--post-fix-report drift-report\.post-fix\.json[^]*?--post-fix-exit "\$\{POST_FIX_EXIT\}"/,
+      /drift-success-predicate\.ts[^]*?--post-fix-report "\$\{POST_FIX_REPORT\}"[^]*?--post-fix-exit "\$\{POST_FIX_EXIT\}"/,
     );
   });
 });
@@ -61,7 +62,10 @@ describe("fix-drift.yml — F1: post-fix re-collect + args wired into --create-p
 describe("fix-drift.yml — F-A: PRE-fix report pinned outside the LLM-writable checkout", () => {
   it("has a pin step that copies the pre-fix report into runner.temp before autofix", () => {
     expect(wf).toContain("Pin pre-fix drift report (integrity)");
-    expect(wf).toContain('cp drift-report.json "$PINNED_REPORT"');
+    // FIX #F3 — the pre-fix report is itself collected into $RUNNER_TEMP
+    // (PRE_FIX_REPORT), so the pin copies from that out-of-repo path, never the
+    // repo cwd. Both source and destination are outside the LLM-writable checkout.
+    expect(wf).toContain('cp "$PRE_FIX_REPORT" "$PINNED_REPORT"');
     expect(wf).toContain("PINNED_REPORT: ${{ runner.temp }}/drift-report.pinned.json");
   });
 
@@ -90,5 +94,37 @@ describe("fix-drift.yml — F-A: PRE-fix report pinned outside the LLM-writable 
     // the pin step, but must NEVER be the --report source for the gate.
     expect(wfFlat).not.toMatch(/drift-success-predicate\.ts \\? *--report drift-report\.json/);
     expect(wfFlat).not.toMatch(/fix-drift\.ts --create-pr \\? *--report drift-report\.json/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX (round-4, user-approved) — HUMAN-APPROVAL BACKSTOP. The drift path opens a
+// PR but must NEVER auto-merge: the predicate is a strong AUTO-FILTER, not a
+// provable merge gate (the re-collect is not independent of the fix — WS-2b), so
+// a human reviews CI + the diff + the verdict and merges. These lock that the
+// unattended in-workflow merge is GONE and the Slack copy no longer claims
+// "merged to main".
+// ---------------------------------------------------------------------------
+describe("fix-drift.yml — human-approval backstop: no unattended auto-merge", () => {
+  it("has NO auto-merge step and never runs `gh pr merge`", () => {
+    expect(wf).not.toContain("Auto-merge PR");
+    expect(wf).not.toMatch(/gh pr merge/);
+  });
+
+  it("documents WHY the drift path is human-gated (predicate is a filter, not a merge gate)", () => {
+    expect(wf).toContain("NO AUTO-MERGE");
+    // The rationale wraps across comment lines (a `#` marker survives flattening),
+    // so match tolerantly across the wrap.
+    expect(wfFlat).toMatch(/AUTO-FILTER, NOT a provable merge (# )?gate/i);
+  });
+
+  it("the success Slack message says the PR needs human review + merge, NOT merged to main", () => {
+    expect(wf).not.toContain("Drift auto-fix merged to main");
+    expect(wf).toContain("Drift-fix PR opened — needs human review + merge");
+  });
+
+  it("the fix-failure Slack step no longer references the removed merge step outputs", () => {
+    expect(wf).not.toContain("steps.merge.outputs");
+    expect(wf).not.toContain("MERGE_REASON");
   });
 });

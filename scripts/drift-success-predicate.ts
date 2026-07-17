@@ -509,17 +509,31 @@ export function evaluateDriftResolved(i: PredicateInputs): PredicateResult {
     };
   }
 
-  // ---- Signal 2: a REAL fix change is present. --------------------------
-  // A legitimate fix touches either production mock-builder source or a fixture
-  // the report explicitly named (the canary model-list case). An empty diff (or a
-  // diff of only files that are neither) means nothing shippable was attempted.
+  // ---- Signal 2: at least one PRODUCTION mock-builder change is present. --
+  // The module invariant (Signal 2 in the header) is that a genuine drift fix
+  // ALWAYS changes at least one production mock-builder file (`src/**` excluding
+  // `src/__tests__/`) — that is the only place the mock output is produced. A run
+  // that changed ZERO production files cannot be a real fix, even if it edited a
+  // report-named fixture target (the canary model-registry.ts case): a
+  // fixture-target-only change (e.g. adding a model id to the model-list fixture
+  // with NO production/builder change) is NOT independently verifiable — the
+  // re-collect's clean signal is derived from the same fixture the change touched,
+  // so a clean post-fix report there means only "the fixture agrees with itself",
+  // not "the mock was fixed". Fix #F2 (round-4): require >=1 production change for
+  // RESOLVED, unconditionally. A fixture-target-only diff is routed to
+  // needs-human (NO_PRODUCTION_CHANGE) rather than auto-resolved — matching the
+  // docstring invariant, which the earlier `onTargetFiles`-satisfies-it logic
+  // violated (it let a canary fixture-only edit reach resolved:true).
   const onTargetFiles = changedFiles.filter((f) => targets.has(f));
-  if (productionFiles.length === 0 && onTargetFiles.length === 0) {
+  if (productionFiles.length === 0) {
     return {
       resolved: false,
       reason: PredicateReason.NO_PRODUCTION_CHANGE,
       detail:
-        "Fix changed zero production mock-builder files and no report-named fixture target — a clean collector is meaningless without a real fix. Nothing shippable.",
+        "Fix changed zero production mock-builder files — a real drift fix always updates the " +
+        "production mock builder (src/** outside src/__tests__/). A fixture-target-only change " +
+        "(e.g. a model-list fixture edit with no builder change) is not independently verifiable " +
+        "(the re-collect reads the same fixture) and is routed to human review, not auto-resolved.",
       offendingFiles: [],
     };
   }

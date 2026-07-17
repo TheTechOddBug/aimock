@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { resolve } from "node:path";
 
 import type {
@@ -40,8 +40,10 @@ import {
   execFileSafe,
   parseMode,
   hasPostFixArgs,
+  parsePostFixExit,
   getChangedFiles,
   gatedCommitFiles,
+  createPr,
   affectedSkillSections,
   BUILDER_TO_SKILL_SECTION,
   truncateBody,
@@ -813,6 +815,33 @@ describe("hasPostFixArgs (fix #5 legacy-fallback closure)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// FIX #F7 (round-4) — parsePostFixExit: the PR path must fail CLOSED on an
+// empty/whitespace --post-fix-exit rather than accept Number("")===0 as a clean
+// collector exit 0. Mirrors the predicate CLI's guard so a missing recollect
+// output never masquerades as clean and opens a PR on an unverified fix.
+// ---------------------------------------------------------------------------
+describe("parsePostFixExit (fix #F7 empty-exit fail-closed)", () => {
+  it("throws on an empty string (Number('')===0 must NOT slip through as clean)", () => {
+    expect(() => parsePostFixExit("")).toThrow(/empty\/whitespace/);
+  });
+
+  it("throws on a whitespace-only value", () => {
+    expect(() => parsePostFixExit("   ")).toThrow(/empty\/whitespace/);
+  });
+
+  it("throws on a non-integer value", () => {
+    expect(() => parsePostFixExit("abc")).toThrow(/integer/);
+    expect(() => parsePostFixExit("1.5")).toThrow(/integer/);
+  });
+
+  it("returns the integer for a valid value", () => {
+    expect(parsePostFixExit("0")).toBe(0);
+    expect(parsePostFixExit("2")).toBe(2);
+    expect(parsePostFixExit("-1")).toBe(-1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // getChangedFiles
 // ---------------------------------------------------------------------------
 
@@ -895,6 +924,101 @@ describe("gatedCommitFiles (F-C: no straggler catch-all)", () => {
       sanctioned,
     );
     expect(g.stragglers).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX #F5 (round-4) — createPr MUST fail-closed if any changed file falls
+// outside every gated commit group (a straggler): staging it as part of an
+// allowlisted group would silently drop or mis-stage it. Because the predicate
+// allowlist already blocks any non-production, non-report-named file BEFORE
+// createPr stages, an unclassified working-tree file causes createPr to exit
+// with UNSANCTIONED_CHANGE and stage NOTHING — the straggler is never `git add`ed.
+//
+// Driven against the REAL createPr with git mocked (no autofix subprocess).
+// ---------------------------------------------------------------------------
+describe("createPr straggler / unsanctioned fail-closed (fix #F5)", () => {
+  const mockedExecSync = vi.mocked(execSync);
+  let logSpy: ReturnType<typeof vi.spyOn> | null = null;
+  let errSpy: ReturnType<typeof vi.spyOn> | null = null;
+  let exitSpy: ReturnType<typeof vi.spyOn> | null = null;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`__exit__${code}`);
+    }) as never);
+    void errSpy;
+    void exitSpy;
+  });
+
+  afterEach(() => {
+    logSpy?.mockRestore();
+    errSpy?.mockRestore();
+    exitSpy?.mockRestore();
+  });
+
+  function stdoutLines(): string[] {
+    return (logSpy?.mock.calls ?? []).map((c) => String(c[0]));
+  }
+
+  const rep: DriftReport = {
+    timestamp: "2026-07-16T00:00:00.000Z",
+    entries: [
+      {
+        provider: "OpenAI",
+        scenario: "chat completion",
+        builderFile: "src/helpers.ts",
+        builderFunctions: ["buildChatCompletion"],
+        typesFile: null,
+        sdkShapesFile: "src/__tests__/drift/sdk-shapes.ts",
+        diffs: [
+          {
+            path: "x",
+            severity: "critical",
+            issue: "missing",
+            expected: "string",
+            real: "string",
+            mock: "<missing>",
+          },
+        ],
+      },
+    ],
+  };
+
+  it("exits UNSANCTIONED_CHANGE (17) and stages NOTHING when an unclassified file is in the tree", () => {
+    // A production fix (helpers.ts, allowlisted) PLUS an unclassified root file.
+    // createPr fail-closes (the root file is neither allowlisted nor a gated
+    // group) BEFORE any staging — the straggler is never git-added.
+    mockedExecSync.mockImplementation((cmd: unknown) => {
+      if (typeof cmd === "string" && cmd.includes("status --porcelain")) {
+        return "M  src/helpers.ts\n?? weird-root-file.txt\n" as unknown as string;
+      }
+      return "" as unknown as string;
+    });
+
+    expect(() => createPr(rep, { report: { timestamp: "t", entries: [] }, exitCode: 0 })).toThrow(
+      /__exit__17/,
+    );
+
+    const addedStraggler = mockedExecFileSync.mock.calls.some(
+      (c) =>
+        c[0] === "git" && Array.isArray(c[1]) && (c[1] as string[]).includes("weird-root-file.txt"),
+    );
+    expect(addedStraggler).toBe(false);
+    expect(stdoutLines()).toContain("reason=unsanctioned-change");
+  });
+
+  it("gatedCommitFiles never leaves a production or report-named file as a straggler (the invariant createPr asserts)", () => {
+    // The straggler guard in createPr is defense-in-depth: prove the partition
+    // it relies on classifies every allowlisted file into a gated group so
+    // stragglers is empty on any RESOLVED-shaped set.
+    const s = sanctionedTargets(rep);
+    const g = gatedCommitFiles(["src/helpers.ts", "src/foo.ts"], s);
+    expect(g.stragglers).toEqual([]);
+    expect(g.builderFiles).toEqual(["src/helpers.ts", "src/foo.ts"]);
   });
 });
 

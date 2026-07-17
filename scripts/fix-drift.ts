@@ -557,7 +557,11 @@ export function addChangelogEntry(report: DriftReport, version: string): void {
   }
 }
 
-export function buildPrBody(report: DriftReport, changedFiles?: string[]): string {
+export function buildPrBody(
+  report: DriftReport,
+  changedFiles?: string[],
+  verdictDetail?: string,
+): string {
   const providers: string[] = [];
   const diffs: string[] = [];
 
@@ -574,6 +578,19 @@ export function buildPrBody(report: DriftReport, changedFiles?: string[]): strin
     "## Summary",
     "",
     "Auto-generated drift remediation.",
+    "",
+    // Human-approval backstop (WS-2): this PR was auto-FILTERED by the
+    // drift-success predicate but is NOT auto-merged. A human must review CI +
+    // this diff + the verdict below and merge. The predicate is a strong filter,
+    // not a provable merge gate (the re-collect is not independent of the fix —
+    // WS-2b), so the merge decision stays with a human.
+    "> **Needs human review + merge.** This drift-fix PR was opened by the",
+    "> automated pipeline after the drift-success predicate passed. It is NOT",
+    "> auto-merged — review CI, the diff, and the verdict below, then merge.",
+    "",
+    "### Drift-success predicate verdict",
+    "",
+    verdictDetail ? `RESOLVED — ${verdictDetail}` : "RESOLVED.",
     "",
     "### Providers affected",
     ...providers,
@@ -683,7 +700,7 @@ export function gatedCommitFiles(
   return { builderFiles, testFiles, skillFiles, stragglers };
 }
 
-function createPr(report: DriftReport, postFix?: PostFixCollectorResult): void {
+export function createPr(report: DriftReport, postFix?: PostFixCollectorResult): void {
   const stamp = todayStamp();
 
   // Detect uncommitted changes (staged + unstaged) BEFORE any git write ops so
@@ -779,7 +796,28 @@ function createPr(report: DriftReport, postFix?: PostFixCollectorResult): void {
   // an unnamed fixture, a config file — would have BLOCKED at the gate, so
   // sweeping it in AFTER the pass silently defeats the allowlist).
   const sanctioned = sanctionedTargets(report);
-  const { builderFiles, testFiles, skillFiles } = gatedCommitFiles(changedFiles, sanctioned);
+  const { builderFiles, testFiles, skillFiles, stragglers } = gatedCommitFiles(
+    changedFiles,
+    sanctioned,
+  );
+
+  // FIX #F5 (round-4) — on a RESOLVED verdict `stragglers` MUST be empty: the
+  // predicate allowlist already rejected any file that is neither production
+  // source nor a report-named fixture target, so every changed file must fall
+  // into one of the gated groups above. If a straggler survives here, the
+  // verdict and the staging partition have DIVERGED (e.g. a future predicate
+  // change admitted a file gatedCommitFiles does not classify) — silently
+  // dropping it would ship an incomplete fix behind a green verdict. Fail closed
+  // to human review rather than open a PR whose diff differs from what was scored.
+  if (stragglers.length > 0) {
+    console.error(
+      `ERROR: RESOLVED verdict but ${stragglers.length} changed file(s) are not in any gated ` +
+        `commit group (${stragglers.join(", ")}) — the verdict and the staging partition have ` +
+        "diverged. Refusing to open a PR that would silently drop these from the diff.",
+    );
+    console.log(`reason=${PredicateReason.UNSANCTIONED_CHANGE}`);
+    process.exit(REASON_EXIT_CODE[PredicateReason.UNSANCTIONED_CHANGE]);
+  }
 
   if (builderFiles.length > 0) {
     execFileSafe("git", ["add", ...builderFiles]);
@@ -822,7 +860,7 @@ function createPr(report: DriftReport, postFix?: PostFixCollectorResult): void {
   execFileSafe("git", ["push", "-u", "origin", branchName]);
   console.log(`Pushed branch ${branchName}`);
 
-  const prBody = buildPrBody(report, changedFiles);
+  const prBody = buildPrBody(report, changedFiles, verdict.detail);
   const prTitle = `fix: auto-remediate API drift (${stamp})`;
 
   const prBodyFile = `/tmp/aimock-drift-${process.pid}-pr-body.md`;
@@ -943,6 +981,29 @@ export function hasPostFixArgs(args: string[]): boolean {
   return hasReport && hasExit;
 }
 
+/**
+ * FIX #F7 (round-4) — parse the `--post-fix-exit` value, failing CLOSED on an
+ * empty/whitespace or non-integer value. `Number("")` and `Number("  ")` are
+ * both 0, which Number.isInteger accepts, so a missing recollect output
+ * (`--post-fix-exit ""`, e.g. a skipped step) would masquerade as a clean
+ * collector exit 0 and open a PR on an unverified fix. This mirrors the
+ * predicate CLI's guard (drift-success-predicate.ts:parseCliArgs). Throws on any
+ * empty/whitespace/non-integer input; the caller must NOT treat that as clean.
+ */
+export function parsePostFixExit(raw: string): number {
+  if (raw.trim() === "") {
+    throw new Error(
+      "--post-fix-exit is empty/whitespace — a missing collector exit code must fail closed, " +
+        "not be treated as clean exit 0",
+    );
+  }
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed)) {
+    throw new Error(`--post-fix-exit must be an integer, got "${raw}"`);
+  }
+  return parsed;
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const mode = parseMode(args);
@@ -989,10 +1050,11 @@ async function main(): Promise<void> {
           "predicate is the authoritative PR-open gate; there is no legacy no-post-fix path)",
       );
     }
-    const postFixExit = Number(args[postFixExitIdx + 1]);
-    if (!Number.isInteger(postFixExit)) {
-      throw new Error(`--post-fix-exit must be an integer, got "${args[postFixExitIdx + 1]}"`);
-    }
+    // FIX #F7 (round-4) — fail CLOSED on an empty/whitespace/non-integer
+    // --post-fix-exit (see parsePostFixExit): a missing recollect output must
+    // not masquerade as a clean collector exit 0 and open a PR on an unverified
+    // fix. Mirrors the predicate CLI's guard.
+    const postFixExit = parsePostFixExit(args[postFixExitIdx + 1]);
     const postFixReport = readPostFixReport(resolve(args[postFixReportIdx + 1]));
     const postFix: PostFixCollectorResult = { report: postFixReport, exitCode: postFixExit };
 

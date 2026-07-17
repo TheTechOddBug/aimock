@@ -12,11 +12,12 @@
  * testFiles>0`) would have ACCEPTED it — demonstrated by contrast below.
  */
 
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 
 import type { DriftEntry, DriftReport, ParsedDiff } from "../../scripts/drift-types.js";
 import {
@@ -515,8 +516,13 @@ describe("allowlist inversion — non-allowlisted changed files ALWAYS block", (
     expect(verdict.offendingFiles).toContain("src/__tests__/drift/model-registry.ts");
   });
 
-  it("a report-NAMED fixture target (builderFile) + clean collector → RESOLVED", () => {
-    // The collector sanctions the fixture as the fix target (canary routing).
+  it("FIX #F2 (round-4): a report-NAMED fixture target ALONE (no production change) → NO_PRODUCTION_CHANGE (routed to human, NOT auto-resolved)", () => {
+    // A canary that names ONLY the fixture as its target and whose diff touches
+    // ONLY that fixture (model-registry.ts) — with NO production/builder change.
+    // The module invariant (Signal 2) requires >=1 production mock-builder change
+    // for RESOLVED: a fixture-target-only change is not independently verifiable
+    // (the re-collect reads the same fixture), so it must route to human review,
+    // never auto-resolve. This is the canary-only bypass F2 closes.
     const canary = report([
       entry({
         provider: "OpenAI Realtime",
@@ -529,6 +535,31 @@ describe("allowlist inversion — non-allowlisted changed files ALWAYS block", (
     ]);
     const verdict = evaluateDriftResolved({
       changedFiles: ["src/__tests__/drift/model-registry.ts"],
+      report: canary,
+      ...cleanSignal,
+    });
+    expect(verdict.resolved).toBe(false);
+    expect(verdict.reason).toBe(PredicateReason.NO_PRODUCTION_CHANGE);
+    expect(REASON_EXIT_CODE[verdict.reason]).toBe(10);
+  });
+
+  it("FIX #F2 (round-4): a report-NAMED fixture target ACCOMPANIED BY a production change → RESOLVED (the legit canary shape)", () => {
+    // The legit canary shape: the report names BOTH a production builder and the
+    // fixture, and BOTH change. The production change satisfies the >=1
+    // production-change invariant, so this auto-resolves (unlike the
+    // fixture-only case above).
+    const canary = report([
+      entry({
+        provider: "OpenAI Realtime",
+        scenario: "known-models canary",
+        builderFile: "src/ws-realtime.ts",
+        builderFunctions: ["buildRealtimeSession"],
+        typesFile: "src/__tests__/drift/model-registry.ts",
+        diffs: [diff({ path: "knownModels", issue: "new model shipped" })],
+      }),
+    ]);
+    const verdict = evaluateDriftResolved({
+      changedFiles: ["src/ws-realtime.ts", "src/__tests__/drift/model-registry.ts"],
       report: canary,
       ...cleanSignal,
     });
@@ -1134,6 +1165,154 @@ describe("runCli maps a repo-escaping/absolute changed-file to CONFIG_ERROR (exi
       "/etc/passwd",
     ]);
     expect(code).toBe(REASON_EXIT_CODE[PredicateReason.CONFIG_ERROR]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX #F3 (round-4) — a collector-output artifact left in the repo working tree
+// (drift-report.post-fix.json / drift-report.json / claude-code-output.log)
+// appears as an untracked file in `git status --porcelain` and is scored by the
+// predicate as UNSANCTIONED_CHANGE, breaking the happy path. The workflow fix
+// writes those artifacts to $RUNNER_TEMP (outside the checkout) so they never
+// enter the changed-file set. These pure-function locks prove the predicate's
+// behaviour on BOTH sides of that move.
+// ---------------------------------------------------------------------------
+describe("FIX #F3 — collector-output artifacts must not be in the changed-file set", () => {
+  const sanctioned = () =>
+    report([entry({ builderFile: "src/helpers.ts", typesFile: "src/types.ts" })]);
+  const cleanSignal = { postFixCollectorExit: 0, postFixCriticalCount: 0 };
+
+  it("RED (the bug): a post-fix report artifact in the changed set → UNSANCTIONED_CHANGE (happy path broken)", () => {
+    // This is exactly what happened when the re-collect wrote into the repo cwd:
+    // the untracked drift-report.post-fix.json joined the changed set and, being
+    // neither production source nor a report-named target, fail-closed the run.
+    const verdict = evaluateDriftResolved({
+      changedFiles: ["src/helpers.ts", "drift-report.post-fix.json"],
+      report: sanctioned(),
+      ...cleanSignal,
+    });
+    expect(verdict.resolved).toBe(false);
+    expect(verdict.reason).toBe(PredicateReason.UNSANCTIONED_CHANGE);
+    expect(verdict.offendingFiles).toContain("drift-report.post-fix.json");
+  });
+
+  it("GREEN (the fix): the SAME production fix WITHOUT the artifact (now in $RUNNER_TEMP) → RESOLVED", () => {
+    const verdict = evaluateDriftResolved({
+      changedFiles: ["src/helpers.ts"],
+      report: sanctioned(),
+      ...cleanSignal,
+    });
+    expect(verdict.resolved).toBe(true);
+    expect(verdict.reason).toBe(PredicateReason.RESOLVED);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TEST-TIGHTNESS (round-4 slot-3) — lock the runCli behaviour the workflow
+// depends on: (F2) the machine-readable `reason=<reason>` stdout line the
+// "Assert" step greps for Slack routing, and (F1) the CONFIG_ERROR path so
+// deleting the parse-error catch fails a test. These drive the REAL runCli in an
+// isolated temp git repo so gitChangedFiles() returns a controlled set.
+// ---------------------------------------------------------------------------
+describe("runCli machine-readable reason= line + CONFIG_ERROR lock (slot-3 F1/F2)", () => {
+  let repo: string | null = null;
+  let logSpy: ReturnType<typeof vi.spyOn> | null = null;
+  let errSpy: ReturnType<typeof vi.spyOn> | null = null;
+  const origCwd = process.cwd();
+
+  afterEach(() => {
+    process.chdir(origCwd);
+    logSpy?.mockRestore();
+    errSpy?.mockRestore();
+    logSpy = null;
+    errSpy = null;
+    if (repo) rmSync(repo, { recursive: true, force: true });
+    repo = null;
+  });
+
+  function initRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), "ws2-runcli-"));
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    execFileSync("git", ["config", "user.email", "t@t"], { cwd: dir });
+    execFileSync("git", ["config", "user.name", "t"], { cwd: dir });
+    return dir;
+  }
+
+  function captureConsole(): void {
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  }
+
+  function stdoutLines(): string[] {
+    return (logSpy?.mock.calls ?? []).map((c) => String(c[0]));
+  }
+
+  it("prints `reason=resolved` on a genuine RESOLVED verdict (the line the workflow greps)", () => {
+    repo = initRepo();
+    // A real production change in the working tree → gitChangedFiles() reports it.
+    // `git add -N` (intent-to-add) makes porcelain list the INDIVIDUAL file
+    // (`A src/helpers.ts`) rather than collapsing an all-untracked dir to `?? src/`.
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "helpers.ts"), "export const x = 1;\n", "utf-8");
+    execFileSync("git", ["add", "-N", "src/helpers.ts"], { cwd: repo });
+    // Report files live OUTSIDE the repo (mirrors the workflow's $RUNNER_TEMP,
+    // FIX #F3) so they are NOT untracked entries in `git status --porcelain` and
+    // do not pollute the changed-file set the predicate scores.
+    const outDir = mkdtempSync(join(tmpdir(), "ws2-runcli-out-"));
+    const rep = report([entry({ builderFile: "src/helpers.ts", typesFile: "src/types.ts" })]);
+    const preP = join(outDir, "pre.json");
+    const postP = join(outDir, "post.json");
+    writeFileSync(preP, JSON.stringify(rep), "utf-8");
+    writeFileSync(postP, JSON.stringify(report([])), "utf-8");
+    process.chdir(repo);
+    captureConsole();
+    try {
+      const code = runCli(["--report", preP, "--post-fix-report", postP, "--post-fix-exit", "0"]);
+      expect(code).toBe(0);
+      expect(stdoutLines()).toContain(`reason=${PredicateReason.RESOLVED}`);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prints `reason=unsanctioned-change` (non-zero) on a blocked verdict — the Slack routing key", () => {
+    repo = initRepo();
+    mkdirSync(join(repo, "src"), { recursive: true });
+    writeFileSync(join(repo, "src", "helpers.ts"), "export const x = 1;\n", "utf-8");
+    // package.json IN the repo is the unsanctioned change; reports live OUTSIDE.
+    writeFileSync(join(repo, "package.json"), '{"name":"x"}\n', "utf-8");
+    execFileSync("git", ["add", "-N", "src/helpers.ts", "package.json"], { cwd: repo });
+    const outDir = mkdtempSync(join(tmpdir(), "ws2-runcli-out-"));
+    const rep = report([entry({ builderFile: "src/helpers.ts", typesFile: "src/types.ts" })]);
+    const preP = join(outDir, "pre.json");
+    const postP = join(outDir, "post.json");
+    writeFileSync(preP, JSON.stringify(rep), "utf-8");
+    writeFileSync(postP, JSON.stringify(report([])), "utf-8");
+    process.chdir(repo);
+    captureConsole();
+    try {
+      const code = runCli(["--report", preP, "--post-fix-report", postP, "--post-fix-exit", "0"]);
+      expect(code).toBe(REASON_EXIT_CODE[PredicateReason.UNSANCTIONED_CHANGE]);
+      expect(stdoutLines()).toContain(`reason=${PredicateReason.UNSANCTIONED_CHANGE}`);
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  });
+
+  it("prints `reason=config-error` and exits 2 when the report is unreadable (CONFIG_ERROR lock)", () => {
+    repo = initRepo();
+    process.chdir(repo);
+    captureConsole();
+    const code = runCli([
+      "--report",
+      join(repo, "does-not-exist.json"),
+      "--post-fix-report",
+      join(repo, "also-missing.json"),
+      "--post-fix-exit",
+      "0",
+    ]);
+    expect(code).toBe(REASON_EXIT_CODE[PredicateReason.CONFIG_ERROR]);
+    expect(stdoutLines()).toContain(`reason=${PredicateReason.CONFIG_ERROR}`);
   });
 });
 
