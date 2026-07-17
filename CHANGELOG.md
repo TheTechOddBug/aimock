@@ -1,5 +1,11 @@
 # @copilotkit/aimock
 
+## [1.37.1] - 2026-07-16
+
+### Fixed
+
+- Capped the uncapped in-memory record buffers that could grow a string past V8's ~512 MiB max string length and throw `RangeError: Invalid string length` (the ~1/sec production crash, amplified once the real-key fixture-miss passthrough landed). The AG-UI recorder, the generic recorder, and the stream-collapse path now bound the buffer they `Buffer.concat(chunks).toString()` for fixture construction to a configurable `maxRecordBufferBytes` (default 64 MiB) clamped to a 256 MiB hard ceiling. Once the cap is crossed the recorder frees the buffer, marks the recording truncated, and skips fixture construction — the full upstream response is still relayed to the client byte-for-byte in real time, so capping never truncates what the client receives ("don't journal", not "don't answer") (#307)
+
 ## [1.37.0] - 2026-07-15
 
 ### Added
