@@ -46,6 +46,7 @@ import {
   readReport as readPostFixReport,
   countCriticalDiffs,
   REASON_EXIT_CODE,
+  PredicateReason,
 } from "./drift-success-predicate.js";
 import type { DriftReport, DriftSeverity } from "./drift-types.js";
 
@@ -658,34 +659,41 @@ function createPr(report: DriftReport, postFix?: PostFixCollectorResult): void {
   // resolved. This runs BEFORE any git add/commit — a blocked verdict opens no
   // PR (and therefore never reaches auto-merge). Without --post-fix-* args,
   // fall back to the legacy "no source files changed" guard (exit 4).
-  if (postFix) {
-    const verdict = evaluateDriftResolved({
-      changedFiles,
-      report,
-      postFixCollectorExit: postFix.exitCode,
-      postFixCriticalCount: countCriticalDiffs(postFix.report),
-    });
-    if (!verdict.resolved) {
-      console.error(`ERROR: Drift NOT resolved [${verdict.reason}]: ${verdict.detail}`);
-      if (verdict.offendingFiles.length > 0) {
-        console.error(`Offending files: ${verdict.offendingFiles.join(", ")}`);
-      }
-      console.error("Aborting PR creation — this fix will be routed to human review.");
-      console.log(`reason=${verdict.reason}`);
-      process.exit(REASON_EXIT_CODE[verdict.reason]);
-    }
-    console.log(`Drift-success predicate: RESOLVED — ${verdict.detail}`);
-  } else {
-    // Legacy guard: abort if no source files changed (a version-bump-only PR
-    // would be misleading). Superseded by the predicate above when present.
-    if (builderFiles.length === 0 && testFiles.length === 0) {
-      console.error(
-        "ERROR: No source files changed. Claude Code may not have made any fixes, " +
-          "or all changes were reverted during verification. Aborting PR creation.",
-      );
-      process.exit(4); // no source files changed (distinct from exit 2 = critical drift)
-    }
+  // FIX #5 — the drift-success predicate is MANDATORY. The old legacy fallback
+  // (accept a PR when `builderFiles.length || testFiles.length`) re-opened the
+  // original fixture-only cheat: a run that changed only comparison-leg test
+  // files satisfied `testFiles.length > 0` and sailed through to a PR. There is
+  // no safe "no post-fix result" path — without the authoritative post-fix
+  // collector signal we cannot tell a real fix from a relaxation, so we
+  // fail-closed to human review (COLLECTOR_INFRA) rather than open a PR. The
+  // real workflow (fix-drift.yml "Create PR" step) always supplies
+  // --post-fix-report/--post-fix-exit, so this only fires on a misconfigured
+  // invocation — which must NOT auto-merge.
+  if (!postFix) {
+    console.error(
+      "ERROR: PR-open gate requires the post-fix collector result " +
+        "(--post-fix-report + --post-fix-exit). Refusing to open a PR without the " +
+        "authoritative drift-success signal — routing to human review.",
+    );
+    console.log(`reason=${PredicateReason.COLLECTOR_INFRA}`);
+    process.exit(REASON_EXIT_CODE[PredicateReason.COLLECTOR_INFRA]);
   }
+  const verdict = evaluateDriftResolved({
+    changedFiles,
+    report,
+    postFixCollectorExit: postFix.exitCode,
+    postFixCriticalCount: countCriticalDiffs(postFix.report),
+  });
+  if (!verdict.resolved) {
+    console.error(`ERROR: Drift NOT resolved [${verdict.reason}]: ${verdict.detail}`);
+    if (verdict.offendingFiles.length > 0) {
+      console.error(`Offending files: ${verdict.offendingFiles.join(", ")}`);
+    }
+    console.error("Aborting PR creation — this fix will be routed to human review.");
+    console.log(`reason=${verdict.reason}`);
+    process.exit(REASON_EXIT_CODE[verdict.reason]);
+  }
+  console.log(`Drift-success predicate: RESOLVED — ${verdict.detail}`);
 
   // Determine branch name
   let currentBranch: string;
@@ -856,6 +864,20 @@ export function parseMode(args: string[]): "pr" | "issue" | "default" {
   return "default";
 }
 
+/**
+ * FIX #5 — true only when BOTH post-fix collector flags are present with values.
+ * PR mode requires both (the drift-success predicate is the authoritative
+ * PR-open gate); there is no legacy no-post-fix fallback that could re-open the
+ * fixture-only cheat.
+ */
+export function hasPostFixArgs(args: string[]): boolean {
+  const reportIdx = args.indexOf("--post-fix-report");
+  const exitIdx = args.indexOf("--post-fix-exit");
+  const hasReport = reportIdx !== -1 && args[reportIdx + 1] !== undefined;
+  const hasExit = exitIdx !== -1 && args[exitIdx + 1] !== undefined;
+  return hasReport && hasExit;
+}
+
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const mode = parseMode(args);
@@ -888,28 +910,26 @@ async function main(): Promise<void> {
   console.log(`Loaded drift report: ${report.entries.length} entries from ${report.timestamp}`);
 
   if (mode === "pr") {
-    // Parse the optional post-fix collector result. When BOTH flags are
-    // supplied, the drift-success predicate gates PR creation. If only one is
-    // supplied the args are malformed — fail rather than silently skip the gate.
     const postFixReportIdx = args.indexOf("--post-fix-report");
     const postFixExitIdx = args.indexOf("--post-fix-exit");
-    const hasPostFixReport = postFixReportIdx !== -1 && args[postFixReportIdx + 1] !== undefined;
-    const hasPostFixExit = postFixExitIdx !== -1 && args[postFixExitIdx + 1] !== undefined;
 
-    let postFix: PostFixCollectorResult | undefined;
-    if (hasPostFixReport || hasPostFixExit) {
-      if (!hasPostFixReport || !hasPostFixExit) {
-        throw new Error(
-          "--post-fix-report and --post-fix-exit must be supplied together (the drift-success predicate needs both)",
-        );
-      }
-      const postFixExit = Number(args[postFixExitIdx + 1]);
-      if (!Number.isInteger(postFixExit)) {
-        throw new Error(`--post-fix-exit must be an integer, got "${args[postFixExitIdx + 1]}"`);
-      }
-      const postFixReport = readPostFixReport(resolve(args[postFixReportIdx + 1]));
-      postFix = { report: postFixReport, exitCode: postFixExit };
+    // FIX #5 — the post-fix collector result is REQUIRED in PR mode. The old
+    // path allowed --create-pr with NO post-fix args, which fell back to the
+    // gameable legacy guard (a test-file-only change satisfied it and opened a
+    // PR). Both flags must be present; a missing/partial pair throws rather than
+    // silently skipping the authoritative drift-success gate.
+    if (!hasPostFixArgs(args)) {
+      throw new Error(
+        "--create-pr requires BOTH --post-fix-report and --post-fix-exit (the drift-success " +
+          "predicate is the authoritative PR-open gate; there is no legacy no-post-fix path)",
+      );
     }
+    const postFixExit = Number(args[postFixExitIdx + 1]);
+    if (!Number.isInteger(postFixExit)) {
+      throw new Error(`--post-fix-exit must be an integer, got "${args[postFixExitIdx + 1]}"`);
+    }
+    const postFixReport = readPostFixReport(resolve(args[postFixReportIdx + 1]));
+    const postFix: PostFixCollectorResult = { report: postFixReport, exitCode: postFixExit };
 
     createPr(report, postFix);
   } else {

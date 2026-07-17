@@ -39,6 +39,7 @@ import {
   readFileIfExists,
   execFileSafe,
   parseMode,
+  hasPostFixArgs,
   getChangedFiles,
   affectedSkillSections,
   BUILDER_TO_SKILL_SECTION,
@@ -775,6 +776,37 @@ describe("parseMode", () => {
 
   it("returns 'pr' even with other flags present", () => {
     expect(parseMode(["--report", "drift-report.json", "--create-pr"])).toBe("pr");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX #5 — hasPostFixArgs: PR mode REQUIRES both post-fix flags. The old legacy
+// no-post-fix fallback re-opened the fixture-only cheat (a test-file-only change
+// satisfied it and opened a PR), so main() throws unless BOTH are present. A
+// live subprocess red-green confirmed the OLD code proceeded to `gh pr create`
+// with no post-fix args while the NEW code fails-closed BEFORE any git op.
+// ---------------------------------------------------------------------------
+describe("hasPostFixArgs (fix #5 legacy-fallback closure)", () => {
+  it("false when NO post-fix flags (the legacy cheat path — must be rejected)", () => {
+    expect(hasPostFixArgs(["--create-pr", "--report", "drift-report.json"])).toBe(false);
+  });
+
+  it("false when only --post-fix-report is present", () => {
+    expect(hasPostFixArgs(["--create-pr", "--post-fix-report", "post.json"])).toBe(false);
+  });
+
+  it("false when only --post-fix-exit is present", () => {
+    expect(hasPostFixArgs(["--create-pr", "--post-fix-exit", "0"])).toBe(false);
+  });
+
+  it("false when a flag is present but its value is missing (trailing flag)", () => {
+    expect(hasPostFixArgs(["--post-fix-report", "post.json", "--post-fix-exit"])).toBe(false);
+  });
+
+  it("true only when BOTH flags carry values", () => {
+    expect(
+      hasPostFixArgs(["--create-pr", "--post-fix-report", "post.json", "--post-fix-exit", "0"]),
+    ).toBe(true);
   });
 });
 

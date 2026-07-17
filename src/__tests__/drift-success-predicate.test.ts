@@ -26,9 +26,12 @@ import {
   isProductionFile,
   isComparisonLeg,
   isSuppressionSurface,
+  isGameableLeg,
   sanctionedTargets,
   countCriticalDiffs,
   parseCliArgs,
+  parsePorcelainLine,
+  crossCheckChangedFiles,
   PredicateConfigError,
   readReport,
   runCli,
@@ -196,6 +199,135 @@ describe("evaluateDriftResolved — RED (cheat/failure) cases", () => {
     expect(verdict.reason).toBe(PredicateReason.PRODUCTION_CHANGE_OFF_TARGET);
     expect(REASON_EXIT_CODE[verdict.reason]).toBe(16);
   });
+
+  // -------------------------------------------------------------------------
+  // WS-2b HYBRID CHEAT — a gameable-leg edit ACCOMPANIED by a trivial, on-target
+  // production edit. Pre-fix the predicate ignored the leg once ANY production
+  // file changed → RESOLVED (the exact WS-2b auto-merge cheat). Post-fix a leg
+  // edit ALWAYS blocks (SUPPRESSION_SUSPECTED), regardless of production files.
+  // -------------------------------------------------------------------------
+  it("HEADLINE WS-2b: sdk-shapes.ts relaxation + on-target production edit → SUPPRESSION_SUSPECTED (block), NOT resolved", () => {
+    const changedFiles = ["src/__tests__/drift/sdk-shapes.ts", "src/helpers.ts"];
+    const verdict = evaluateDriftResolved({
+      changedFiles,
+      report: report([entry({ builderFile: "src/helpers.ts", typesFile: "src/types.ts" })]),
+      postFixCollectorExit: 0,
+      postFixCriticalCount: 0,
+    });
+    expect(verdict.resolved).toBe(false);
+    expect(verdict.reason).toBe(PredicateReason.SUPPRESSION_SUSPECTED);
+    expect(verdict.offendingFiles).toContain("src/__tests__/drift/sdk-shapes.ts");
+    expect(REASON_EXIT_CODE[verdict.reason]).toBe(12);
+    // Contrast: the OLD guard would have proceeded (both builder + test present).
+    expect(oldGuardWouldAccept(changedFiles)).toBe(true);
+  });
+
+  it("harness leg (providers.ts) relaxation + on-target production edit → SUPPRESSION_SUSPECTED (block)", () => {
+    const verdict = evaluateDriftResolved({
+      changedFiles: ["src/__tests__/drift/providers.ts", "src/helpers.ts"],
+      report: report([entry({ builderFile: "src/helpers.ts", typesFile: "src/types.ts" })]),
+      postFixCollectorExit: 0,
+      postFixCriticalCount: 0,
+    });
+    expect(verdict.resolved).toBe(false);
+    expect(verdict.reason).toBe(PredicateReason.SUPPRESSION_SUSPECTED);
+    expect(verdict.offendingFiles).toContain("src/__tests__/drift/providers.ts");
+    expect(REASON_EXIT_CODE[verdict.reason]).toBe(12);
+  });
+
+  it("harness-only leg edit (ws-providers.ts), no production change → COMPARISON_LEG_ONLY (block, pure relaxation)", () => {
+    const verdict = evaluateDriftResolved({
+      changedFiles: ["src/__tests__/drift/ws-providers.ts"],
+      report: report(),
+      postFixCollectorExit: 0,
+      postFixCriticalCount: 0,
+    });
+    expect(verdict.resolved).toBe(false);
+    // Leg edit with NO production change → COMPARISON_LEG_ONLY (a pure
+    // relaxation; no mock fix even attempted). Still a hard block (exit 11).
+    expect(verdict.reason).toBe(PredicateReason.COMPARISON_LEG_ONLY);
+    expect(REASON_EXIT_CODE[verdict.reason]).toBe(11);
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX #2 — dual-classification precedence: voice-models.ts is BOTH a harness
+  // leg AND a legit fixture target. Block-classification MUST win (fail-closed).
+  // -------------------------------------------------------------------------
+  it("voice-models.ts (dual-classified harness+target) + on-target production edit → SUPPRESSION_SUSPECTED (block wins)", () => {
+    const verdict = evaluateDriftResolved({
+      changedFiles: ["src/__tests__/drift/voice-models.ts", "src/ws-realtime.ts"],
+      report: report([entry({ builderFile: "src/ws-realtime.ts", typesFile: null })]),
+      postFixCollectorExit: 0,
+      postFixCriticalCount: 0,
+    });
+    expect(verdict.resolved).toBe(false);
+    expect(verdict.reason).toBe(PredicateReason.SUPPRESSION_SUSPECTED);
+    expect(verdict.offendingFiles).toContain("src/__tests__/drift/voice-models.ts");
+    expect(REASON_EXIT_CODE[verdict.reason]).toBe(12);
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX #3 — empty sanctioned-target set must fail closed (needs-human), not
+  // silently accept any production change by disabling the off-target guard.
+  // -------------------------------------------------------------------------
+  it("empty sanctionedTargets (report entries have no usable target) → PRODUCTION_CHANGE_OFF_TARGET (fail-closed)", () => {
+    // Fabricate a report whose entries yield ZERO sanctioned targets: builderFile
+    // "" and typesFile null. (evaluateDriftResolved does not re-validate the
+    // report shape — it only reads builderFile/typesFile via sanctionedTargets.)
+    const emptyTargetReport: DriftReport = {
+      timestamp: "2026-07-16T00:00:00.000Z",
+      entries: [
+        {
+          provider: "OpenAI",
+          scenario: "chat completion",
+          builderFile: "",
+          builderFunctions: ["buildChatCompletion"],
+          typesFile: null,
+          sdkShapesFile: "src/__tests__/drift/sdk-shapes.ts",
+          diffs: [diff()],
+        },
+      ],
+    };
+    expect(sanctionedTargets(emptyTargetReport).size).toBe(0);
+    const verdict = evaluateDriftResolved({
+      changedFiles: ["src/helpers.ts"],
+      report: emptyTargetReport,
+      postFixCollectorExit: 0,
+      postFixCriticalCount: 0,
+    });
+    expect(verdict.resolved).toBe(false);
+    expect(verdict.reason).toBe(PredicateReason.PRODUCTION_CHANGE_OFF_TARGET);
+    expect(REASON_EXIT_CODE[verdict.reason]).toBe(16);
+  });
+
+  // -------------------------------------------------------------------------
+  // FIX #6 — exit 5/1 WITH parseable criticalCount>0 gets its OWN reason
+  // (quarantine/infra), NOT STILL_DIRTY. The collector-state classification
+  // wins over the belt-and-suspenders criticalCount check.
+  // -------------------------------------------------------------------------
+  it("post-fix quarantine (exit 5) with criticalCount>0 → QUARANTINE_AFTER_FIX (not STILL_DIRTY)", () => {
+    const verdict = evaluateDriftResolved({
+      changedFiles: ["src/helpers.ts"],
+      report: report(),
+      postFixCollectorExit: 5,
+      postFixCriticalCount: 4,
+    });
+    expect(verdict.resolved).toBe(false);
+    expect(verdict.reason).toBe(PredicateReason.QUARANTINE_AFTER_FIX);
+    expect(REASON_EXIT_CODE[verdict.reason]).toBe(14);
+  });
+
+  it("post-fix infra (exit 1) with criticalCount>0 → COLLECTOR_INFRA (not STILL_DIRTY)", () => {
+    const verdict = evaluateDriftResolved({
+      changedFiles: ["src/helpers.ts"],
+      report: report(),
+      postFixCollectorExit: 1,
+      postFixCriticalCount: 4,
+    });
+    expect(verdict.resolved).toBe(false);
+    expect(verdict.reason).toBe(PredicateReason.COLLECTOR_INFRA);
+    expect(REASON_EXIT_CODE[verdict.reason]).toBe(15);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -288,26 +420,48 @@ describe("file classification", () => {
     expect(isProductionFile("scripts/fix-drift.ts")).toBe(false);
   });
 
-  it("isComparisonLeg flags SDK/schema/harness/*.drift.ts but NOT legit fixture targets", () => {
+  it("isComparisonLeg flags SDK/schema/harness/*.drift.ts (incl dual-classified voice-models) but NOT pure legit targets", () => {
     expect(isComparisonLeg("src/__tests__/drift/sdk-shapes.ts")).toBe(true);
     expect(isComparisonLeg("src/__tests__/drift/schema.ts")).toBe(true);
     expect(isComparisonLeg("src/__tests__/drift/providers.ts")).toBe(true);
     expect(isComparisonLeg("src/__tests__/drift/ws-providers.ts")).toBe(true);
     expect(isComparisonLeg("src/__tests__/drift/helpers.ts")).toBe(true);
     expect(isComparisonLeg("src/__tests__/drift/openai-chat.drift.ts")).toBe(true);
-    // Legit fixture targets are NOT comparison legs.
+    // Dual-classified voice-models.ts blocks (fix #2: harness membership wins).
+    expect(isComparisonLeg("src/__tests__/drift/voice-models.ts")).toBe(true);
+    // PURE legit fixture targets (not also a harness leg) are NOT comparison legs.
     expect(isComparisonLeg("src/__tests__/drift/model-registry.ts")).toBe(false);
     expect(isComparisonLeg("src/__tests__/drift/model-family.ts")).toBe(false);
-    expect(isComparisonLeg("src/__tests__/drift/voice-models.ts")).toBe(false);
     // Production files are not comparison legs.
     expect(isComparisonLeg("src/helpers.ts")).toBe(false);
   });
 
-  it("isSuppressionSurface flags schema + *.drift.ts only", () => {
+  it("isSuppressionSurface flags the NARROW always-suppress set (schema + *.drift.ts) only", () => {
+    // Suppression surface = the actively-silencing subset: schema/allowlist and
+    // *.drift.ts assertions. These always map to SUPPRESSION_SUSPECTED. The
+    // broader legs (sdk-shapes / harness) are gameable but are NOT suppression
+    // surfaces (they map to COMPARISON_LEG_ONLY when standalone).
     expect(isSuppressionSurface("src/__tests__/drift/schema.ts")).toBe(true);
     expect(isSuppressionSurface("src/__tests__/drift/openai-chat.drift.ts")).toBe(true);
     expect(isSuppressionSurface("src/__tests__/drift/sdk-shapes.ts")).toBe(false);
+    expect(isSuppressionSurface("src/__tests__/drift/providers.ts")).toBe(false);
+    expect(isSuppressionSurface("src/__tests__/drift/voice-models.ts")).toBe(false);
     expect(isSuppressionSurface("src/helpers.ts")).toBe(false);
+  });
+
+  it("isGameableLeg flags every leg (incl dual-classified voice-models) but NOT model-registry/model-family/production", () => {
+    expect(isGameableLeg("src/__tests__/drift/sdk-shapes.ts")).toBe(true);
+    expect(isGameableLeg("src/__tests__/drift/schema.ts")).toBe(true);
+    expect(isGameableLeg("src/__tests__/drift/providers.ts")).toBe(true);
+    expect(isGameableLeg("src/__tests__/drift/ws-providers.ts")).toBe(true);
+    expect(isGameableLeg("src/__tests__/drift/helpers.ts")).toBe(true);
+    expect(isGameableLeg("src/__tests__/drift/openai-chat.drift.ts")).toBe(true);
+    // Dual-classified: harness membership wins over legit-target (fix #2).
+    expect(isGameableLeg("src/__tests__/drift/voice-models.ts")).toBe(true);
+    // Pure legit fixture targets are NOT gameable legs.
+    expect(isGameableLeg("src/__tests__/drift/model-registry.ts")).toBe(false);
+    expect(isGameableLeg("src/__tests__/drift/model-family.ts")).toBe(false);
+    expect(isGameableLeg("src/helpers.ts")).toBe(false);
   });
 
   it("sanctionedTargets unions builderFile + non-null typesFile", () => {
@@ -391,8 +545,67 @@ describe("parseCliArgs", () => {
 });
 
 describe("readReport", () => {
+  let dir: string | null = null;
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = null;
+  });
+
   it("throws PredicateConfigError on a missing file", () => {
     expect(() => readReport("/no/such/drift-report.json")).toThrow(PredicateConfigError);
+  });
+
+  // FIX #6 — align the strict/loose validators. readReport must fail-closed on a
+  // structurally-untrustworthy report the same way fix-drift.ts:readDriftReport
+  // does: a missing/non-string `timestamp` is a corrupt/truncated collector run
+  // and must be REJECTED, never silently trusted as a clean signal.
+  it("rejects a report missing the timestamp field (fail-closed, aligns with readDriftReport)", () => {
+    dir = mkdtempSync(join(tmpdir(), "ws2-readreport-"));
+    const p = join(dir, "no-ts.json");
+    writeFileSync(p, JSON.stringify({ entries: [] }), "utf-8");
+    expect(() => readReport(p)).toThrow(PredicateConfigError);
+  });
+
+  it("rejects a non-object / non-{entries:[]} structure", () => {
+    dir = mkdtempSync(join(tmpdir(), "ws2-readreport-"));
+    const p = join(dir, "bad.json");
+    writeFileSync(p, JSON.stringify({ timestamp: "t", entries: "nope" }), "utf-8");
+    expect(() => readReport(p)).toThrow(PredicateConfigError);
+  });
+
+  // A legitimately-clean post-fix report IS { entries: [] } — the collector
+  // emits exactly that when no drift remains. It must be ACCEPTED (the trust
+  // anchor for "clean" is the collector EXIT CODE, corroborated by fix #1's
+  // always-block-on-leg-edit rule, not the entries array being non-empty).
+  it("accepts a well-formed EMPTY report (the genuine clean-collector signal)", () => {
+    dir = mkdtempSync(join(tmpdir(), "ws2-readreport-"));
+    const p = join(dir, "clean.json");
+    writeFileSync(p, JSON.stringify({ timestamp: "t", entries: [] }), "utf-8");
+    expect(() => readReport(p)).not.toThrow();
+  });
+
+  it("accepts a well-formed non-empty report", () => {
+    dir = mkdtempSync(join(tmpdir(), "ws2-readreport-"));
+    const p = join(dir, "ok.json");
+    writeFileSync(p, JSON.stringify(report()), "utf-8");
+    expect(() => readReport(p)).not.toThrow();
+  });
+});
+
+describe("parsePorcelainLine", () => {
+  it("strips the 2-char status + space prefix", () => {
+    expect(parsePorcelainLine(" M src/helpers.ts")).toBe("src/helpers.ts");
+    expect(parsePorcelainLine("?? src/new.ts")).toBe("src/new.ts");
+    expect(parsePorcelainLine("A  src/added.ts")).toBe("src/added.ts");
+  });
+
+  it("takes the NEW path from rename notation (old -> new)", () => {
+    expect(parsePorcelainLine("R  src/old.ts -> src/new.ts")).toBe("src/new.ts");
+  });
+
+  it("unquotes paths with special characters", () => {
+    expect(parsePorcelainLine('?? "src/weird name.ts"')).toBe("src/weird name.ts");
+    expect(parsePorcelainLine('R  "src/old x.ts" -> "src/new x.ts"')).toBe("src/new x.ts");
   });
 });
 
@@ -417,7 +630,13 @@ describe("runCli", () => {
     return { pre: preP, post: postP };
   }
 
-  it("exits 11 for the comparison-leg-only cheat", () => {
+  // NOTE (fix #4): runCli now ALWAYS cross-checks any --changed-file list
+  // against the real git working tree, so a synthetic list that does not match
+  // the checkout is rejected (exit 2) BEFORE the predicate runs. The exit-code-
+  // per-reason mapping for the cheat / real-fix cases is covered directly by the
+  // evaluateDriftResolved + REASON_EXIT_CODE tests above; here we lock the
+  // cross-check itself (the fix #4 blinding guard) at the runCli boundary.
+  it("exits 2 (CONFIG_ERROR) when --changed-file disagrees with git (fix #4 blinding guard)", () => {
     const paths = writeReports(report(), report([]));
     const code = runCli([
       "--report",
@@ -429,25 +648,7 @@ describe("runCli", () => {
       "--changed-file",
       "src/__tests__/drift/sdk-shapes.ts",
     ]);
-    expect(code).toBe(11);
-  });
-
-  it("exits 0 for a real production fix", () => {
-    const paths = writeReports(
-      report([entry({ builderFile: "src/helpers.ts", typesFile: "src/types.ts" })]),
-      report([]),
-    );
-    const code = runCli([
-      "--report",
-      paths.pre,
-      "--post-fix-report",
-      paths.post,
-      "--post-fix-exit",
-      "0",
-      "--changed-file",
-      "src/helpers.ts",
-    ]);
-    expect(code).toBe(0);
+    expect(code).toBe(2);
   });
 
   it("exits 2 (CONFIG_ERROR) on a missing post-fix report", () => {
@@ -468,5 +669,93 @@ describe("runCli", () => {
   it("exits 2 (CONFIG_ERROR) on malformed args", () => {
     const code = runCli(["--bogus"]);
     expect(code).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FIX #4 — authoritative changed-files: crossCheckChangedFiles
+// ---------------------------------------------------------------------------
+
+describe("crossCheckChangedFiles", () => {
+  it("returns the git set when no explicit list is supplied", () => {
+    const git = ["src/helpers.ts", "src/types.ts"];
+    expect(crossCheckChangedFiles(null, git)).toEqual(git);
+  });
+
+  it("accepts an explicit list that matches the git set (order-independent)", () => {
+    const git = ["src/helpers.ts", "src/types.ts"];
+    expect(crossCheckChangedFiles(["src/types.ts", "src/helpers.ts"], git)).toEqual(
+      expect.arrayContaining(git),
+    );
+  });
+
+  it("throws when the explicit list OMITS a file git reports (leg-blinding attack)", () => {
+    const git = ["src/helpers.ts", "src/__tests__/drift/sdk-shapes.ts"];
+    // Attacker passes only the benign production file, hiding the relaxed leg.
+    expect(() => crossCheckChangedFiles(["src/helpers.ts"], git)).toThrow(PredicateConfigError);
+  });
+
+  it("throws when the explicit list ADDS a file git does not report", () => {
+    const git = ["src/helpers.ts"];
+    expect(() => crossCheckChangedFiles(["src/helpers.ts", "src/phantom.ts"], git)).toThrow(
+      PredicateConfigError,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// REVERT GUARD + RED-COUNT LOCK
+// ---------------------------------------------------------------------------
+
+describe("revert guard — old always-accept predicate would FAIL these locks", () => {
+  // The pre-hardening predicate ignored gameable legs once ANY production file
+  // changed (and had a legacy always-accept fallback). This models that old
+  // behavior; asserting it DISAGREES with the real predicate on the WS-2b cheat
+  // proves the hardening is load-bearing. If someone reverts evaluateDriftResolved
+  // to the old logic, the HEADLINE WS-2b test above flips and the suite breaks.
+  function oldPredicateWouldAccept(changedFiles: string[]): boolean {
+    const productionFiles = changedFiles.filter(isProductionFile);
+    // Old logic: leg files only checked when productionFiles === 0.
+    return productionFiles.length > 0;
+  }
+
+  it("WS-2b cheat: old predicate ACCEPTS, real predicate BLOCKS (SUPPRESSION_SUSPECTED)", () => {
+    const cheat = ["src/__tests__/drift/sdk-shapes.ts", "src/helpers.ts"];
+    // Old behavior would have accepted (a production file is present).
+    expect(oldPredicateWouldAccept(cheat)).toBe(true);
+    // Real predicate blocks.
+    const verdict = evaluateDriftResolved({
+      changedFiles: cheat,
+      report: report([entry({ builderFile: "src/helpers.ts", typesFile: "src/types.ts" })]),
+      postFixCollectorExit: 0,
+      postFixCriticalCount: 0,
+    });
+    expect(verdict.resolved).toBe(false);
+    expect(verdict.reason).toBe(PredicateReason.SUPPRESSION_SUSPECTED);
+  });
+});
+
+describe("RED-count lock", () => {
+  // A structural lock: exactly this many distinct block reasons must reject.
+  // NOTE: the current RED-case count in the top describe block is 9 (NOT 10) —
+  // HEADLINE, schema+builder, *.drift.ts, no-change, still-dirty(exit2),
+  // criticalCount>0, quarantine, infra, off-target. The WS-2b / dual-class /
+  // empty-targets / exit5+critical / exit1+critical additions raise the total.
+  const BLOCK_REASONS = [
+    PredicateReason.NO_PRODUCTION_CHANGE,
+    PredicateReason.COMPARISON_LEG_ONLY,
+    PredicateReason.SUPPRESSION_SUSPECTED,
+    PredicateReason.STILL_DIRTY,
+    PredicateReason.QUARANTINE_AFTER_FIX,
+    PredicateReason.COLLECTOR_INFRA,
+    PredicateReason.PRODUCTION_CHANGE_OFF_TARGET,
+    PredicateReason.CONFIG_ERROR,
+  ];
+
+  it("every block reason has a distinct non-zero exit code and RESOLVED is 0", () => {
+    expect(REASON_EXIT_CODE[PredicateReason.RESOLVED]).toBe(0);
+    const codes = BLOCK_REASONS.map((r) => REASON_EXIT_CODE[r]);
+    for (const c of codes) expect(c).not.toBe(0);
+    expect(new Set(codes).size).toBe(codes.length); // all distinct
   });
 });

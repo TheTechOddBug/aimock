@@ -24,26 +24,42 @@
  *      criticalCount 0).
  *   2. PRODUCTION CHANGE — at least one PRODUCTION mock-builder file changed
  *      (`src/**` excluding `src/__tests__/`). A relaxation NEVER changes one.
- *   3. NO STANDALONE COMPARISON-LEG RELAXATION — a change that touches a
- *      gameable comparison leg must be ACCOMPANIED by a production change, and
- *      edits to the triangulation allowlist / `*.drift.ts` assertions are
- *      ALWAYS blocked (silencing the detector is never a valid drift fix).
+ *   3. NO GAMEABLE-LEG EDIT AT ALL — the changed set touches NO gameable leg.
+ *      HARDENED (fix #1): a gameable-leg edit ALWAYS blocks, INDEPENDENT of how
+ *      many production files also changed. A legitimate auto-remediation updates
+ *      the mock BUILDER to match the SDK; it never edits a comparison/SDK/harness
+ *      leg (those change only on a deliberate human vendored-SDK bump). This
+ *      closes the WS-2b hybrid cheat (relax a leg + one trivial on-target
+ *      production edit) that the old "only check legs when productionFiles===0"
+ *      logic passed straight to auto-merge. Schema/allowlist and `*.drift.ts`
+ *      assertion edits always map to SUPPRESSION_SUSPECTED (actively silencing
+ *      the detector); other gameable legs (sdk-shapes, harness incl the
+ *      dual-classified voice-models.ts) map to SUPPRESSION_SUSPECTED when paired
+ *      with a production change and COMPARISON_LEG_ONLY when standalone.
  *
  * Additionally, the production change should intersect the report's SANCTIONED
  * target set (`union(entry.builderFile, entry.typesFile≠null)`); an off-target
  * production change is a WARNING that still blocks (a shared helper MAY be the
- * real fix, so it is distinct from an outright cheat).
+ * real fix, so it is distinct from an outright cheat). An EMPTY sanctioned set is
+ * fail-closed (fix #3): with no named target we cannot verify the change landed
+ * where the drift lives, so it routes to human rather than rubber-stamps.
  *
  * CLI exit codes (mirrors drift-report-collector.ts's distinct-code discipline):
  *   0  — RESOLVED
  *   10 — NO_PRODUCTION_CHANGE
- *   11 — COMPARISON_LEG_ONLY          (the headline cheat)
- *   12 — SUPPRESSION_SUSPECTED        (allowlist / *.drift.ts assertion edited)
- *   13 — STILL_DIRTY                  (post-fix collector exit 2)
- *   14 — QUARANTINE_AFTER_FIX         (post-fix collector exit 5)
- *   15 — COLLECTOR_INFRA              (post-fix collector exit 1)
- *   16 — PRODUCTION_CHANGE_OFF_TARGET (WARNING, still blocks)
- *   2  — CONFIG_ERROR                 (missing/unreadable report, bad args)
+ *   11 — COMPARISON_LEG_ONLY          (leg edit with NO production change)
+ *   12 — SUPPRESSION_SUSPECTED        (schema/*.drift.ts edit, OR any gameable
+ *                                      leg edited ALONGSIDE a production change)
+ *   13 — STILL_DIRTY                  (post-fix collector exit 2, or exit 0 with
+ *                                      criticalCount>0)
+ *   14 — QUARANTINE_AFTER_FIX         (post-fix collector exit 5 — checked BEFORE
+ *                                      criticalCount, so exit 5 wins)
+ *   15 — COLLECTOR_INFRA              (post-fix collector exit 1 — likewise wins
+ *                                      over criticalCount)
+ *   16 — PRODUCTION_CHANGE_OFF_TARGET (off-target OR zero sanctioned targets;
+ *                                      WARNING, still blocks)
+ *   2  — CONFIG_ERROR                 (missing/unreadable report, bad args, or a
+ *                                      --changed-file list that disagrees w/ git)
  *
  * Usage:
  *   npx tsx scripts/drift-success-predicate.ts \
@@ -53,7 +69,10 @@
  *     [--changed-file src/helpers.ts ...]
  *
  * When no --changed-file args are supplied the CLI derives the changed set from
- * `git status --porcelain` (mirrors fix-drift.ts:getChangedFiles()).
+ * `git status --porcelain` (mirrors fix-drift.ts:getChangedFiles()). When a
+ * --changed-file list IS supplied it is cross-checked against git and rejected
+ * (CONFIG_ERROR) on any mismatch (fix #4 — a leg-omitting list must not blind
+ * the predicate).
  */
 
 import { execSync } from "node:child_process";
@@ -99,7 +118,18 @@ export interface PredicateInputs {
   report: DriftReport;
   /** Exit code of the re-run collector (0 clean / 2 dirty / 5 quarantine / 1 infra). */
   postFixCollectorExit: number;
-  /** criticalCount parsed from the re-run report (belt-and-suspenders vs exit 0). */
+  /**
+   * criticalCount parsed from the re-run report (belt-and-suspenders vs exit 0).
+   *
+   * FIX #7 — INDEPENDENCE CAVEAT: this signal (and the collector exit code) is
+   * derived from the SAME fixtures the fixer was told to make pass, so it is
+   * NOT independent of a fixture-relaxation cheat — a run that relaxed the SDK
+   * leg reports clean here too. It is therefore only trustworthy BECAUSE fix #1
+   * now blocks ANY gameable-leg edit (see isGameableLeg / the SUPPRESSION_SUSPECTED
+   * + COMPARISON_LEG_ONLY branches) regardless of production files. That
+   * always-block rule is load-bearing: it is what makes a clean post-fix signal
+   * mean "the mock was really fixed" rather than "the leg was relaxed".
+   */
   postFixCriticalCount: number;
 }
 
@@ -145,12 +175,15 @@ const HARNESS_FILES: ReadonlySet<string> = new Set([
  * (the known-models canary routes fixes to these model-list files). These are
  * NOT gameable comparison legs — adding a newly-shipped model id here is a
  * legit fix, not a relaxation. They are allowed as accompanying changes and are
- * never counted as a standalone comparison-leg cheat.
+ * never counted as a comparison-leg cheat.
+ *
+ * FIX #2 — `voice-models.ts` is deliberately NOT listed here: it is also a
+ * real-API HARNESS file, and block-classification wins over legit-accept
+ * (fail-closed precedence). It is classified as a gameable leg in isGameableLeg.
  */
 const LEGIT_FIXTURE_TARGETS: ReadonlySet<string> = new Set([
   "src/__tests__/drift/model-registry.ts",
   "src/__tests__/drift/model-family.ts",
-  "src/__tests__/drift/voice-models.ts",
 ]);
 
 /**
@@ -171,30 +204,59 @@ export function isDriftTestFile(file: string): boolean {
 }
 
 /**
- * SUPPRESSION surface: editing these ALWAYS blocks, even alongside a production
- * change, because silencing the detector (allowlist growth, loosened assertions)
- * is never a valid drift fix. The schema file carries ALLOWLISTED_PATHS; the
- * `*.drift.ts` files carry the assertions.
+ * GAMEABLE-LEG (the block set). Editing ANY of these can erase a drift diff
+ * WITHOUT changing the mock output — either by relaxing a comparison leg (the
+ * SDK-shape fixture, the schema/allowlist, the real-API harness) or by loosening
+ * a `*.drift.ts` assertion. Every one of these is a HUMAN-REVIEWED artifact: a
+ * legitimate auto-remediation updates the mock BUILDER to match the SDK, and the
+ * leg only changes on a deliberate human vendored-SDK bump. So any leg edit —
+ * ALONE OR ACCOMPANIED BY A PRODUCTION CHANGE — is fail-closed to needs-human
+ * (SUPPRESSION_SUSPECTED). This closes the WS-2b hybrid cheat (relax a leg +
+ * one trivial on-target production edit), which the old "only check legs when
+ * productionFiles===0" logic let through to auto-merge.
+ *
+ * FIX #2 — CLASSIFICATION PRECEDENCE: a file that is BOTH a harness leg AND a
+ * legit fixture target (e.g. `voice-models.ts`) is treated as gameable (block).
+ * Block-classification wins over legit-accept; fail-closed. Only PURE legit
+ * fixture targets (model-registry.ts / model-family.ts), which are NOT harness
+ * legs, are excluded — a canary model-list fix routes to those plus its
+ * production builder and is not blocked.
+ */
+export function isGameableLeg(file: string): boolean {
+  // Block-set membership is checked FIRST (fix #2 precedence): a file that is
+  // BOTH a harness leg AND a legit fixture target (voice-models.ts) matches
+  // HARNESS_FILES here and blocks, before the legit-target set is ever consulted.
+  if (file === SDK_SHAPES_FILE) return true;
+  if (file === SCHEMA_FILE) return true;
+  if (HARNESS_FILES.has(file)) return true;
+  if (isDriftTestFile(file)) return true;
+  // PURE legit fixture targets (not also a harness leg) are explicitly
+  // non-gameable — a canary model-list fix routes here plus its production
+  // builder and must not be blocked.
+  if (LEGIT_FIXTURE_TARGETS.has(file)) return false;
+  // Everything else (production files, unrelated paths) is non-gameable.
+  return false;
+}
+
+/**
+ * SUPPRESSION surface (the NARROW always-SUPPRESSION_SUSPECTED subset): the
+ * triangulation schema/allowlist and `*.drift.ts` assertion files. Editing these
+ * ACTIVELY SILENCES the detector (allowlist growth, loosened assertion) and is
+ * never a valid fix — so it ALWAYS maps to SUPPRESSION_SUSPECTED, standalone or
+ * alongside a production change. (The broader gameable-leg set below — sdk-shapes,
+ * harness — also always blocks per fix #1, but maps to COMPARISON_LEG_ONLY when
+ * standalone and SUPPRESSION_SUSPECTED only when paired with a production change.)
  */
 export function isSuppressionSurface(file: string): boolean {
   return file === SCHEMA_FILE || isDriftTestFile(file);
 }
 
 /**
- * GAMEABLE-COMPARISON-LEG: a comparison leg (SDK fixture, schema, real-API
- * harness, or drift-test assertion) whose edit can erase a diff WITHOUT
- * changing mock output. Explicitly EXCLUDES LEGIT_FIXTURE_TARGETS
- * (canary model-list fixtures) — those are legit fix targets, not cheats.
- * Note `voice-models.ts` is both a harness file AND a legit canary target; it
- * is treated as a legit target (excluded here) so a canary fix is not blocked.
+ * GAMEABLE-COMPARISON-LEG (retained for API compatibility / classification
+ * unit coverage). Same full set as isGameableLeg — every leg edit blocks.
  */
 export function isComparisonLeg(file: string): boolean {
-  if (LEGIT_FIXTURE_TARGETS.has(file)) return false;
-  if (file === SDK_SHAPES_FILE) return true;
-  if (file === SCHEMA_FILE) return true;
-  if (HARNESS_FILES.has(file)) return true;
-  if (isDriftTestFile(file)) return true;
-  return false;
+  return isGameableLeg(file);
 }
 
 /**
@@ -220,16 +282,14 @@ export function evaluateDriftResolved(i: PredicateInputs): PredicateResult {
 
   // ---- Signal 1: AUTHORITATIVE — collector clean on re-run. -------------
   // Checked FIRST: a dirty/quarantine/infra collector makes any file-set moot.
-  if (postFixCollectorExit === 2 || postFixCriticalCount > 0) {
-    return {
-      resolved: false,
-      reason: PredicateReason.STILL_DIRTY,
-      detail:
-        "Post-fix drift collector still reports critical drift " +
-        `(exit ${postFixCollectorExit}, criticalCount ${postFixCriticalCount}). The fix did not resolve the drift.`,
-      offendingFiles: [],
-    };
-  }
+  //
+  // FIX #6 — the collector-STATE classification (exit 2/5/1) is checked BEFORE
+  // the belt-and-suspenders criticalCount>0 branch. A quarantine (exit 5) or an
+  // infra failure (exit 1) that ALSO happens to carry a parseable criticalCount>0
+  // is a quarantine/infra event, NOT a plain STILL_DIRTY — it gets its own
+  // distinct reason so the Slack alert names the real cause. STILL_DIRTY is
+  // reserved for exit 2, or a clean-looking exit 0 that nonetheless reports
+  // criticalCount>0 (report/exit disagreement).
   if (postFixCollectorExit === 5) {
     return {
       resolved: false,
@@ -248,6 +308,16 @@ export function evaluateDriftResolved(i: PredicateInputs): PredicateResult {
       offendingFiles: [],
     };
   }
+  if (postFixCollectorExit === 2 || postFixCriticalCount > 0) {
+    return {
+      resolved: false,
+      reason: PredicateReason.STILL_DIRTY,
+      detail:
+        "Post-fix drift collector still reports critical drift " +
+        `(exit ${postFixCollectorExit}, criticalCount ${postFixCriticalCount}). The fix did not resolve the drift.`,
+      offendingFiles: [],
+    };
+  }
   if (postFixCollectorExit !== 0) {
     // Any other non-zero exit is an unrecognized collector state — fail closed.
     return {
@@ -260,12 +330,13 @@ export function evaluateDriftResolved(i: PredicateInputs): PredicateResult {
 
   // ---- Classify the changed-file set. -----------------------------------
   const productionFiles = changedFiles.filter(isProductionFile);
-  const comparisonLegFiles = changedFiles.filter(isComparisonLeg);
+  const gameableLegFiles = changedFiles.filter(isGameableLeg);
   const suppressionFiles = changedFiles.filter(isSuppressionSurface);
 
-  // ---- Signal 3 (suppression): ALWAYS block. ----------------------------
-  // Edits to the allowlist/schema or a *.drift.ts assertion silence the
-  // detector and are never a valid fix — block even with a production change.
+  // ---- Signal 3a (suppression surface): ALWAYS block, standalone or paired. -
+  // Editing the schema/allowlist or a *.drift.ts assertion actively SILENCES the
+  // detector — never a valid fix, even alongside a production change. Distinct
+  // reason so the workflow's Slack alert names "silenced the detector".
   if (suppressionFiles.length > 0) {
     return {
       resolved: false,
@@ -277,21 +348,46 @@ export function evaluateDriftResolved(i: PredicateInputs): PredicateResult {
     };
   }
 
-  // ---- Signal 2: PRODUCTION change present. ------------------------------
-  if (productionFiles.length === 0) {
-    // No production change at all. Distinguish the pure comparison-leg cheat
-    // (the headline case) from a truly empty / non-source change.
-    if (comparisonLegFiles.length > 0) {
+  // ---- Signal 3b (gameable leg): ALWAYS block, independent of production. -
+  // FIX #1 (HEADLINE) + FIX #2 — a legitimate auto-remediation updates the mock
+  // BUILDER to match the SDK; it NEVER edits a comparison/SDK/harness leg (those
+  // change only on a deliberate human vendored-SDK bump). So the presence of ANY
+  // gameable-leg file blocks REGARDLESS of how many production files also
+  // changed. This closes the WS-2b hybrid cheat (relax sdk-shapes.ts + one
+  // trivial on-target production edit) that the old "only check legs when
+  // productionFiles===0" logic passed straight to auto-merge. voice-models.ts is
+  // dual-classified (harness + legit target) and blocks here (fix #2 precedence).
+  //
+  // Reason split (both distinct, both NEEDS-HUMAN in the workflow):
+  //   • leg edit WITH a production change → SUPPRESSION_SUSPECTED — the WS-2b
+  //     hybrid, the dangerous auto-merge vector.
+  //   • leg edit with NO production change → COMPARISON_LEG_ONLY — a pure
+  //     relaxation, no mock fix even attempted.
+  if (gameableLegFiles.length > 0) {
+    if (productionFiles.length > 0) {
       return {
         resolved: false,
-        reason: PredicateReason.COMPARISON_LEG_ONLY,
+        reason: PredicateReason.SUPPRESSION_SUSPECTED,
         detail:
-          "Fix changed ONLY comparison-leg files " +
-          `(${comparisonLegFiles.join(", ")}) with no production mock-builder change — ` +
-          "this relaxes the drift detector instead of fixing the mock. The exact cheat this gate blocks.",
-        offendingFiles: comparisonLegFiles,
+          "Fix edited a gameable comparison/SDK/harness leg " +
+          `(${gameableLegFiles.join(", ")}) ALONGSIDE a production change — relaxing a leg is never a valid ` +
+          "drift fix (a real fix updates the mock builder, not the leg). The WS-2b hybrid cheat. Needs human review.",
+        offendingFiles: gameableLegFiles,
       };
     }
+    return {
+      resolved: false,
+      reason: PredicateReason.COMPARISON_LEG_ONLY,
+      detail:
+        "Fix changed ONLY comparison/SDK/harness-leg files " +
+        `(${gameableLegFiles.join(", ")}) with no production mock-builder change — ` +
+        "this relaxes the drift detector instead of fixing the mock. The exact cheat this gate blocks.",
+      offendingFiles: gameableLegFiles,
+    };
+  }
+
+  // ---- Signal 2: PRODUCTION change present. ------------------------------
+  if (productionFiles.length === 0) {
     return {
       resolved: false,
       reason: PredicateReason.NO_PRODUCTION_CHANGE,
@@ -301,12 +397,28 @@ export function evaluateDriftResolved(i: PredicateInputs): PredicateResult {
     };
   }
 
-  // ---- Signal 3 (off-target WARNING): production change must intersect ---
-  // the report's sanctioned target set. A shared helper MAY legitimately be
-  // the real fix, so this WARNS and blocks but is distinct from a cheat.
+  // ---- Signal 3 (off-target): production change must intersect the report's
+  // sanctioned target set. A shared helper MAY legitimately be the real fix, so
+  // this WARNS and blocks but is distinct from a cheat.
+  //
+  // FIX #3 — an EMPTY sanctioned-target set is fail-closed, not a free pass. The
+  // old `targets.size > 0` guard disabled the off-target check entirely when the
+  // report named no targets, accepting ANY production change. An empty target set
+  // means the report could not name where to fix the drift — route to human
+  // rather than rubber-stamp an unverifiable production change.
   const targets = sanctionedTargets(report);
+  if (targets.size === 0) {
+    return {
+      resolved: false,
+      reason: PredicateReason.PRODUCTION_CHANGE_OFF_TARGET,
+      detail:
+        "Drift report named ZERO sanctioned fix targets (no builderFile/typesFile) — cannot verify the " +
+        `production change (${productionFiles.join(", ")}) landed where the drift lives. Fail-closed, needs human review.`,
+      offendingFiles: productionFiles,
+    };
+  }
   const onTarget = productionFiles.some((f) => targets.has(f));
-  if (targets.size > 0 && !onTarget) {
+  if (!onTarget) {
     return {
       resolved: false,
       reason: PredicateReason.PRODUCTION_CHANGE_OFF_TARGET,
@@ -422,6 +534,19 @@ export function readReport(path: string): DriftReport {
       `Drift report at ${path} has invalid structure: expected { entries: [...] }`,
     );
   }
+  // FIX #6 — align this (previously loose) validator with the stricter
+  // fix-drift.ts:readDriftReport: a report missing/carrying a non-string
+  // `timestamp` is a corrupt/truncated collector run and must fail-closed rather
+  // than be silently trusted as a clean "drift is gone" signal. NOTE: an EMPTY
+  // `entries: []` is intentionally ACCEPTED — that is exactly what the collector
+  // emits when no drift remains (the legitimate clean signal); the trust anchor
+  // for "clean" is the collector EXIT CODE plus fix #1's always-block-on-leg-edit
+  // rule, not a non-empty entries array.
+  if (typeof (parsed as Record<string, unknown>).timestamp !== "string") {
+    throw new PredicateConfigError(
+      `Drift report at ${path} is missing a string "timestamp" — corrupt/truncated report, failing closed`,
+    );
+  }
   return parsed as DriftReport;
 }
 
@@ -455,6 +580,33 @@ export function gitChangedFiles(): string[] {
 }
 
 /**
+ * FIX #4 — AUTHORITATIVE changed-file set. The git working tree is the single
+ * source of truth for what actually changed. An explicit `--changed-file` list
+ * is only a hint, and a supplied list that OMITS a relaxed leg would BLIND the
+ * predicate (the exact WS-2b vector, from the other side). So when a list is
+ * supplied we cross-check it against git as a set and fail-closed
+ * (PredicateConfigError → exit 2) on ANY disagreement — a missing file (leg
+ * hidden) OR an extra file (phantom) both mean the caller's view diverges from
+ * ground truth and the verdict cannot be trusted. When no list is supplied we
+ * use the git set directly.
+ */
+export function crossCheckChangedFiles(explicit: string[] | null, git: string[]): string[] {
+  if (explicit === null) return git;
+  const gitSet = new Set(git);
+  const explicitSet = new Set(explicit);
+  const missing = git.filter((f) => !explicitSet.has(f)); // git has it, list omits it
+  const extra = explicit.filter((f) => !gitSet.has(f)); // list has it, git does not
+  if (missing.length > 0 || extra.length > 0) {
+    throw new PredicateConfigError(
+      "--changed-file list disagrees with the git working tree (fail-closed): " +
+        `${missing.length > 0 ? `omitted by the list: ${missing.join(", ")}; ` : ""}` +
+        `${extra.length > 0 ? `not present in git: ${extra.join(", ")}` : ""}`.trim(),
+    );
+  }
+  return explicit;
+}
+
+/**
  * Run the predicate from CLI args. Returns the process exit code and prints
  * `detail` (and offending files for LOUD reasons) to stdout/stderr.
  */
@@ -481,12 +633,15 @@ export function runCli(argv: string[]): number {
     return REASON_EXIT_CODE[PredicateReason.CONFIG_ERROR];
   }
 
+  // FIX #4 — always derive the AUTHORITATIVE changed set from git, and
+  // cross-check any supplied --changed-file list against it (fail-closed on
+  // mismatch) so a leg-omitting list cannot blind the predicate.
   let changedFiles: string[];
   try {
-    changedFiles = args.changedFiles ?? gitChangedFiles();
+    changedFiles = crossCheckChangedFiles(args.changedFiles, gitChangedFiles());
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`CONFIG_ERROR: could not read changed files from git: ${msg}`);
+    console.error(`CONFIG_ERROR: ${msg}`);
     console.log(`reason=${PredicateReason.CONFIG_ERROR}`);
     return REASON_EXIT_CODE[PredicateReason.CONFIG_ERROR];
   }
