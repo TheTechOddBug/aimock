@@ -457,4 +457,70 @@ describe("Journal", () => {
       expect(journal.getFixtureMatchCount(fixture, "t-9999")).toBe(1);
     });
   });
+
+  describe("journal body cap (ISL regression)", () => {
+    const BODY_CAP = 64 * 1024; // 64 KB — must match journal.ts constant
+
+    it("replaces oversized bodies with a truncation marker", () => {
+      const journal = new Journal();
+      // Build a body that serializes to well over 64 KB (100 KB of content)
+      const bigContent = "A".repeat(100 * 1024);
+      const entry = journal.add(
+        makeEntry({
+          body: {
+            model: "gpt-4o",
+            messages: [{ role: "user", content: bigContent }],
+          },
+        }),
+      );
+
+      // The stored body must be the truncation marker, not the original
+      const body = entry.body as Record<string, unknown>;
+      expect(body.__aimock_truncated).toBe(true);
+      expect(typeof body.originalByteSize).toBe("number");
+      expect(body.originalByteSize as number).toBeGreaterThan(BODY_CAP);
+      expect(typeof body.note).toBe("string");
+    });
+
+    it("retains bodies that are within the 64 KB cap", () => {
+      const journal = new Journal();
+      const smallBody = {
+        model: "gpt-4o",
+        messages: [{ role: "user" as const, content: "hello" }],
+      };
+      const entry = journal.add(makeEntry({ body: smallBody }));
+
+      // Small body must be stored as-is (no truncation marker)
+      expect((entry.body as Record<string, unknown>).__aimock_truncated).toBeUndefined();
+      expect(entry.body).toEqual(smallBody);
+    });
+
+    it("JSON.stringify(journal.getAll()) does not throw with 1000 large-body entries", () => {
+      // Regression anchor for RangeError: Invalid string length (ISL).
+      // 1000 entries × 100 KB body each = 100 MB without cap → exceeds V8 limit.
+      // With cap, each entry stores only the ~200-byte marker → <1 MB total.
+      const journal = new Journal({ maxEntries: 1000 });
+      const bigContent = "B".repeat(100 * 1024);
+      for (let i = 0; i < 1000; i++) {
+        journal.add(
+          makeEntry({
+            body: {
+              model: "gpt-4o",
+              messages: [{ role: "user", content: bigContent }],
+            },
+          }),
+        );
+      }
+
+      expect(journal.size).toBe(1000);
+      // This must not throw RangeError: Invalid string length
+      let serialized: string;
+      expect(() => {
+        serialized = JSON.stringify(journal.getAll());
+      }).not.toThrow();
+      // Sanity-check: valid JSON, 1000 entries
+      const parsed = JSON.parse(serialized!) as unknown[];
+      expect(parsed).toHaveLength(1000);
+    });
+  });
 });
