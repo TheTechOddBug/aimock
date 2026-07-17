@@ -1,7 +1,45 @@
 import { generateId } from "./helpers.js";
-import type { Fixture, FixtureMatch, JournalEntry } from "./types.js";
+import type { ChatCompletionRequest, Fixture, FixtureMatch, JournalEntry } from "./types.js";
 import { DEFAULT_TEST_ID } from "./constants.js";
 export { DEFAULT_TEST_ID } from "./constants.js";
+
+/**
+ * Maximum UTF-8 byte length of a serialized request body retained in a
+ * journal entry. Bodies whose JSON serialization exceeds this byte size are
+ * replaced with a truncation marker.
+ *
+ * Only the request `body` field is capped here. `headers` and `path` are
+ * retained uncapped, but they are naturally bounded by Node's default ~16 KB
+ * maximum HTTP header size, so the per-entry overhead beyond the body cap
+ * remains small. Combined with the journal's maxEntries limit (default 1000),
+ * the total `JSON.stringify(journal.getAll())` output stays well under V8's
+ * ~512 MB string limit even at maximum capacity.
+ */
+const JOURNAL_BODY_CAP_BYTES = 64 * 1024; // 64 KB
+
+/**
+ * If `body` serializes to more than JOURNAL_BODY_CAP_BYTES (in UTF-8 bytes),
+ * replace it with a truncation marker. Returns the original body when within
+ * the cap, or null when `body` is null.
+ *
+ * The gate uses Buffer.byteLength (UTF-8 bytes) rather than .length (UTF-16
+ * code units) to match the constant name and to correctly cap multibyte
+ * content (e.g. CJK/emoji) whose code-unit count falls under the threshold
+ * but whose byte size does not.
+ */
+function capBody(body: ChatCompletionRequest | null): ChatCompletionRequest | null {
+  if (body === null) return null;
+  const serialized = JSON.stringify(body);
+  if (Buffer.byteLength(serialized, "utf8") <= JOURNAL_BODY_CAP_BYTES) return body;
+  // Cast: the marker is not a real ChatCompletionRequest, but the field type
+  // is already nullable-union and downstream consumers (e.g. GET /journal)
+  // treat the body as opaque JSON — the truncation marker is safe to store.
+  return {
+    __aimock_truncated: true,
+    originalByteSize: Buffer.byteLength(serialized, "utf8"),
+    note: "body truncated by aimock journal cap (64 KB limit)",
+  } as unknown as ChatCompletionRequest;
+}
 
 /**
  * Compare two field values, handling RegExp by source+flags rather than reference.
@@ -101,6 +139,7 @@ export class Journal {
       id: generateId("req"),
       timestamp: Date.now(),
       ...entry,
+      body: capBody(entry.body),
     };
     this.entries.push(full);
     // FIFO eviction when over capacity. Array.prototype.shift() is O(n)

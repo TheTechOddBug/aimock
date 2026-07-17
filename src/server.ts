@@ -1227,7 +1227,10 @@ export async function createServer(
     // Delegate to async handler — catch unhandled rejections to prevent Node.js crashes
     handleHttpRequest(req, res).catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : "Internal error";
-      defaults.logger.warn(`Unhandled request error: ${msg}`);
+      const stack = err instanceof Error ? (err.stack ?? msg) : msg;
+      const method = req.method ?? "?";
+      const url = req.url ?? "?";
+      defaults.logger.warn(`Unhandled request error on ${method} ${url}: ${msg}\n${stack}`);
       if (!res.headersSent) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: { message: msg, type: "server_error" } }));
