@@ -1171,6 +1171,32 @@ describe("createPr version-bump fail-closed (WS-8)", () => {
     expect(pushed).toBe(false);
     expect(openedPr).toBe(false);
   });
+
+  it("exits GIT_PUSH_FAILED (20) with a named reason and opens NO PR when `git push` throws", () => {
+    // slot2-F12 lock: a git push failure after the local commits must fail
+    // CLOSED (no PR) AND emit a NAMED reason — historically it reached the
+    // top-level catch as a blank-reason exit 3.
+    mockedExecSync.mockImplementation(onlyHelpersChanged as never);
+    mockedExecFileSync.mockImplementation((file: unknown, args: unknown) => {
+      if (file === "git" && Array.isArray(args) && (args as string[]).includes("push")) {
+        throw new Error("simulated git push failure (auth/network)");
+      }
+      return Buffer.from("") as unknown as void;
+    });
+
+    expect(() => createPr(rep, { report: { timestamp: "t", entries: [] }, exitCode: 0 })).toThrow(
+      /__exit__20/,
+    );
+
+    // Named, fail-closed reason (not blank) for the workflow's failure alert.
+    expect(stdoutLines()).toContain("reason=git-push-failed");
+
+    // No PR opened — push failed before `gh pr create`.
+    const openedPr = mockedExecFileSync.mock.calls.some(
+      (c) => c[0] === "gh" && Array.isArray(c[1]) && (c[1] as string[]).includes("pr"),
+    );
+    expect(openedPr).toBe(false);
+  });
 });
 
 describe("affectedSkillSections", () => {

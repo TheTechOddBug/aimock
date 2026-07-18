@@ -136,6 +136,23 @@ export enum PredicateReason {
    * needs-human reason.
    */
   VERSION_BUMP_FAILED = "version-bump-failed",
+  /**
+   * The `--post-fix-*` arguments were present but could not be parsed/read
+   * while opening a drift-fix PR (e.g. an empty/non-integer `--post-fix-exit`
+   * from a skipped recollect, or an unreadable post-fix report). fix-drift.ts
+   * already fails CLOSED on this (no PR), but the throw historically reached the
+   * top-level catch with a BLANK `reason=`; this names the cause so the Slack
+   * alert is not blank. Surfaced by fix-drift.ts's main(), never the predicate.
+   */
+  POST_FIX_PARSE_ERROR = "post-fix-parse-error",
+  /**
+   * A git operation (checkout / add / commit / push) failed while opening a
+   * drift-fix PR. This fails CLOSED (no PR is opened — the push never completed,
+   * so no partial/unversioned PR ships) but historically alerted with a BLANK
+   * `reason=`; this names the cause. Surfaced by fix-drift.ts's createPr, never
+   * the predicate.
+   */
+  GIT_PUSH_FAILED = "git-push-failed",
 }
 
 /** Stable exit code for each reason (see module header). */
@@ -151,6 +168,8 @@ export const REASON_EXIT_CODE: Record<PredicateReason, number> = {
   [PredicateReason.PRODUCTION_CHANGE_OFF_TARGET]: 16,
   [PredicateReason.CONFIG_ERROR]: 2,
   [PredicateReason.VERSION_BUMP_FAILED]: 18,
+  [PredicateReason.POST_FIX_PARSE_ERROR]: 19,
+  [PredicateReason.GIT_PUSH_FAILED]: 20,
 };
 
 export interface PredicateInputs {

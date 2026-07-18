@@ -202,3 +202,51 @@ describe("fix-drift.yml — WS-8: version-bump-failed reason wiring", () => {
     expect(wfFlat).toContain("reason=${PR_REASON}");
   });
 });
+
+// ---------------------------------------------------------------------------
+// slot2-F3 — QUARANTINE must FAIL THE JOB (non-green), not just Slack-ping.
+// A human watching CI status (not Slack) must see quarantine as a failure, like
+// the collector-crash / autofix-failure alerts. Because quarantine sets
+// check.outputs.skip == 'true', the fix-failure alert (needs skip != 'true')
+// and the catch-all (needs skip == '') are both disjoint from it, so making the
+// quarantine step exit 1 does NOT double-alert.
+// ---------------------------------------------------------------------------
+describe("fix-drift.yml — slot2-F3: quarantine fails the job (non-green)", () => {
+  it("the quarantine alert step exits non-zero on the happy (webhook-sent) path too", () => {
+    const idx = wf.indexOf("Alert on drift quarantine");
+    expect(idx).toBeGreaterThan(-1);
+    // The step body runs until the next `- name:` step.
+    const nextStep = wf.indexOf("\n      - name:", idx + 1);
+    const stepBlock = wf.slice(idx, nextStep === -1 ? undefined : nextStep);
+    // The curl (happy path) must be FOLLOWED by an `exit 1` — the step is not
+    // allowed to end green after sending the Slack ping.
+    const curlIdx = stepBlock.lastIndexOf("curl -fsS");
+    expect(curlIdx).toBeGreaterThan(-1);
+    expect(stepBlock.slice(curlIdx)).toMatch(/\n\s*exit 1\b/);
+  });
+
+  it("does not overlap the fix-failure alert or the catch-all (both disjoint from quarantine's skip=='true')", () => {
+    // fix-failure requires skip != 'true'; catch-all requires skip == '';
+    // quarantine sets skip == 'true' — so neither fires alongside it.
+    expect(wf).toContain("steps.check.outputs.skip != 'true'"); // fix-failure guard
+    const catchAllIdx = wf.indexOf("Alert on early-infra failure (catch-all)");
+    expect(wf.slice(catchAllIdx, catchAllIdx + 600)).toContain("steps.check.outputs.skip == ''");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// slot2-F7/F12 — the fail-closed parse/git paths must be NAMED in the failure
+// alert (post-fix-parse-error / git-push-failed), not blank. The code emits the
+// reason; the workflow's case block must translate it to a human DETAIL.
+// ---------------------------------------------------------------------------
+describe("fix-drift.yml — slot2-F7/F12: fail-closed reasons are named in the alert", () => {
+  it("the fix-failure alert names the post-fix-parse-error reason", () => {
+    expect(wf).toContain("post-fix-parse-error)");
+    expect(wfFlat).toMatch(/post-fix-parse-error\) DETAIL=.*Failed closed/);
+  });
+
+  it("the fix-failure alert names the git-push-failed reason", () => {
+    expect(wf).toContain("git-push-failed)");
+    expect(wfFlat).toMatch(/git-push-failed\) DETAIL=.*no PR opened/);
+  });
+});

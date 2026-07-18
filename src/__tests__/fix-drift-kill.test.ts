@@ -17,7 +17,7 @@
  */
 import { spawn } from "node:child_process";
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 /** Real subprocess spin-up + grace windows need more than the default budget. */
 const SUBPROC_TIMEOUT = 15000;
@@ -78,6 +78,37 @@ describe("killProcessGroup", () => {
     expect(killProcessGroup(missing, "SIGTERM")).toBe(false);
   });
 
+  it("does NOT silently treat EPERM as success — logs a visible warning and attempts a single-PID fallback (slot2-F5)", () => {
+    // EPERM means the group EXISTS but is unkillable by us (re-credentialed /
+    // re-parented child) — it may still be ALIVE burning the budget. It must
+    // NOT be swallowed as a benign "nothing to kill" like ESRCH. Assert we (a)
+    // log a distinct WARNING and (b) attempt the single-PID fallback.
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    let call = 0;
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(((pidArg: number) => {
+      call += 1;
+      if (call === 1) {
+        // First call: group signal (negative pid) → EPERM.
+        expect(pidArg).toBeLessThan(0);
+        const e = new Error("EPERM") as NodeJS.ErrnoException;
+        e.code = "EPERM";
+        throw e;
+      }
+      // Second call: the single-PID fallback (positive pid) succeeds.
+      expect(pidArg).toBeGreaterThan(0);
+      return true;
+    }) as never);
+    try {
+      expect(killProcessGroup(12345, "SIGKILL")).toBe(true); // fallback delivered
+      expect(call).toBe(2); // group attempt + single-PID fallback
+      const warned = errSpy.mock.calls.some((c) => String(c[0]).includes("EPERM"));
+      expect(warned).toBe(true); // distinct, visible EPERM warning — not silent
+    } finally {
+      killSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
   it("re-throws unexpected errors (e.g. EINVAL from a bad signal)", () => {
     const child = spawn("node", ["-e", OBEDIENT_CHILD], { stdio: "ignore", detached: true });
     const pid = child.pid!;
@@ -124,47 +155,80 @@ describe("scheduleEscalatingKill — SIGKILL escalation gated on a REAL exit fla
   );
 
   it(
-    "does NOT SIGKILL when the process has already exited (clean completion reaps without a stray kill)",
+    "does NOT SIGKILL when hasExited() is true — the gate genuinely SKIPS escalation (a SIGTERM-trapping child that WOULD have died to a stray SIGKILL stays alive)",
     { timeout: SUBPROC_TIMEOUT },
     async () => {
-      // Model a child that exited cleanly right after SIGTERM: hasExited() true.
-      const child = spawn("node", ["-e", OBEDIENT_CHILD], { stdio: "ignore", detached: true });
+      // The previous version of this test used an OBEDIENT child and asserted
+      // it was dead — but an obedient child dies from the unconditional SIGTERM
+      // that scheduleEscalatingKill sends FIRST, regardless of whether the
+      // SIGKILL escalation is skipped, so it passed for the WRONG reason (it
+      // could not distinguish "escalation skipped" from "escalation fired").
+      //
+      // Use a WEDGED child that TRAPS SIGTERM instead: the first SIGTERM leaves
+      // it alive, so the ONLY thing that could kill it within the window is the
+      // SIGKILL escalation. With hasExited() forced true, that escalation MUST
+      // be skipped — so the child must remain ALIVE after the grace elapses. If
+      // the has-exited gate regressed to always-escalate (the WS-4 defect), the
+      // group SIGKILL would fire and the child would be DEAD — turning this RED.
+      const child = spawn("node", ["-e", WEDGED_CHILD], { stdio: "ignore", detached: true });
       const pid = child.pid!;
+      await sleep(300);
+      expect(isAlive(pid)).toBe(true);
+
       const timer = scheduleEscalatingKill(pid, () => true, 100);
-      await sleep(250);
-      // The obedient child exited on SIGTERM; the escalation must have SKIPPED
-      // SIGKILL (hasExited() === true).
-      await sleep(200);
-      expect(isAlive(pid)).toBe(false);
+      // Wait well past the grace window: the escalation callback has run (and,
+      // gated on hasExited()===true, SKIPPED the SIGKILL).
+      await sleep(400);
+      // Wedged child trapped the SIGTERM and no SIGKILL was sent → STILL ALIVE.
+      expect(isAlive(pid)).toBe(true);
+
+      // The grace timer must have already fired-and-skipped (not still pending):
+      // clearing it now is a no-op, and no LATE SIGKILL can arrive after this.
       clearTimeout(timer);
+      await sleep(200);
+      expect(isAlive(pid)).toBe(true); // no late kill
+
+      // Clean up the still-alive wedged group.
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        /* best effort */
+      }
+      await sleep(300);
+      expect(isAlive(pid)).toBe(false);
     },
   );
 
   it(
-    "the OLD `!child.killed` guard would NOT have fired SIGKILL — regression contrast (RED demonstration)",
+    "the returned grace timer, once cleared before it fires, delivers NO late SIGKILL to a still-running group",
     { timeout: SUBPROC_TIMEOUT },
     async () => {
-      // This test documents the ORIGINAL defect against a real subprocess: the
-      // old code gated SIGKILL on `!child.killed`, which is false immediately
-      // after SIGTERM delivery, so a SIGTERM-trapping child SURVIVES.
-      const child = spawn("node", ["-e", WEDGED_CHILD], { stdio: "ignore" });
+      // Locks the caller-side lifecycle used by invokeClaudeCode's `close`
+      // handler: on a clean early exit the caller clears the returned timer, and
+      // a pending SIGKILL escalation must NOT fire late against a (possibly
+      // reused) PID. Here the child is still running and hasExited() would be
+      // false, so ONLY a fired escalation could kill it — we clear the timer
+      // BEFORE the grace elapses and assert the child survives.
+      const child = spawn("node", ["-e", WEDGED_CHILD], { stdio: "ignore", detached: true });
       const pid = child.pid!;
       await sleep(300);
-      child.kill("SIGTERM"); // old: signal the child pid directly
-      await sleep(150);
-      // Node flips child.killed true on delivery — the old guard is dead code.
-      expect(child.killed).toBe(true);
-      const oldGuardWouldFireSigkill = !child.killed;
-      expect(oldGuardWouldFireSigkill).toBe(false);
-      // Consequently the wedged process is STILL ALIVE under the old logic.
-      await sleep(200);
       expect(isAlive(pid)).toBe(true);
 
-      // Clean up: this child was spawned NON-detached (to mirror the old code
-      // exactly), so it is not its own group leader — kill it by pid directly.
-      // SIGKILL cannot be trapped, so the wedged child dies.
-      process.kill(pid, "SIGKILL");
-      await sleep(400);
+      // Long grace so we can cancel before it fires. hasExited stays false.
+      const timer = scheduleEscalatingKill(pid, () => false, 5000);
+      // The initial SIGTERM is trapped; child alive. Cancel before the grace.
+      await sleep(100);
+      clearTimeout(timer);
+      // Well past what the grace would have been — no SIGKILL arrives.
+      await sleep(300);
+      expect(isAlive(pid)).toBe(true);
+
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch {
+        /* best effort */
+      }
+      await sleep(300);
       expect(isAlive(pid)).toBe(false);
     },
   );

@@ -468,6 +468,13 @@ jobs:
           curl -fsS --show-error -X POST "$SLACK_WEBHOOK" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD"
+          # Quarantine is a needs-human outcome — FAIL the job so a human
+          # watching CI status (not just Slack) sees it (matching the
+          # collector-crash / autofix-failure alerts which also exit 1). The
+          # other alert steps are mutually exclusive with quarantine (fix-failure
+          # requires skip != 'true'; catch-all requires skip == ''; both false on
+          # quarantine where skip == 'true'), so this does not double-alert.
+          exit 1
 
       # Slack notification on success. The drift path NEVER auto-merges (see the
       # "NO AUTO-MERGE" comment above): a passing predicate opens a PR that a
@@ -526,6 +533,8 @@ jobs:
             collector-infra)      DETAIL=" (NEEDS HUMAN: post-fix collector infra failure — cannot trust a clean signal)";;
             production-change-off-target) DETAIL=" (NEEDS HUMAN: production change did not touch any file the drift report named as a fix target — may be a legit shared-helper fix)";;
             version-bump-failed)  DETAIL=" (NEEDS HUMAN: the version bump / CHANGELOG step failed — refused to open an UNVERSIONED PR that would merge a fix which never publishes a release. See run logs)";;
+            post-fix-parse-error) DETAIL=" (NEEDS HUMAN: the post-fix collector result could not be parsed/read — empty/non-integer --post-fix-exit (e.g. a skipped recollect) or an unreadable post-fix report. Failed closed: no PR opened. See run logs)";;
+            git-push-failed)      DETAIL=" (NEEDS HUMAN: a git checkout/add/commit/push failed while opening the PR — failed closed, no PR opened. See run logs)";;
             config-error)         DETAIL=" (drift-success predicate CONFIG error — missing/unreadable report or bad args; the gate itself needs attention)";;
             *)                  DETAIL="";;
           esac
