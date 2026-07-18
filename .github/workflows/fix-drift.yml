@@ -159,6 +159,15 @@ jobs:
           echo "Pinned pre-fix drift report to $PINNED_REPORT (outside the LLM-writable repo checkout)"
 
       # Step 3: Invoke Claude Code to fix
+      #
+      # --report reads the PINNED pre-fix report (Step 2b), NOT the default
+      # in-repo `drift-report.json`. The collector writes its report to
+      # $RUNNER_TEMP (Step 1, FIX #F3), which is OUTSIDE the repo checkout, so
+      # the repo-root `drift-report.json` that fix-drift.ts defaults to does not
+      # exist — without this flag readDriftReport throws "Drift report not
+      # found" and the fixer never runs. Reading the pinned copy (same source
+      # the Assert and Create PR steps read) also keeps the fixer's view of the
+      # drift consistent with the downstream integrity gate.
       - name: Auto-fix drift
         id: autofix
         if: steps.check.outputs.skip != 'true'
@@ -167,7 +176,8 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-        run: npx tsx scripts/fix-drift.ts
+          PINNED_REPORT: ${{ runner.temp }}/drift-report.pinned.json
+        run: npx tsx scripts/fix-drift.ts --report "${PINNED_REPORT}"
 
       # Upload Claude Code output for debugging
       - name: Upload Claude Code logs

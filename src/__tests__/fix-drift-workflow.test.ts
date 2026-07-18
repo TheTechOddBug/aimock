@@ -98,6 +98,39 @@ describe("fix-drift.yml — F-A: PRE-fix report pinned outside the LLM-writable 
 });
 
 // ---------------------------------------------------------------------------
+// report-path — the Auto-fix step must pass --report from the PINNED copy.
+//
+// FIX #F3 moved the collector's report to $RUNNER_TEMP (outside the repo
+// checkout), so the repo-root drift-report.json that fix-drift.ts defaults to no
+// longer exists. The Assert and Create-PR steps were updated to read --report
+// from the pinned copy, but the Auto-fix step still ran `fix-drift.ts` with NO
+// --report, so it fell back to the missing repo-root path and died with "Drift
+// report not found" (readDriftReport) — the recurring drift-job failure. These
+// lock that the Auto-fix step reads --report from the pinned copy, matching the
+// downstream integrity gate.
+// ---------------------------------------------------------------------------
+describe("fix-drift.yml — report-path: Auto-fix step reads --report from the pinned copy", () => {
+  it("passes --report from the PINNED copy into the Auto-fix `fix-drift.ts` invocation", () => {
+    expect(wfFlat).toMatch(/scripts\/fix-drift\.ts --report "\$\{PINNED_REPORT\}"/);
+  });
+
+  it("does NOT run the Auto-fix step against the default (missing) repo-root drift-report.json", () => {
+    // The bare `npx tsx scripts/fix-drift.ts` (no --report) is the regression:
+    // it defaults to the repo-root drift-report.json which FIX #F3 no longer
+    // writes. Ensure the autofix invocation always carries a --report flag.
+    expect(wfFlat).not.toMatch(/npx tsx scripts\/fix-drift\.ts(?! --)/);
+  });
+
+  it("exposes PINNED_REPORT as an env in the Auto-fix step", () => {
+    const idx = wf.indexOf("name: Auto-fix drift");
+    expect(idx).toBeGreaterThan(-1);
+    const nextStep = wf.indexOf("\n      - name:", idx + 1);
+    const stepBlock = wf.slice(idx, nextStep === -1 ? undefined : nextStep);
+    expect(stepBlock).toContain("PINNED_REPORT: ${{ runner.temp }}/drift-report.pinned.json");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // FIX (round-4, user-approved) — HUMAN-APPROVAL BACKSTOP. The drift path opens a
 // PR but must NEVER auto-merge: the predicate is a strong AUTO-FILTER, not a
 // provable merge gate (the re-collect is not independent of the fix — WS-2b), so
