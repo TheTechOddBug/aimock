@@ -636,9 +636,9 @@
           <code>inputText</code>), the normalized model becomes <code>model</code>, and for chat
           requests the recorder also writes the multi-turn disambiguators
           <code>turnIndex</code> (the number of assistant messages already in the conversation) and
-          <code>hasToolResult</code> (whether a tool-result message is present). If no match
-          criteria can be derived (e.g., empty messages), the fixture is saved to disk with a
-          warning but not registered in memory.
+          <code>hasToolResult</code> (whether the current turn &mdash; the messages after the last
+          user message &mdash; contains a tool result). If no match criteria can be derived (e.g.,
+          empty messages), the fixture is saved to disk with a warning but not registered in memory.
         </p>
 
         <h2 id="model-aware-recording">Model-Aware Recording</h2>
@@ -1040,11 +1040,11 @@ await mock.start();</code></pre>
           <strong>last user message</strong> (<code>match.userMessage</code>), the normalized
           <code>model</code>, and two shape disambiguators read off the request itself:
           <code>turnIndex</code> (how many assistant messages the conversation already contains) and
-          <code>hasToolResult</code> (whether a tool-result message is present). Embedding requests
-          key on the input text instead. There is no history-based fingerprinting of the full
-          request body &mdash; but because a growing conversation carries a growing
-          <code>turnIndex</code>, successive turns that happen to end with the same user message
-          still record as <em>distinct</em> fixtures.
+          <code>hasToolResult</code> (whether the current turn &mdash; the messages after the last
+          user message &mdash; contains a tool result). Embedding requests key on the input text
+          instead. There is no history-based fingerprinting of the full request body &mdash; but
+          because a growing conversation carries a growing <code>turnIndex</code>, successive turns
+          that happen to end with the same user message still record as <em>distinct</em> fixtures.
         </p>
 
         <div class="code-block">
@@ -1063,7 +1063,9 @@ await mock.start();</code></pre>
     <span class="prop">userMessage</span>: <span class="fn">getTextContent</span>(lastUser.content),
     <span class="prop">model</span>: <span class="fn">normalizeModelName</span>(request.model),
     <span class="prop">turnIndex</span>: request.messages.filter((m) => m.role === <span class="str">"assistant"</span>).length,
-    <span class="prop">hasToolResult</span>: request.messages.some((m) => m.role === <span class="str">"tool"</span>),
+    <span class="cm">// Scoped to the current turn (messages after the last user message), so it</span>
+    <span class="cm">// shares the exact predicate the matcher uses &mdash; see router.ts.</span>
+    <span class="prop">hasToolResult</span>: <span class="fn">currentTurnHasToolResult</span>(request.messages),
   };
   <span class="cm">// Capture context from X-AIMock-Context header if present</span>
   <span class="kw">if</span> (request._context) match.<span class="prop">context</span> = request._context;

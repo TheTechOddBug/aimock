@@ -166,8 +166,9 @@
               <td>hasToolResult</td>
               <td>boolean</td>
               <td>
-                <code>true</code> when at least one <code>role: "tool"</code> message is present;
-                <code>false</code> when none are. Stateless alternative to ordering fixtures by
+                <code>true</code> when the current turn (the messages after the last
+                <code>role: "user"</code> message) contains a <code>role: "tool"</code> result;
+                <code>false</code> when it does not. Stateless alternative to ordering fixtures by
                 <code>toolCallId</code>. See <a href="/multi-turn">Multi-Turn Conversations</a>
               </td>
             </tr>
