@@ -90,7 +90,8 @@
         </p>
 
         <p>
-          Two additional fields inspect the <em>full</em> message array rather than just the tail:
+          Two additional fields derive their value from the request shape rather than from a single
+          tail message:
         </p>
         <ul>
           <li>
@@ -100,9 +101,16 @@
             entirely from the request content, not from a server-side counter.
           </li>
           <li>
-            <code>hasToolResult</code> checks whether <em>any</em> <code>role: "tool"</code> message
-            exists in the request. <code>true</code> means &ldquo;this request carries tool
-            results&rdquo;; <code>false</code> means &ldquo;no tools have executed yet.&rdquo;
+            <code>hasToolResult</code> checks whether the <strong>current turn</strong> &mdash; the
+            messages after the last <code>role: "user"</code> message &mdash; contains a
+            <code>role: "tool"</code> result. <code>true</code> means &ldquo;a tool has executed in
+            this turn&rdquo;; <code>false</code> means &ldquo;no tool result yet this turn.&rdquo; It
+            is scoped to the current turn, not the whole conversation &mdash; that is what keeps the
+            leg-1 tool-call fixture (<code>false</code>) and the leg-2 narration fixture
+            (<code>true</code>) working on <em>every</em> turn of a multi-turn session, because
+            earlier turns&rsquo; tool results no longer force <code>true</code> forever. (If the
+            request carries no <code>user</code> message at all, it falls back to scanning the whole
+            conversation.)
           </li>
         </ul>
 
@@ -166,9 +174,9 @@
 
         <h3>hasToolResult &mdash; match by tool execution state</h3>
         <p>
-          <code>hasToolResult</code> checks whether the request contains any
-          <code>role: "tool"</code> messages. For a simple two-step tool round, this is often
-          simpler than <code>turnIndex</code>:
+          <code>hasToolResult</code> checks whether the <em>current turn</em> (the messages after
+          the last <code>role: "user"</code> message) contains a <code>role: "tool"</code> result.
+          For a simple two-step tool round, this is often simpler than <code>turnIndex</code>:
         </p>
 
         <div class="code-block">
@@ -365,8 +373,8 @@
               </td>
               <td><code>hasToolResult</code></td>
               <td>
-                Boolean check for <code>role: "tool"</code> presence. Stateless. Does not require
-                pinning a specific <code>tool_call_id</code>.
+                Boolean check for <code>role: "tool"</code> presence in the current turn. Stateless.
+                Does not require pinning a specific <code>tool_call_id</code>.
               </td>
             </tr>
             <tr>
