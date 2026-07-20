@@ -107,6 +107,14 @@ export interface FixtureMatch {
   /** Which occurrence of this match to respond to (0-indexed). Undefined means match any. */
   sequenceIndex?: number;
   turnIndex?: number;
+  /**
+   * Turn-scoped tool-result presence gate: matches on whether the CURRENT turn
+   * (the messages after the last `role: "user"` message) contains a `role: "tool"`
+   * message. Scoping to the current turn — rather than the whole conversation —
+   * lets a leg-1 (`false`) / leg-2 (`true`) fixture pair keep discriminating on
+   * later turns whose history still carries earlier turns' tool results. If the
+   * request has no user message, it falls back to scanning the whole conversation.
+   */
   hasToolResult?: boolean;
   endpoint?:
     | "chat"
@@ -559,6 +567,13 @@ export interface FixtureFileEntry {
     responseFormat?: string;
     sequenceIndex?: number;
     turnIndex?: number;
+    /**
+     * Turn-scoped tool-result presence gate: matches on whether the CURRENT turn
+     * (the messages after the last `role: "user"` message) contains a `role: "tool"`
+     * message, not the whole conversation. Falls back to scanning the whole
+     * conversation when the request has no user message. Mirrors the runtime
+     * `FixtureMatch.hasToolResult`.
+     */
     hasToolResult?: boolean;
     endpoint?:
       | "chat"

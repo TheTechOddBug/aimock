@@ -1,5 +1,18 @@
 # @copilotkit/aimock
 
+## [1.37.4] - 2026-07-20
+
+### Fixed
+
+- `hasToolResult` record and replay are symmetric again: both the recorder (`buildFixtureMatch`) and the matcher (`matchFixtureDiagnostic`) now derive the value from one shared `currentTurnHasToolResult` helper. The recorder previously STAMPED the value with a whole-conversation `messages.some((m) => m.role === "tool")` while the matcher (as of 1.37.3) CHECKS it scoped to the current turn, so a genuinely-recorded multi-turn fixture (a fresh user turn whose history still carried an earlier turn's tool result) was stamped `true` but matched `false` and could never replay its own recorded request. Sharing one predicate makes the two sides structurally unable to drift (#319)
+- Anthropic `tool_result` blocks bundled WITH accompanying text in a single user message now normalize with the text message BEFORE the tool message (`[..., user(text), tool]`), so a leg-2-with-text turn is correctly classified as carrying a tool result. Previously the tool message was emitted first (`[..., tool, user(text)]`), which is byte-identical to a fresh leg-1 turn and was misclassified `false`. The common `tool_result`-only follow-up (no text) is unaffected (#319)
+
+## [1.37.3] - 2026-07-20
+
+### Changed
+
+- **Behavior change:** the `hasToolResult` match predicate is now scoped to the CURRENT turn (messages after the last `role: "user"` message) instead of the whole conversation. This lets a leg-1 (`false`) / leg-2 (`true`) fixture pair keep discriminating across multi-turn sessions, where the request on the 2nd+ user turn still carries earlier turns' tool results and a whole-conversation check would pin `hasToolResult` to `true` forever. Migration: any fixture that relied on `hasToolResult: true` meaning "a tool result appears anywhere in the conversation" (e.g. a multi-turn fixture that previously stuck on `true` once the first tool ran) will now only match on the turn that actually carries the tool result; a request with no `role: "user"` message still falls back to the whole-conversation scan (#316)
+
 ## [1.37.2] - 2026-07-17
 
 ### Fixed
