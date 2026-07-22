@@ -70,7 +70,10 @@ jobs:
       - name: Provision Ollama daemon (live drift leg)
         run: |
           set -euo pipefail
-          curl -fsSL https://ollama.com/install.sh | sh
+          # Download the installer to disk first, then execute it — avoids piping
+          # a remote, mutable script straight into a shell (no `curl | sh`).
+          curl -fsSL https://ollama.com/install.sh -o "${RUNNER_TEMP}/ollama-install.sh"
+          sh "${RUNNER_TEMP}/ollama-install.sh"
           ollama serve > /tmp/ollama-serve.log 2>&1 &
           for _ in $(seq 1 30); do
             if curl -sf http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
