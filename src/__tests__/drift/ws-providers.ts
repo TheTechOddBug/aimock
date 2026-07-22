@@ -200,10 +200,19 @@ export function connectTLSWebSocket(
                     settled = true;
                     removeResolver();
                     const types = collected.map((m: any) => m?.type ?? "unknown").join(", ");
+                    // Surface collected message bodies (truncated) so an early
+                    // `error` event's code/message is visible in CI logs rather
+                    // than swallowed behind the bare type list.
+                    let bodies = "";
+                    try {
+                      bodies = ` bodies=${JSON.stringify(collected).slice(0, 800)}`;
+                    } catch {
+                      /* non-serializable payload; type list is enough */
+                    }
                     reject(
                       new Error(
                         `waitUntil timeout after ${timeoutMs}ms. ` +
-                          `Collected ${collected.length} messages: [${types}]`,
+                          `Collected ${collected.length} messages: [${types}]${bodies}`,
                       ),
                     );
                   }
