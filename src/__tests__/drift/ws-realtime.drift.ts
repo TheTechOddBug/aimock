@@ -2,7 +2,7 @@
  * OpenAI Realtime API WebSocket drift tests.
  *
  * Three-way comparison: SDK types x real API (WS) x aimock output (WS).
- * Updated for GA protocol — uses gpt-realtime-2 and GA event names.
+ * Updated for GA protocol — uses gpt-realtime-mini and GA event names.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";

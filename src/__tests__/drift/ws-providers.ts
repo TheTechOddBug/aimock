@@ -355,7 +355,7 @@ export async function openaiRealtimeWS(
   }
   const ws = await connectTLSWebSocket(
     "api.openai.com",
-    "/v1/realtime?model=gpt-4o-mini-realtime-preview",
+    "/v1/realtime?model=gpt-realtime-mini",
     headers,
   );
 
@@ -364,7 +364,7 @@ export async function openaiRealtimeWS(
 
   // Step 2: Send session.update
   const session: Record<string, unknown> = {
-    model: "gpt-4o-mini-realtime-preview",
+    model: "gpt-realtime-mini",
     modalities: ["text"],
   };
   if (tools) session.tools = tools;
