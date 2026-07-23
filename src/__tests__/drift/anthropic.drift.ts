@@ -5,7 +5,7 @@
  */
 
 import http from "node:http";
-import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import type { ServerInstance } from "../../server.js";
 import { extractShape, triangulate, compareSSESequences, formatDriftReport } from "./schema.js";
 import {
@@ -352,6 +352,48 @@ describe.skipIf(!ANTHROPIC_API_KEY)("Anthropic Claude Messages drift", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Regression guard for the drift-live-pr exit-5 quarantine (cross-block memo
+// pollution).
+// ---------------------------------------------------------------------------
+//
+// When ANTHROPIC_API_KEY is armed in CI, the live block above runs FIRST and
+// populates `resolveLiveModel`'s per-key memo under "anthropic" with the real
+// resolved id — and, exactly like the real live block, has no afterEach cache
+// reset. This block SIMULATES that seeding with no credentials (a stubbed
+// listing exposing the still-live `claude-haiku-4-5-20251001`) so the fixture
+// self-healing block below is proven to reset the shared memo BEFORE it runs.
+//
+// Without that reset, the fixture block's first test read the leaked live id
+// and asserted a raw `.toBe()` on model ids — an unparseable AssertionError
+// (`expected 'claude-haiku-4-5-20251001' to be 'claude-haiku-5-1-20260201'`)
+// that the drift collector could not parse as a structured report and
+// quarantined as a fatal exit 5 (the drift-live-pr failure). Declared
+// immediately before the fixture block so declaration order (vitest runs
+// in-file tests in order; no shuffle configured) reproduces the CI sequence.
+describe("Anthropic live-leg memo seeding (simulates the armed-key live block running first)", () => {
+  it("populates the shared resolveLiveModel memo under 'anthropic' (no reset — mirrors the live block)", async () => {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL) => {
+      if (String(url).includes("/v1/models")) {
+        return new Response(JSON.stringify({ data: [{ id: "claude-haiku-4-5-20251001" }] }), {
+          status: 200,
+        });
+      }
+      throw new Error(`Unexpected fetch in seeding test: ${String(url)}`);
+    }) as typeof fetch;
+    try {
+      // The live leg resolves and MEMOIZES the still-live real id under
+      // "anthropic". Intentionally NOT cleared here — the fixture block below
+      // must be the thing that resets it.
+      const resolved = await getAnthropicModel();
+      expect(resolved).toEqual({ model: "claude-haiku-4-5-20251001" });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Self-healing proof (fixture-driven — no live credentials required)
 // ---------------------------------------------------------------------------
 //
@@ -372,6 +414,14 @@ describe.skipIf(!ANTHROPIC_API_KEY)("Anthropic Claude Messages drift", () => {
 //   discovered id succeeds, and shape-grading reports zero critical drift.
 describe("Anthropic live-leg self-healing (fixture-driven, no credentials required)", () => {
   const origFetch = globalThis.fetch;
+  // Reset the shared per-key `resolveLiveModel` memo BEFORE each case, not only
+  // after. The live block (and the seeding guard) above run first and leave the
+  // "anthropic" key memoized with a real/still-live id; without this the first
+  // fixture case would resolve to that leaked id instead of its own stub and
+  // fail a raw `.toBe()` on model ids (the drift-live-pr exit-5 quarantine).
+  beforeEach(() => {
+    __resetResolveLiveModelCache();
+  });
   afterEach(() => {
     globalThis.fetch = origFetch;
     __resetResolveLiveModelCache();
