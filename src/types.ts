@@ -43,6 +43,29 @@ export interface ChatCompletionRequest {
   model: string;
   messages: ChatMessage[];
   stream?: boolean;
+  /**
+   * OpenRouter fallback model list. When present (and the request arrived on
+   * the OpenRouter `/api/v1/...` base), the candidate list `[model, ...models]`
+   * is attempted in order and the first NON-error fixture match wins — the
+   * winning slug is echoed back as the response `model`. Purely additive: a
+   * request without `models` behaves as a single-model match. Every other
+   * OpenRouter request extension (`provider`, `route`, `reasoning`, `plugins`,
+   * `prediction`, `usage`, and any unknown key) is accepted and journaled via
+   * the index signature below — never required, never rejected. aimock does not
+   * model those sub-shapes; unknown body keys pass straight through.
+   */
+  models?: string[];
+  /**
+   * OpenRouter provider-routing preferences. Accepted loosely and journaled
+   * verbatim; the ONLY sub-field aimock reads behaviorally is
+   * `allow_fallbacks`. When `allow_fallbacks === false` on an OpenRouter
+   * request, the `models[]` fallback loop is suppressed — only the primary is
+   * tried, and a primary error fixture is served as terminal instead of
+   * falling through (the fail-CLOSED half of the feature). Absent/`true` keeps
+   * the default fall-through behavior. Every other provider-prefs key
+   * (`order`, `only`, `ignore`, `sort`, …) passes straight through unread.
+   */
+  provider?: { allow_fallbacks?: boolean; [key: string]: unknown };
   stream_options?: { include_usage?: boolean; [key: string]: unknown };
   temperature?: number;
   max_tokens?: number;
@@ -164,10 +187,60 @@ export interface ResponseOverrides {
     promptTokenCount?: number;
     candidatesTokenCount?: number;
     totalTokenCount?: number;
+    /**
+     * OpenRouter per-request cost (USD/credits). Fixture-scriptable — powers
+     * budget-guard demos ("assert the guard trips at $5 without spending $5").
+     * Emitted on OpenRouter-shaped responses only, and ONLY when supplied —
+     * `cost`/`cost_details` are nullable and omitted by default (never 0).
+     */
+    cost?: number;
+    /**
+     * OpenRouter cost breakdown. When the response emits `cost_details` at all
+     * it MUST carry all three upstream fields (the canonical `@openrouter/sdk`
+     * throws on a partial object); a fixture may supply any subset and the rest
+     * default to 0. Only emitted when the fixture supplies a `cost`.
+     */
+    cost_details?: {
+      upstream_inference_cost?: number;
+      upstream_inference_prompt_cost?: number;
+      upstream_inference_completions_cost?: number;
+      [key: string]: unknown;
+    };
+    /**
+     * OpenRouter prompt-token breakdown. Emitted ONLY when overridden — the
+     * default response never asserts a fake cache state.
+     */
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+      cache_write_tokens?: number;
+      audio_tokens?: number;
+      [key: string]: unknown;
+    };
+    /**
+     * OpenRouter completion-token breakdown. Emitted ONLY when overridden.
+     */
+    completion_tokens_details?: { reasoning_tokens?: number; [key: string]: unknown };
+    /**
+     * OpenRouter bring-your-own-key flag on the usage object. Emitted ONLY when
+     * overridden (avoids asserting a fake BYOK state by default).
+     */
+    is_byok?: boolean;
   };
   systemFingerprint?: string;
   finishReason?: string;
   role?: string;
+  /**
+   * OpenRouter top-level `provider` override. When omitted, OpenRouter-shaped
+   * responses default it to the author segment of the winning model slug
+   * (`openai/gpt-4o` → `"openai"`). Ignored for OpenAI (`/v1/...`) responses.
+   */
+  provider?: string;
+  /**
+   * OpenRouter `native_finish_reason` override (the raw upstream finish reason).
+   * When omitted, OpenRouter-shaped responses mirror `finish_reason`. Ignored
+   * for OpenAI responses.
+   */
+  nativeFinishReason?: string;
 }
 
 export interface TextResponse extends ResponseOverrides {
@@ -257,7 +330,20 @@ export interface ContentWithToolCallsResponse extends ResponseOverrides {
 }
 
 export interface ErrorResponse {
-  error: { message: string; type?: string; param?: string | null; code?: string };
+  error: {
+    message: string;
+    type?: string;
+    param?: string | null;
+    code?: string;
+    /**
+     * OpenRouter error metadata. Emitted verbatim inside the OpenRouter error
+     * envelope (`{ error: { code, message, metadata } }`) when the request
+     * arrived on the OpenRouter base. Moderation blocks carry
+     * `{ reasons, flagged_input, provider_name, model_slug }` on a 403.
+     * Ignored for OpenAI-shaped error responses.
+     */
+    metadata?: Record<string, unknown>;
+  };
   status?: number;
   /** Override the Retry-After header value on 429 responses. Default: 1. */
   retryAfter?: number;
@@ -436,6 +522,13 @@ export interface Fixture {
   recordedTimings?: RecordedTimings;
   replaySpeed?: number;
   chaos?: ChaosConfig;
+  /**
+   * Opt into OpenRouter's `: OPENROUTER PROCESSING` SSE keepalive comment
+   * lines on this fixture's streamed OpenRouter responses (default OFF).
+   * A faithful client skips `:`-prefixed lines before JSON-parsing; enabling
+   * this exercises that path. No effect on non-streaming or OpenAI responses.
+   */
+  openRouterProcessing?: boolean;
   metadata?: {
     systemHash?: string;
     toolsHash?: string;
@@ -602,6 +695,8 @@ export interface FixtureFileEntry {
   recordedTimings?: RecordedTimings;
   replaySpeed?: number;
   chaos?: ChaosConfig;
+  /** See {@link Fixture.openRouterProcessing}. */
+  openRouterProcessing?: boolean;
   metadata?: {
     systemHash?: string;
     toolsHash?: string;
@@ -644,14 +739,51 @@ export interface JournalEntry {
 
 // SSE chunk types (OpenAI format)
 
+/**
+ * OpenRouter-only additions layered onto a `usage` object when a response is
+ * shaped for the OpenRouter `/api/v1/...` base. `cost`/`cost_details` are
+ * NULLABLE and emitted only when a fixture supplies a cost (default: omitted).
+ * When `cost_details` is emitted it carries all three upstream fields (partial
+ * objects break the canonical SDK). The detail breakdowns and `is_byok` appear
+ * only when a fixture overrides them; an emitted `prompt_tokens_details` always
+ * carries `cached_tokens` and an emitted `completion_tokens_details` always
+ * carries `reasoning_tokens` (required-if-present in the AI SDK provider).
+ */
+export interface OpenRouterUsageExtras {
+  cost?: number;
+  cost_details?: {
+    upstream_inference_cost: number;
+    upstream_inference_prompt_cost: number;
+    upstream_inference_completions_cost: number;
+    [key: string]: unknown;
+  };
+  prompt_tokens_details?: {
+    cached_tokens: number;
+    cache_write_tokens?: number;
+    audio_tokens?: number;
+    [key: string]: unknown;
+  };
+  completion_tokens_details?: { reasoning_tokens: number; [key: string]: unknown };
+  is_byok?: boolean;
+}
+
 export interface SSEChunk {
   id: string;
   object: "chat.completion.chunk";
   created: number;
   model: string;
   choices: SSEChoice[];
-  system_fingerprint?: string;
-  usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+  /** Nullable: OpenRouter shaping emits this on every chunk (null when unset). */
+  system_fingerprint?: string | null;
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  } & OpenRouterUsageExtras;
+  /** OpenRouter top-level provider that served the chunk. OpenRouter shaping only. */
+  provider?: string;
+  /** OpenRouter emits `service_tier: null` on the final (usage-bearing) chunk. Shaping only. */
+  service_tier?: string | null;
 }
 
 export interface SSEChoice {
@@ -659,6 +791,8 @@ export interface SSEChoice {
   delta: SSEDelta;
   logprobs: null;
   finish_reason: string | null;
+  /** OpenRouter raw upstream finish reason, alongside the normalized one. */
+  native_finish_reason?: string | null;
 }
 
 export interface SSEDelta {
@@ -683,8 +817,21 @@ export interface ChatCompletion {
   created: number;
   model: string;
   choices: ChatCompletionChoice[];
-  usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
-  system_fingerprint?: string;
+  usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+  } & OpenRouterUsageExtras;
+  /**
+   * Nullable: OpenRouter shaping always emits this on the non-streaming
+   * response (null when no override) because the canonical `@openrouter/sdk`
+   * requires the field. OpenAI responses omit it unless overridden.
+   */
+  system_fingerprint?: string | null;
+  /** OpenRouter top-level provider that served the request. OpenRouter shaping only. */
+  provider?: string;
+  /** OpenRouter emits `service_tier: null` on the non-streaming response. Shaping only. */
+  service_tier?: string | null;
 }
 
 export interface ChatCompletionChoice {
@@ -692,6 +839,8 @@ export interface ChatCompletionChoice {
   message: ChatCompletionMessage;
   logprobs: null;
   finish_reason: string;
+  /** OpenRouter raw upstream finish reason, alongside the normalized one. */
+  native_finish_reason?: string;
 }
 
 export interface ChatCompletionMessage {
@@ -699,6 +848,12 @@ export interface ChatCompletionMessage {
   content: string | null;
   refusal: string | null;
   reasoning_content?: string;
+  /**
+   * OpenRouter emits `reasoning` (null when absent) on the response message.
+   * OpenRouter shaping mirrors `reasoning_content` here (or null). Omitted for
+   * OpenAI responses.
+   */
+  reasoning?: string | null;
   tool_calls?: ToolCallMessage[];
 }
 

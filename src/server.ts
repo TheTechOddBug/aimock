@@ -21,8 +21,8 @@ import {
   buildContentWithToolCallsChunks,
   buildContentWithToolCallsCompletion,
   buildUsageChunk,
-  estimateTokens,
-  estimatePromptTokens,
+  resolveUsage,
+  resolveFixtureBlocks,
   extractOverrides,
   isTextResponse,
   isToolCallResponse,
@@ -41,6 +41,18 @@ import {
   strictNoMatchLogLine,
   getContext,
 } from "./helpers.js";
+import {
+  isOpenRouterPath,
+  buildOpenRouterCandidates,
+  resolveOpenRouterShaping,
+  shapeOpenRouterCompletion,
+  shapeOpenRouterChunks,
+  serializeOpenRouterError,
+  handleOpenRouterModels,
+  handleOpenRouterKey,
+  handleOpenRouterCredits,
+} from "./openrouter-chat.js";
+import type { FixtureResponse, ChatCompletion, SSEChunk, ResponseOverrides } from "./types.js";
 import { handleResponses } from "./responses.js";
 import { handleMessages } from "./messages.js";
 import { handleGemini } from "./gemini.js";
@@ -491,6 +503,7 @@ async function handleCompletions(
   defaults: HandlerDefaults,
   modelFallback?: string,
   providerKey?: RecordProviderKey,
+  openRouter = false,
 ): Promise<void> {
   setCorsHeaders(res);
 
@@ -510,12 +523,14 @@ async function handleCompletions(
     writeErrorResponse(
       res,
       500,
-      JSON.stringify({
-        error: {
-          message: `Request body read failed: ${msg}`,
-          type: "server_error",
-        },
-      }),
+      openRouter
+        ? serializeOpenRouterError(500, `Request body read failed: ${msg}`)
+        : JSON.stringify({
+            error: {
+              message: `Request body read failed: ${msg}`,
+              type: "server_error",
+            },
+          }),
     );
     return;
   }
@@ -540,14 +555,16 @@ async function handleCompletions(
     writeErrorResponse(
       res,
       400,
-      JSON.stringify({
-        error: {
-          message: `Malformed JSON: ${detail}`,
-          type: "invalid_request_error",
-          param: null,
-          code: "invalid_json",
-        },
-      }),
+      openRouter
+        ? serializeOpenRouterError(400, `Malformed JSON: ${detail}`)
+        : JSON.stringify({
+            error: {
+              message: `Malformed JSON: ${detail}`,
+              type: "invalid_request_error",
+              param: null,
+              code: "invalid_json",
+            },
+          }),
     );
     return;
   }
@@ -564,14 +581,16 @@ async function handleCompletions(
     writeErrorResponse(
       res,
       400,
-      JSON.stringify({
-        error: {
-          message: "Missing required parameter: 'messages'",
-          type: "invalid_request_error",
-          param: null,
-          code: null,
-        },
-      }),
+      openRouter
+        ? serializeOpenRouterError(400, "Missing required parameter: 'messages'")
+        : JSON.stringify({
+            error: {
+              message: "Missing required parameter: 'messages'",
+              type: "invalid_request_error",
+              param: null,
+              code: null,
+            },
+          }),
     );
     return;
   }
@@ -588,20 +607,133 @@ async function handleCompletions(
   // (headers > fixture.chaos > server defaults), so the fixture has to be
   // known before we can roll with the right config.
   const testId = getTestId(req);
-  const { fixture, skippedBySequenceOrTurn } = matchFixtureDiagnostic(
-    fixtures,
-    body,
-    journal.getFixtureMatchCountsForTest(testId),
-    defaults.requestTransform,
+  const matchOptions = recordMatchOptions(
     // In record mode a miss proxies upstream to capture a fresh turn, so an
     // earlier-turn capture must not shadow a longer request via the relaxed
     // turnIndex disambiguator — keep turnIndex a strict gate while recording.
     // This handler's record gate (below) is `defaults.record && providerKey`.
-    recordMatchOptions(!!(defaults.record && providerKey), defaults.logger),
+    !!(defaults.record && providerKey),
+    defaults.logger,
   );
 
+  // OpenRouter `models[]` fallback simulation. When the request arrived on the
+  // OpenRouter base AND carries a fallback array, attempt the candidate list
+  // `[model, ...models]` in order and serve the FIRST non-error fixture match
+  // — an ERROR-fixture candidate simulates a RUNTIME provider failure (429/503)
+  // and falls through, exactly as real OpenRouter fails over on a runtime
+  // error. The winning slug is echoed back as the response `model` (the only
+  // fallback signal a real client sees). `preResolvedResponse` is the winner's
+  // already-resolved response so the shared branch below does not re-resolve
+  // (and thus does not re-invoke a response factory). Requests without a
+  // fallback array take the ordinary single-model match path unchanged.
+  //
+  // Deliberate non-goal (mock vs real): real OpenRouter rejects an
+  // unknown/invalid model in `models[]` up front with a 400 "not a valid model
+  // ID" and does NOT fail over from it (failover is runtime-error only). aimock
+  // is fixture-driven — an unknown model simply matches no fixture (a strict
+  // miss / 404), so we do not replicate that up-front 400.
+  let fixture: Fixture | null = null;
+  let skippedBySequenceOrTurn = 0;
+  let preResolvedResponse: FixtureResponse | null = null;
+  // The model echoed back in the RESPONSE — the winner of the fallback chain,
+  // or the requested model when there is no chain. The client's originally
+  // requested `body.model` is left UNTOUCHED so the journaled request records
+  // what was actually sent: it is the RESPONSE, not the request, that carries
+  // the fallback outcome (`response.model` = winner).
+  let responseModel = body.model;
+  // Whether the fallback loop already advanced the served fixture's match count
+  // (so the shared increment below does not double-count it).
+  let fixtureCountIncremented = false;
+  const openRouterFallback = openRouter && Array.isArray(body.models) && body.models.length > 0;
+
+  if (openRouterFallback) {
+    const candidates = buildOpenRouterCandidates(body);
+    // Re-read after each in-loop increment (below). `getFixtureMatchCountsForTest`
+    // returns the LIVE cached map only once a map exists for `testId`; on the
+    // FIRST request for a testId it returns a fresh TRANSIENT empty map that
+    // `incrementFixtureMatchCount` (which lazily creates the cached map) never
+    // touches. Without the refresh, a single fixture matched by MULTIPLE
+    // candidates in one request would evaluate later candidates against a stale
+    // count-0 snapshot — re-matching the same sequenced/turn-gated fixture and
+    // over-advancing its count. Refreshing binds `matchCounts` to the live map.
+    let matchCounts = journal.getFixtureMatchCountsForTest(testId);
+    // Fail-CLOSED gate: `provider.allow_fallbacks: false` suppresses fall-through
+    // — only the primary is tried and a primary error fixture is served as
+    // terminal. Absent / `true` keeps the default runtime-error fall-through.
+    const allowFallbacks = body.provider?.allow_fallbacks !== false;
+    let lastErrorFixture: Fixture | null = null;
+    let lastErrorResponse: FixtureResponse | null = null;
+    // Separable resolver step: a candidate's success/error decision goes through
+    // this small lookup (fixture match today) kept OUT of the loop's control
+    // flow, so the loop could later resolve a candidate against a live upstream
+    // without re-welding the iteration to `matchFixtureDiagnostic`.
+    const resolveCandidate = async (
+      candidate: string,
+    ): Promise<{ fixture: Fixture; response: FixtureResponse; isError: boolean } | null> => {
+      const probe: ChatCompletionRequest = { ...body, model: candidate };
+      const attempt = matchFixtureDiagnostic(
+        fixtures,
+        probe,
+        matchCounts,
+        defaults.requestTransform,
+        matchOptions,
+      );
+      skippedBySequenceOrTurn = Math.max(skippedBySequenceOrTurn, attempt.skippedBySequenceOrTurn);
+      if (!attempt.fixture) return null;
+      const response = await resolveResponse(attempt.fixture, probe);
+      return { fixture: attempt.fixture, response, isError: isErrorResponse(response) };
+    };
+    for (const candidate of candidates) {
+      const outcome = await resolveCandidate(candidate);
+      if (!outcome) {
+        // Primary produced no fixture and fall-through is suppressed — stop.
+        if (!allowFallbacks) break;
+        continue;
+      }
+      // A candidate whose fixture matched-and-resolved is "consumed": advance
+      // its match count (INCLUDING error candidates used as failovers) so a
+      // sequenced/turn-gated fixture progresses across requests exactly as a
+      // single match would — otherwise a sequenced error primary replays the
+      // same failover on every request.
+      journal.incrementFixtureMatchCount(outcome.fixture, fixtures, testId);
+      fixtureCountIncremented = true;
+      // Rebind to the now-live cached map so subsequent candidates in THIS
+      // request see the increment (see the `let matchCounts` note above).
+      matchCounts = journal.getFixtureMatchCountsForTest(testId);
+      responseModel = candidate;
+      if (outcome.isError && allowFallbacks) {
+        // Runtime provider failure — remember it and fail over to the next.
+        lastErrorFixture = outcome.fixture;
+        lastErrorResponse = outcome.response;
+        continue;
+      }
+      // Success, or a primary error under allow_fallbacks:false — terminal.
+      fixture = outcome.fixture;
+      preResolvedResponse = outcome.response;
+      break;
+    }
+    if (!fixture && lastErrorFixture) {
+      // Every candidate failed — serve the last provider's error (faithful to
+      // "primary and every fallback failed"). It was already counted above.
+      fixture = lastErrorFixture;
+      preResolvedResponse = lastErrorResponse;
+    }
+  } else {
+    const single = matchFixtureDiagnostic(
+      fixtures,
+      body,
+      journal.getFixtureMatchCountsForTest(testId),
+      defaults.requestTransform,
+      matchOptions,
+    );
+    fixture = single.fixture;
+    skippedBySequenceOrTurn = single.skippedBySequenceOrTurn;
+  }
+
   if (fixture) {
-    journal.incrementFixtureMatchCount(fixture, fixtures, testId);
+    // The fallback loop already advanced the served fixture's count; only the
+    // single-match path still needs to increment here (never double-count).
+    if (!fixtureCountIncremented) journal.incrementFixtureMatchCount(fixture, fixtures, testId);
     defaults.logger.debug(`Fixture matched: ${JSON.stringify(fixture.match).slice(0, 120)}`);
   } else {
     const lastUserMsg = body.messages.filter((m) => m.role === "user").pop();
@@ -675,14 +807,16 @@ async function handleCompletions(
       writeErrorResponse(
         res,
         strictStatus,
-        JSON.stringify({
-          error: {
-            message: strictMessage,
-            type: "invalid_request_error",
-            param: null,
-            code: "no_fixture_match",
-          },
-        }),
+        openRouter
+          ? serializeOpenRouterError(strictStatus, strictMessage)
+          : JSON.stringify({
+              error: {
+                message: strictMessage,
+                type: "invalid_request_error",
+                param: null,
+                code: "no_fixture_match",
+              },
+            }),
       );
       return;
     }
@@ -768,22 +902,83 @@ async function handleCompletions(
     writeErrorResponse(
       res,
       404,
-      JSON.stringify({
-        error: {
-          message: "No fixture matched",
-          type: "invalid_request_error",
-          param: null,
-          code: "no_fixture_match",
-        },
-      }),
+      openRouter
+        ? serializeOpenRouterError(404, "No fixture matched")
+        : JSON.stringify({
+            error: {
+              message: "No fixture matched",
+              type: "invalid_request_error",
+              param: null,
+              code: "no_fixture_match",
+            },
+          }),
     );
     return;
   }
 
-  const response = await resolveResponse(fixture, body);
+  // Reuse the response already resolved by the OpenRouter fallback loop (so a
+  // response factory is not invoked twice); otherwise resolve it now.
+  const response = preResolvedResponse ?? (await resolveResponse(fixture, body));
   const latency = fixture.latency ?? defaults.latency;
   const chunkSize = Math.max(1, fixture.chunkSize ?? defaults.chunkSize);
+  // OpenRouter always accounts usage (cost) in the response, including as the
+  // final streaming chunk — the OpenAI `stream_options.include_usage` gate is a
+  // deprecated no-op there.
   const includeUsage = body.stream === true && body.stream_options?.include_usage === true;
+  const emitStreamingUsage = includeUsage || openRouter;
+
+  // Prompt text for streaming usage-chunk token estimation, concatenated from
+  // the request messages exactly as the non-streaming completion builders do
+  // (see buildTextCompletion et al. in helpers.ts) so both paths estimate the
+  // same prompt token count. The streaming usage chunk is then resolved through
+  // the SAME helpers.ts `resolveUsage` as the non-streaming path — a single
+  // source of truth for "explicit token override wins, cost-only override still
+  // estimates" (replaces three formerly-duplicated inline `?? 0` copies).
+  const streamingPromptText = body.messages
+    .map((m) =>
+      typeof m.content === "string"
+        ? m.content
+        : Array.isArray(m.content)
+          ? m.content.map((p) => p.text ?? "").join("")
+          : "",
+    )
+    .join("");
+  const resolveStreamingUsageTokens = (
+    overrides: ResponseOverrides | undefined,
+    completionText: string,
+  ): { prompt_tokens: number; completion_tokens: number; total_tokens: number } =>
+    resolveUsage(overrides, streamingPromptText, completionText);
+
+  // OpenRouter response shaping (no-op for OpenAI callers). Applied as a
+  // post-pass over the objects the shared OpenAI builders produce so the
+  // OpenAI code path is untouched. All OpenRouter-specific field shapes live in
+  // openrouter-chat.ts. The fixture's `id` override still wins verbatim (the
+  // `gen-` prefix rewrite only applies to auto-generated ids).
+  const shapeORCompletion = (
+    completion: ChatCompletion,
+    overrides: ResponseOverrides | undefined,
+  ): ChatCompletion => {
+    if (!openRouter) return completion;
+    return shapeOpenRouterCompletion(
+      completion,
+      resolveOpenRouterShaping(overrides, overrides?.model ?? responseModel),
+      overrides?.id !== undefined,
+    );
+  };
+  const shapeORChunks = (
+    chunks: SSEChunk[],
+    usageChunk: SSEChunk | undefined,
+    overrides: ResponseOverrides | undefined,
+  ): void => {
+    if (!openRouter) return;
+    const shaping = resolveOpenRouterShaping(overrides, overrides?.model ?? responseModel);
+    shapeOpenRouterChunks(chunks, shaping, overrides?.id !== undefined);
+    // The final usage chunk shares the stream id and provider; shaping it also
+    // augments its usage with cost/cost_details.
+    if (usageChunk) shapeOpenRouterChunks([usageChunk], shaping, overrides?.id !== undefined);
+  };
+  // Opt-in `: OPENROUTER PROCESSING` keepalive comment lines (default off).
+  const openRouterProcessing = !!(openRouter && fixture.openRouterProcessing);
 
   // Error response
   if (isErrorResponse(response)) {
@@ -795,9 +990,16 @@ async function handleCompletions(
       body,
       response: { status, fixture },
     });
-    writeErrorResponse(res, status, serializeErrorResponse(response), {
-      retryAfter: response.retryAfter,
-    });
+    writeErrorResponse(
+      res,
+      status,
+      openRouter
+        ? serializeOpenRouterError(status, response.error.message, response.error.metadata)
+        : serializeErrorResponse(response),
+      {
+        retryAfter: response.retryAfter,
+      },
+    );
     return;
   }
 
@@ -813,13 +1015,18 @@ async function handleCompletions(
     writeErrorResponse(
       res,
       422,
-      JSON.stringify({
-        error: {
-          message:
+      openRouter
+        ? serializeOpenRouterError(
+            422,
             "Audio responses are not supported on the chat completions endpoint. Use Gemini generateContent or a dedicated audio endpoint.",
-          type: "invalid_request_error",
-        },
-      }),
+          )
+        : JSON.stringify({
+            error: {
+              message:
+                "Audio responses are not supported on the chat completions endpoint. Use Gemini generateContent or a dedicated audio endpoint.",
+              type: "invalid_request_error",
+            },
+          }),
     );
     return;
   }
@@ -835,10 +1042,26 @@ async function handleCompletions(
     const effectiveStrict = resolveStrictMode(defaults.strict, req.headers);
     const effReasoning = resolveReasoningForModel(
       response.reasoning,
-      body.model,
+      responseModel,
       effectiveStrict,
       defaults.logger,
     );
+    // Resolve the ordered streaming blocks ONCE, BEFORE recording success in the
+    // journal. resolveFixtureBlocks validates and can throw on a malformed
+    // `blocks` array; doing it here (rather than inside the chunk builder AND a
+    // second time for the usage estimate, both of which previously ran AFTER
+    // journal.add) guarantees a malformed fixture never leaves a spurious
+    // status-200 journal entry. The single resolved array is reused for both
+    // chunk emission and the completion-token estimate — the builder re-normalizes
+    // it idempotently (a can't-fail pass on already-validated blocks), so this is
+    // the only resolution that can throw. Only the streaming path consumes blocks
+    // (the non-streaming builder ignores them), so gate on `stream` to leave the
+    // non-streaming path's behavior byte-identical.
+    const streaming = body.stream === true;
+    const streamingBlocks =
+      streaming && response.blocks && response.blocks.length > 0
+        ? resolveFixtureBlocks(response.blocks)
+        : undefined;
     const journalEntry = journal.add({
       method: req.method ?? "POST",
       path: req.url ?? COMPLETIONS_PATH,
@@ -846,53 +1069,47 @@ async function handleCompletions(
       body,
       response: { status: 200, fixture },
     });
-    if (body.stream !== true) {
+    if (!streaming) {
       const completion = buildContentWithToolCallsCompletion(
         response.content ?? "",
         response.toolCalls ?? [],
-        body.model,
+        responseModel,
         effReasoning,
         overrides,
         body.messages,
       );
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(completion));
+      res.end(JSON.stringify(shapeORCompletion(completion, overrides)));
     } else {
       const chunks = buildContentWithToolCallsChunks(
         response.content ?? "",
         response.toolCalls ?? [],
-        body.model,
+        responseModel,
         chunkSize,
         effReasoning,
         overrides,
-        response.blocks,
+        streamingBlocks,
       );
-      // Build usage chunk for stream_options.include_usage
-      const completionText =
-        (response.content ?? "") +
-        (response.toolCalls ?? []).map((tc) => tc.name + tc.arguments).join("");
-      const usageChunk = includeUsage
+      // Build usage chunk for stream_options.include_usage (always for OpenRouter).
+      // When the fixture is blocks-driven, the streamed text comes from the
+      // ordered blocks (content/toolCalls are ignored by the chunk builder), so
+      // the completion-token estimate must derive from the SAME block text —
+      // otherwise a blocks-only fixture reports ~1 completion token. Reuse the
+      // single pre-resolved `streamingBlocks` (no second resolveFixtureBlocks).
+      const completionText = streamingBlocks
+        ? streamingBlocks.map((b) => (b.type === "text" ? b.text : b.name + b.arguments)).join("")
+        : (response.content ?? "") +
+          (response.toolCalls ?? []).map((tc) => tc.name + tc.arguments).join("");
+      const usageChunk = emitStreamingUsage
         ? buildUsageChunk(
             chunks[0]?.id ?? "chatcmpl-unknown",
-            overrides?.model ?? body.model,
+            overrides?.model ?? responseModel,
             chunks[0]?.created ?? Math.floor(Date.now() / 1000),
-            overrides?.usage
-              ? {
-                  prompt_tokens: overrides.usage.prompt_tokens ?? 0,
-                  completion_tokens: overrides.usage.completion_tokens ?? 0,
-                  total_tokens:
-                    overrides.usage.total_tokens ??
-                    (overrides.usage.prompt_tokens ?? 0) + (overrides.usage.completion_tokens ?? 0),
-                }
-              : {
-                  prompt_tokens: estimatePromptTokens(body.messages),
-                  completion_tokens: estimateTokens(completionText),
-                  total_tokens:
-                    estimatePromptTokens(body.messages) + estimateTokens(completionText),
-                },
+            resolveStreamingUsageTokens(overrides, completionText),
             overrides?.systemFingerprint,
           )
         : undefined;
+      shapeORChunks(chunks, usageChunk, overrides);
       const interruption = createInterruptionSignal(fixture);
       const completed = await writeSSEStream(res, chunks, {
         latency,
@@ -902,6 +1119,7 @@ async function handleCompletions(
         usageChunk,
         recordedTimings: fixture.recordedTimings,
         replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
+        openRouterProcessing,
       });
       if (!completed) {
         if (!res.writableEnded) res.destroy();
@@ -924,7 +1142,7 @@ async function handleCompletions(
     const effectiveStrict = resolveStrictMode(defaults.strict, req.headers);
     const effReasoning = resolveReasoningForModel(
       response.reasoning,
-      body.model,
+      responseModel,
       effectiveStrict,
       defaults.logger,
     );
@@ -938,43 +1156,31 @@ async function handleCompletions(
     if (body.stream !== true) {
       const completion = buildTextCompletion(
         response.content,
-        body.model,
+        responseModel,
         effReasoning,
         overrides,
         body.messages,
       );
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(completion));
+      res.end(JSON.stringify(shapeORCompletion(completion, overrides)));
     } else {
       const chunks = buildTextChunks(
         response.content,
-        body.model,
+        responseModel,
         chunkSize,
         effReasoning,
         overrides,
       );
-      const usageChunk = includeUsage
+      const usageChunk = emitStreamingUsage
         ? buildUsageChunk(
             chunks[0]?.id ?? "chatcmpl-unknown",
-            overrides?.model ?? body.model,
+            overrides?.model ?? responseModel,
             chunks[0]?.created ?? Math.floor(Date.now() / 1000),
-            overrides?.usage
-              ? {
-                  prompt_tokens: overrides.usage.prompt_tokens ?? 0,
-                  completion_tokens: overrides.usage.completion_tokens ?? 0,
-                  total_tokens:
-                    overrides.usage.total_tokens ??
-                    (overrides.usage.prompt_tokens ?? 0) + (overrides.usage.completion_tokens ?? 0),
-                }
-              : {
-                  prompt_tokens: estimatePromptTokens(body.messages),
-                  completion_tokens: estimateTokens(response.content),
-                  total_tokens:
-                    estimatePromptTokens(body.messages) + estimateTokens(response.content),
-                },
+            resolveStreamingUsageTokens(overrides, response.content),
             overrides?.systemFingerprint,
           )
         : undefined;
+      shapeORChunks(chunks, usageChunk, overrides);
       const interruption = createInterruptionSignal(fixture);
       const completed = await writeSSEStream(res, chunks, {
         latency,
@@ -984,6 +1190,7 @@ async function handleCompletions(
         usageChunk,
         recordedTimings: fixture.recordedTimings,
         replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
+        openRouterProcessing,
       });
       if (!completed) {
         if (!res.writableEnded) res.destroy();
@@ -1006,7 +1213,7 @@ async function handleCompletions(
     const effectiveStrict = resolveStrictMode(defaults.strict, req.headers);
     const effReasoning = resolveReasoningForModel(
       response.reasoning,
-      body.model,
+      responseModel,
       effectiveStrict,
       defaults.logger,
     );
@@ -1020,44 +1227,32 @@ async function handleCompletions(
     if (body.stream !== true) {
       const completion = buildToolCallCompletion(
         response.toolCalls,
-        body.model,
+        responseModel,
         effReasoning,
         overrides,
         body.messages,
       );
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(completion));
+      res.end(JSON.stringify(shapeORCompletion(completion, overrides)));
     } else {
       const chunks = buildToolCallChunks(
         response.toolCalls,
-        body.model,
+        responseModel,
         chunkSize,
         effReasoning,
         overrides,
       );
       const completionText = response.toolCalls.map((tc) => tc.name + tc.arguments).join("");
-      const usageChunk = includeUsage
+      const usageChunk = emitStreamingUsage
         ? buildUsageChunk(
             chunks[0]?.id ?? "chatcmpl-unknown",
-            overrides?.model ?? body.model,
+            overrides?.model ?? responseModel,
             chunks[0]?.created ?? Math.floor(Date.now() / 1000),
-            overrides?.usage
-              ? {
-                  prompt_tokens: overrides.usage.prompt_tokens ?? 0,
-                  completion_tokens: overrides.usage.completion_tokens ?? 0,
-                  total_tokens:
-                    overrides.usage.total_tokens ??
-                    (overrides.usage.prompt_tokens ?? 0) + (overrides.usage.completion_tokens ?? 0),
-                }
-              : {
-                  prompt_tokens: estimatePromptTokens(body.messages),
-                  completion_tokens: estimateTokens(completionText),
-                  total_tokens:
-                    estimatePromptTokens(body.messages) + estimateTokens(completionText),
-                },
+            resolveStreamingUsageTokens(overrides, completionText),
             overrides?.systemFingerprint,
           )
         : undefined;
+      shapeORChunks(chunks, usageChunk, overrides);
       const interruption = createInterruptionSignal(fixture);
       const completed = await writeSSEStream(res, chunks, {
         latency,
@@ -1067,6 +1262,7 @@ async function handleCompletions(
         usageChunk,
         recordedTimings: fixture.recordedTimings,
         replaySpeed: fixture.replaySpeed ?? defaults.replaySpeed,
+        openRouterProcessing,
       });
       if (!completed) {
         if (!res.writableEnded) res.destroy();
@@ -1089,12 +1285,14 @@ async function handleCompletions(
   writeErrorResponse(
     res,
     500,
-    JSON.stringify({
-      error: {
-        message: "Fixture response did not match any known type",
-        type: "server_error",
-      },
-    }),
+    openRouter
+      ? serializeOpenRouterError(500, "Fixture response did not match any known type")
+      : JSON.stringify({
+          error: {
+            message: "Fixture response did not match any known type",
+            type: "server_error",
+          },
+        }),
   );
 }
 
@@ -1256,6 +1454,11 @@ export async function createServer(
     // Parse the URL pathname (strip query string)
     const parsedUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
     let pathname = parsedUrl.pathname;
+    // Capture the ORIGINAL path before normalizeCompatPath rewrites it — the
+    // OpenRouter `/api/v1/` base is the detection signal and would otherwise be
+    // erased (`/api/v1/chat/completions` → `/v1/chat/completions`).
+    const originalPathname = pathname;
+    const isOpenRouter = isOpenRouterPath(originalPathname);
 
     // Instrument response completion for metrics. The finish callback reads
     // pathname via closure after normalizeCompatPath has rewritten it, so
@@ -1592,6 +1795,23 @@ export async function createServer(
           res.destroy();
         }
       }
+      return;
+    }
+
+    // OpenRouter discovery endpoints. Dispatched BEFORE normalizeCompatPath
+    // (which does not rewrite these — /models etc. are excluded from
+    // COMPAT_SUFFIXES — so they would otherwise 404), mirroring the
+    // /api/v1/videos ordering above. Read-only metadata; no body.
+    if (pathname === "/api/v1/models" && req.method === "GET") {
+      handleOpenRouterModels(req, res, fixtures, journal, defaults, setCorsHeaders);
+      return;
+    }
+    if (pathname === "/api/v1/key" && req.method === "GET") {
+      handleOpenRouterKey(req, res, journal, setCorsHeaders);
+      return;
+    }
+    if (pathname === "/api/v1/credits" && req.method === "GET") {
+      handleOpenRouterCredits(req, res, journal, setCorsHeaders);
       return;
     }
 
@@ -2791,7 +3011,13 @@ export async function createServer(
       return;
     }
 
-    const completionsProvider: RecordProviderKey = azureDeploymentId ? "azure" : "openai";
+    // OpenRouter callers (original path under /api/v1/) get the OpenRouter
+    // provider key + response shaping; OpenAI (/v1/...) callers are unchanged.
+    const completionsProvider: RecordProviderKey = azureDeploymentId
+      ? "azure"
+      : isOpenRouter
+        ? "openrouter"
+        : "openai";
     try {
       await handleCompletions(
         req,
@@ -2801,6 +3027,7 @@ export async function createServer(
         defaults,
         azureDeploymentId,
         completionsProvider,
+        isOpenRouter,
       );
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Internal error";
@@ -2808,18 +3035,24 @@ export async function createServer(
         writeErrorResponse(
           res,
           500,
-          JSON.stringify({
-            error: {
-              message: msg,
-              type: "server_error",
-            },
-          }),
+          isOpenRouter
+            ? serializeOpenRouterError(500, msg)
+            : JSON.stringify({
+                error: {
+                  message: msg,
+                  type: "server_error",
+                },
+              }),
         );
       } else if (!res.writableEnded) {
         // Headers already sent (SSE stream in progress) — write error event then close
         try {
           res.write(
-            `data: ${JSON.stringify({ error: { message: msg, type: "server_error" } })}\n\n`,
+            `data: ${
+              isOpenRouter
+                ? serializeOpenRouterError(500, msg)
+                : JSON.stringify({ error: { message: msg, type: "server_error" } })
+            }\n\n`,
           );
           res.end();
         } catch (writeErr) {

@@ -66,6 +66,18 @@ const FEATURE_RULES: FeatureRule[] = [
     keywords: ["gemini", "generateContent", "google.*ai"],
   },
   {
+    rowLabel: "OpenRouter router / fallback simulation",
+    keywords: [
+      "openrouter",
+      "fallback.*model",
+      "model.*fallback",
+      "provider routing",
+      "failover",
+      "models.*array",
+      "allow_fallbacks",
+    ],
+  },
+  {
     rowLabel: "WebSocket APIs",
     keywords: ["websocket", "realtime", "ws://", "wss://"],
   },
@@ -412,6 +424,7 @@ function buildMigrationRowPatterns(rowLabel: string): string[] {
     "Responses API SSE": ["OpenAI Responses API"],
     "Claude Messages API": ["Anthropic Claude"],
     "Gemini streaming": ["Google Gemini"],
+    "OpenRouter router / fallback simulation": ["OpenRouter routing", "Model fallback/failover"],
     "WebSocket APIs": ["WebSocket protocols"],
     "Structured output / JSON mode": ["Structured output / JSON mode", "Structured output"],
     "Sequential / stateful responses": ["Sequential responses"],
