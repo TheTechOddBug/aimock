@@ -17,6 +17,12 @@ import {
   startDriftServer,
   stopDriftServer,
 } from "./helpers.js";
+import {
+  COHERE_BASE_URL,
+  isInfraStatus,
+  selectCohereChatModel,
+  type CohereModelEntry,
+} from "./cohere-model.js";
 
 // ---------------------------------------------------------------------------
 // Credentials check
@@ -87,16 +93,17 @@ function cohereChatStreamChunkShape() {
 // ---------------------------------------------------------------------------
 
 async function cohereChatNonStreaming(
+  model: string,
   messages: { role: string; content: string }[],
 ): Promise<{ status: number; body: string }> {
-  const res = await fetch("https://api.cohere.com/v2/chat", {
+  const res = await fetch(`${COHERE_BASE_URL}/v2/chat`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${COHERE_API_KEY}`,
     },
     body: JSON.stringify({
-      model: "command-r-plus",
+      model,
       messages,
       stream: false,
       max_tokens: 10,
@@ -106,22 +113,62 @@ async function cohereChatNonStreaming(
 }
 
 async function cohereChatStreaming(
+  model: string,
   messages: { role: string; content: string }[],
 ): Promise<{ status: number; body: string }> {
-  const res = await fetch("https://api.cohere.com/v2/chat", {
+  const res = await fetch(`${COHERE_BASE_URL}/v2/chat`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${COHERE_API_KEY}`,
     },
     body: JSON.stringify({
-      model: "command-r-plus",
+      model,
       messages,
       stream: true,
       max_tokens: 10,
     }),
   });
   return { status: res.status, body: await res.text() };
+}
+
+// ---------------------------------------------------------------------------
+// Live chat-model resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Outcome of resolving a live Cohere chat model:
+ *   - { model }        → a valid, non-deprecated chat model to drive the leg
+ *   - { infra }        → the listing call hit an auth/credit/rate-limit/5xx
+ *                        condition; the caller SKIPS honestly (not drift)
+ *   - { unavailable }  → the listing succeeded but exposed no usable chat
+ *                        model (genuinely broken state — fail loud)
+ */
+type ResolvedModel = { model: string } | { infra: number } | { unavailable: true };
+
+let cohereChatModelPromise: Promise<ResolvedModel> | null = null;
+
+/**
+ * Discover a currently-valid chat model from Cohere's own model listing rather
+ * than hardcoding one. Cohere retires model IDs on a schedule (command-r-plus
+ * was removed 2026-04-04, which is what quarantined this leg), so the listing
+ * is the only drift-resilient source of a live model name.
+ */
+async function resolveCohereChatModel(): Promise<ResolvedModel> {
+  const res = await fetch(`${COHERE_BASE_URL}/v1/models?endpoint=chat&page_size=1000`, {
+    headers: { Authorization: `Bearer ${COHERE_API_KEY}` },
+  });
+  if (isInfraStatus(res.status)) return { infra: res.status };
+  if (!res.ok) return { unavailable: true };
+  const json = (await res.json()) as { models?: CohereModelEntry[] };
+  const model = selectCohereChatModel(json.models ?? []);
+  return model ? { model } : { unavailable: true };
+}
+
+/** Memoized so the whole live leg makes exactly one model-listing call. */
+function getCohereChatModel(): Promise<ResolvedModel> {
+  if (!cohereChatModelPromise) cohereChatModelPromise = resolveCohereChatModel();
+  return cohereChatModelPromise;
 }
 
 // ---------------------------------------------------------------------------
@@ -235,18 +282,37 @@ describe("Cohere error shapes", () => {
 });
 
 describe.skipIf(!HAS_CREDENTIALS)("Cohere drift", () => {
-  it("non-streaming /v2/chat shape matches", async () => {
+  it("non-streaming /v2/chat shape matches", async (ctx) => {
+    const resolved = await getCohereChatModel();
+    if ("infra" in resolved) {
+      // Provider-side auth/credit/rate-limit/5xx — honest skip, not drift.
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error(
+        "Cohere /v1/models?endpoint=chat exposed no usable non-deprecated chat model",
+      );
+    }
+    const model = resolved.model;
+
     const sdkShape = cohereChatResponseShape();
     const messages = [{ role: "user", content: "Say hello" }];
 
     const [realRes, mockRes] = await Promise.all([
-      cohereChatNonStreaming(messages),
+      cohereChatNonStreaming(model, messages),
       httpPost(`${instance.url}/v2/chat`, {
-        model: "command-r-plus",
+        model,
         messages,
         stream: false,
       }),
     ]);
+
+    if (isInfraStatus(realRes.status)) {
+      // Real API hit a transient provider-side condition — honest skip.
+      ctx.skip();
+      return;
+    }
 
     expect(realRes.status).toBe(200);
     expect(mockRes.status).toBeLessThan(500);
@@ -265,18 +331,37 @@ describe.skipIf(!HAS_CREDENTIALS)("Cohere drift", () => {
     }
   });
 
-  it("streaming /v2/chat shape matches", async () => {
+  it("streaming /v2/chat shape matches", async (ctx) => {
+    const resolved = await getCohereChatModel();
+    if ("infra" in resolved) {
+      // Provider-side auth/credit/rate-limit/5xx — honest skip, not drift.
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error(
+        "Cohere /v1/models?endpoint=chat exposed no usable non-deprecated chat model",
+      );
+    }
+    const model = resolved.model;
+
     const sdkChunkShape = cohereChatStreamChunkShape();
     const messages = [{ role: "user", content: "Say hello" }];
 
     const [realRes, mockRes] = await Promise.all([
-      cohereChatStreaming(messages),
+      cohereChatStreaming(model, messages),
       httpPost(`${instance.url}/v2/chat`, {
-        model: "command-r-plus",
+        model,
         messages,
         stream: true,
       }),
     ]);
+
+    if (isInfraStatus(realRes.status)) {
+      // Real API hit a transient provider-side condition — honest skip.
+      ctx.skip();
+      return;
+    }
 
     expect(realRes.status).toBe(200);
     expect(mockRes.status).toBeLessThan(500);

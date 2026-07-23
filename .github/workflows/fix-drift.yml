@@ -103,6 +103,8 @@ jobs:
           OLLAMA_HOST: 127.0.0.1:11434
           OLLAMA_MODEL: qwen2:0.5b
           FAL_KEY: ${{ secrets.FAL_KEY }}
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           PRE_FIX_REPORT: ${{ runner.temp }}/drift-report.json
         run: |
           set +e
@@ -241,6 +243,8 @@ jobs:
           OLLAMA_HOST: 127.0.0.1:11434
           OLLAMA_MODEL: qwen2:0.5b
           FAL_KEY: ${{ secrets.FAL_KEY }}
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
         run: pnpm test:drift
 
       # Step 4c: Re-collect drift AUTHORITATIVELY against the LIVE SDK, writing
@@ -270,6 +274,8 @@ jobs:
           OLLAMA_HOST: 127.0.0.1:11434
           OLLAMA_MODEL: qwen2:0.5b
           FAL_KEY: ${{ secrets.FAL_KEY }}
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           POST_FIX_REPORT: ${{ runner.temp }}/drift-report.post-fix.json
         run: |
           set +e
