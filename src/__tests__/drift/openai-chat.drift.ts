@@ -17,7 +17,13 @@ import {
   openaiChatCompletionReasoningShape,
   openaiChatCompletionReasoningChunkShape,
 } from "./sdk-shapes.js";
-import { openaiChatNonStreaming, openaiChatStreaming } from "./providers.js";
+import {
+  resolveLiveModel,
+  isInfraSkip,
+  isModelNotFound,
+  type ResolvedModel,
+  type LiveModelEntry,
+} from "./providers.js";
 import { httpPost, parseDataOnlySSE, startDriftServer, stopDriftServer } from "./helpers.js";
 
 // ---------------------------------------------------------------------------
@@ -36,25 +42,120 @@ afterAll(async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Live chat-model resolution (self-healing — generalizes cohere #325 / R0)
+// ---------------------------------------------------------------------------
+//
+// `gpt-4o-mini` is a stable OpenAI alias (not a dated snapshot), but OpenAI
+// still retires aliases on its own schedule. Discover a currently-live,
+// non-deprecated chat model from OpenAI's own `/v1/models` listing rather
+// than trusting the hardcoded literal to remain valid forever, and treat any
+// auth/credit/rate-limit/5xx condition on the listing (or on the real chat
+// call itself) as an HONEST SKIP rather than a drift finding that reds the
+// PR. A real shape drift (a 2xx envelope that doesn't match) is never
+// skipped — only status-classified provider-side conditions are.
+//
+// providers.ts's own `openaiChatNonStreaming`/`openaiChatStreaming` hardcode
+// "gpt-4o-mini" and take no model parameter, so the resolved model below is
+// threaded through a LOCAL, model-parameterized raw fetch (mirrors
+// openai-responses.drift.ts's `fetchOpenAIResponses`) rather than a
+// providers.ts edit — otherwise the discovered model never reaches the real
+// API and the self-healing degrades to an eternal honest-skip once
+// gpt-4o-mini retires.
+
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
+const OPENAI_MODELS_URL = "https://api.openai.com/v1/models";
+
+/** Maps OpenAI's `/v1/models` listing shape onto the shared `LiveModelEntry`. */
+async function fetchOpenAIModelListing(): Promise<{ status: number; models: LiveModelEntry[] }> {
+  const res = await fetch(OPENAI_MODELS_URL, {
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+  });
+  if (!res.ok) return { status: res.status, models: [] };
+  const json = (await res.json()) as { data?: { id: string }[] };
+  // OpenAI's listing does not expose a `deprecated` flag — every listed id is
+  // presumed live; retirement shows up as a model-not-found on the real call.
+  const models: LiveModelEntry[] = (json.data ?? []).map((m) => ({ id: m.id }));
+  return { status: res.status, models };
+}
+
+let openaiChatModelPromise: Promise<ResolvedModel> | null = null;
+
+/** Memoized so the whole live leg makes exactly one model-listing call. */
+function getOpenAIChatModel(): Promise<ResolvedModel> {
+  if (!openaiChatModelPromise) {
+    openaiChatModelPromise = resolveLiveModel("openai-chat", fetchOpenAIModelListing, [
+      "gpt-4o-mini",
+    ]);
+  }
+  return openaiChatModelPromise;
+}
+
+/**
+ * Raw Chat Completions fetch parameterized by a discovered model id,
+ * returning the raw status/body so the caller can classify a retired-model or
+ * provider-side condition via {@link isModelNotFound}/{@link isInfraSkip}
+ * BEFORE asserting success (unlike providers.ts's variants, which throw an
+ * opaque InfraError on any non-2xx).
+ */
+async function fetchOpenAIChat(
+  model: string,
+  messages: { role: string; content: string }[],
+  tools: object[] | undefined,
+  stream: boolean,
+): Promise<{ status: number; raw: string }> {
+  const body: Record<string, unknown> = { model, messages, stream, max_tokens: 10 };
+  if (tools) body.tools = tools;
+
+  const res = await fetch(OPENAI_CHAT_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  return { status: res.status, raw: await res.text() };
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!OPENAI_API_KEY)("OpenAI Chat Completions drift", () => {
-  const config = { apiKey: OPENAI_API_KEY! };
+  it("non-streaming text shape matches", async (ctx) => {
+    const resolved = await getOpenAIChatModel();
+    if ("infra" in resolved) {
+      // Listing hit an auth/credit/rate-limit/5xx condition — honest skip.
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("OpenAI /v1/models exposed no usable chat model");
+    }
+    const model = resolved.model;
 
-  it("non-streaming text shape matches", async () => {
     const sdkShape = openaiChatCompletionShape();
+    const messages = [{ role: "user", content: "Say hello" }];
 
     const [realRes, mockRes] = await Promise.all([
-      openaiChatNonStreaming(config, [{ role: "user", content: "Say hello" }]),
+      fetchOpenAIChat(model, messages, undefined, false),
       httpPost(`${instance.url}/v1/chat/completions`, {
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: "Say hello" }],
+        model,
+        messages,
         stream: false,
       }),
     ]);
 
-    const realShape = extractShape(realRes.body);
+    if (isInfraSkip(realRes.status) || isModelNotFound(realRes.status, realRes.raw)) {
+      // Retired model id or a transient provider-side condition — honest
+      // skip, never a drift finding that quarantines the shared baseline.
+      ctx.skip();
+      return;
+    }
+    expect(realRes.status, `Real API error: ${realRes.raw.slice(0, 300)}`).toBe(200);
+
+    const realShape = extractShape(JSON.parse(realRes.raw));
     const mockShape = extractShape(JSON.parse(mockRes.body));
 
     const diffs = triangulate(sdkShape, realShape, mockShape);
@@ -66,24 +167,42 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Chat Completions drift", () => {
     ).toEqual([]);
   });
 
-  it("streaming text shape matches", async () => {
-    const sdkChunkShape = openaiChatCompletionChunkShape();
+  it("streaming text shape matches", async (ctx) => {
+    const resolved = await getOpenAIChatModel();
+    if ("infra" in resolved) {
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("OpenAI /v1/models exposed no usable chat model");
+    }
+    const model = resolved.model;
 
-    const [realStream, mockStreamRes] = await Promise.all([
-      openaiChatStreaming(config, [{ role: "user", content: "Say hello" }]),
+    const sdkChunkShape = openaiChatCompletionChunkShape();
+    const messages = [{ role: "user", content: "Say hello" }];
+
+    const [realRes, mockStreamRes] = await Promise.all([
+      fetchOpenAIChat(model, messages, undefined, true),
       httpPost(`${instance.url}/v1/chat/completions`, {
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: "Say hello" }],
+        model,
+        messages,
         stream: true,
       }),
     ]);
 
+    if (isInfraSkip(realRes.status) || isModelNotFound(realRes.status, realRes.raw)) {
+      ctx.skip();
+      return;
+    }
+    expect(realRes.status, `Real API error: ${realRes.raw.slice(0, 300)}`).toBe(200);
+
+    const realChunks = parseDataOnlySSE(realRes.raw);
     const mockChunks = parseDataOnlySSE(mockStreamRes.body);
 
-    expect(realStream.rawEvents.length, "Real API returned no SSE events").toBeGreaterThan(0);
+    expect(realChunks.length, "Real API returned no SSE events").toBeGreaterThan(0);
     expect(mockChunks.length, "Mock returned no SSE chunks").toBeGreaterThan(0);
 
-    const realChunkShape = extractShape(realStream.rawEvents[0].data);
+    const realChunkShape = extractShape(realChunks[0]);
     const mockChunkShape = extractShape(mockChunks[0]);
 
     const diffs = triangulate(sdkChunkShape, realChunkShape, mockChunkShape);
@@ -95,7 +214,17 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Chat Completions drift", () => {
     ).toEqual([]);
   });
 
-  it("non-streaming tool call shape matches", async () => {
+  it("non-streaming tool call shape matches", async (ctx) => {
+    const resolved = await getOpenAIChatModel();
+    if ("infra" in resolved) {
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("OpenAI /v1/models exposed no usable chat model");
+    }
+    const model = resolved.model;
+
     const sdkShape = openaiChatCompletionToolCallShape();
 
     const tools = [
@@ -112,18 +241,25 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Chat Completions drift", () => {
         },
       },
     ];
+    const messages = [{ role: "user", content: "Weather in Paris" }];
 
     const [realRes, mockRes] = await Promise.all([
-      openaiChatNonStreaming(config, [{ role: "user", content: "Weather in Paris" }], tools),
+      fetchOpenAIChat(model, messages, tools, false),
       httpPost(`${instance.url}/v1/chat/completions`, {
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: "Weather in Paris" }],
+        model,
+        messages,
         stream: false,
         tools,
       }),
     ]);
 
-    const realShape = extractShape(realRes.body);
+    if (isInfraSkip(realRes.status) || isModelNotFound(realRes.status, realRes.raw)) {
+      ctx.skip();
+      return;
+    }
+    expect(realRes.status, `Real API error: ${realRes.raw.slice(0, 300)}`).toBe(200);
+
+    const realShape = extractShape(JSON.parse(realRes.raw));
     const mockShape = extractShape(JSON.parse(mockRes.body));
 
     const diffs = triangulate(sdkShape, realShape, mockShape);
@@ -135,7 +271,17 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Chat Completions drift", () => {
     ).toEqual([]);
   });
 
-  it("streaming tool call shape matches", async () => {
+  it("streaming tool call shape matches", async (ctx) => {
+    const resolved = await getOpenAIChatModel();
+    if ("infra" in resolved) {
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("OpenAI /v1/models exposed no usable chat model");
+    }
+    const model = resolved.model;
+
     const sdkChunkShape = openaiChatCompletionChunkShape();
 
     const tools = [
@@ -152,23 +298,31 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Chat Completions drift", () => {
         },
       },
     ];
+    const messages = [{ role: "user", content: "Weather in Paris" }];
 
-    const [realStream, mockStreamRes] = await Promise.all([
-      openaiChatStreaming(config, [{ role: "user", content: "Weather in Paris" }], tools),
+    const [realRes, mockStreamRes] = await Promise.all([
+      fetchOpenAIChat(model, messages, tools, true),
       httpPost(`${instance.url}/v1/chat/completions`, {
-        model: "gpt-4o-mini",
-        messages: [{ role: "user", content: "Weather in Paris" }],
+        model,
+        messages,
         stream: true,
         tools,
       }),
     ]);
 
+    if (isInfraSkip(realRes.status) || isModelNotFound(realRes.status, realRes.raw)) {
+      ctx.skip();
+      return;
+    }
+    expect(realRes.status, `Real API error: ${realRes.raw.slice(0, 300)}`).toBe(200);
+
+    const realChunks = parseDataOnlySSE(realRes.raw);
     const mockChunks = parseDataOnlySSE(mockStreamRes.body);
 
-    expect(realStream.rawEvents.length, "Real API returned no SSE events").toBeGreaterThan(0);
+    expect(realChunks.length, "Real API returned no SSE events").toBeGreaterThan(0);
     expect(mockChunks.length, "Mock returned no SSE chunks").toBeGreaterThan(0);
 
-    const realChunkShape = extractShape(realStream.rawEvents[0].data);
+    const realChunkShape = extractShape(realChunks[0]);
     const mockChunkShape = extractShape(mockChunks[0]);
 
     const diffs = triangulate(sdkChunkShape, realChunkShape, mockChunkShape);

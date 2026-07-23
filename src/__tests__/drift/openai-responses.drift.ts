@@ -14,7 +14,13 @@ import {
   openaiResponsesToolCallEventShapes,
   openaiResponsesReasoningEventShapes,
 } from "./sdk-shapes.js";
-import { openaiResponsesNonStreaming, openaiResponsesStreaming } from "./providers.js";
+import {
+  resolveLiveModel,
+  isInfraSkip,
+  isModelNotFound,
+  type LiveModelEntry,
+  type ResolvedModel,
+} from "./providers.js";
 import {
   httpPost,
   httpPostRaw,
@@ -39,25 +45,112 @@ afterAll(async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Live model discovery (self-healing)
+// ---------------------------------------------------------------------------
+//
+// Replaces the hardcoded "gpt-4o-mini" pin with a live-listing lookup so a
+// retired/renamed alias resolves to a currently-valid model (or honest-skips)
+// instead of quarantining this leg's whole batch. Generalizes the cohere
+// (#325) discovery + fal (#332) infra-skip patterns via providers.ts's shared
+// resolveLiveModel/isInfraSkip/isModelNotFound.
+//
+// providers.ts's own `openaiResponsesNonStreaming`/`openaiResponsesStreaming`
+// hardcode "gpt-4o-mini" and take no model parameter, so the live probe below
+// is a local, model-parameterized fetch (mirrors cohere.drift.ts's pattern of
+// a leg-local raw-fetch helper) rather than a providers.ts edit.
+
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const OPENAI_MODELS_URL = "https://api.openai.com/v1/models";
+
+/** Maps OpenAI's `/v1/models` listing shape onto {@link LiveModelEntry}. */
+export async function fetchOpenAIModelsListing(): Promise<{
+  status: number;
+  models: LiveModelEntry[];
+}> {
+  const res = await fetch(OPENAI_MODELS_URL, {
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+  });
+  const raw = await res.text();
+  if (res.status >= 400) return { status: res.status, models: [] };
+  let json: { data?: { id: string }[] };
+  try {
+    json = JSON.parse(raw) as { data?: { id: string }[] };
+  } catch {
+    return { status: res.status, models: [] };
+  }
+  return { status: res.status, models: (json.data ?? []).map((m) => ({ id: m.id })) };
+}
+
+/** Memoized (per providers.ts `resolveLiveModel`) so this file makes one listing call. */
+export function getOpenAIResponsesModel(): Promise<ResolvedModel> {
+  return resolveLiveModel("openai-responses", fetchOpenAIModelsListing, ["gpt-4o-mini", "gpt-4o"]);
+}
+
+/**
+ * Raw Responses API fetch parameterized by a discovered model id, returning
+ * the raw status/body so the caller can classify a retired-model or
+ * provider-side condition via {@link isModelNotFound}/{@link isInfraSkip}
+ * BEFORE asserting success (unlike providers.ts's variants, which throw an
+ * opaque InfraError on any non-2xx).
+ */
+export async function fetchOpenAIResponses(
+  model: string,
+  input: object[],
+  tools: object[] | undefined,
+  stream: boolean,
+): Promise<{ status: number; raw: string }> {
+  const body: Record<string, unknown> = { model, input, stream, max_output_tokens: 50 };
+  if (tools) body.tools = tools;
+
+  const res = await fetch(OPENAI_RESPONSES_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify(body),
+  });
+
+  return { status: res.status, raw: await res.text() };
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!OPENAI_API_KEY)("OpenAI Responses API drift", () => {
-  const config = { apiKey: OPENAI_API_KEY! };
+  it("non-streaming text shape matches", async (ctx) => {
+    const resolved = await getOpenAIResponsesModel();
+    if ("infra" in resolved) {
+      // Provider-side auth/credit/rate-limit/5xx — honest skip, not drift.
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("OpenAI /v1/models exposed no usable model for the Responses API");
+    }
+    const model = resolved.model;
 
-  it("non-streaming text shape matches", async () => {
     const sdkShape = openaiResponsesNonStreamingShape();
+    const input = [{ role: "user", content: "Say hello" }];
 
     const [realRes, mockRes] = await Promise.all([
-      openaiResponsesNonStreaming(config, [{ role: "user", content: "Say hello" }]),
+      fetchOpenAIResponses(model, input, undefined, false),
       httpPost(`${instance.url}/v1/responses`, {
-        model: "gpt-4o-mini",
-        input: [{ role: "user", content: "Say hello" }],
+        model,
+        input,
         stream: false,
       }),
     ]);
 
-    const realShape = extractShape(realRes.body);
+    if (isInfraSkip(realRes.status) || isModelNotFound(realRes.status, realRes.raw)) {
+      // Retired/renamed model or a transient provider condition — honest skip.
+      ctx.skip();
+      return;
+    }
+    expect(realRes.status, `Real API error: ${realRes.raw.slice(0, 300)}`).toBe(200);
+
+    const realShape = extractShape(JSON.parse(realRes.raw));
     const mockShape = extractShape(JSON.parse(mockRes.body));
 
     const diffs = triangulate(sdkShape, realShape, mockShape);
@@ -73,19 +166,41 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Responses API drift", () => {
     ).toEqual([]);
   });
 
-  it("streaming text event sequence and shapes match", async () => {
-    const sdkEvents = openaiResponsesTextEventShapes();
+  it("streaming text event sequence and shapes match", async (ctx) => {
+    const resolved = await getOpenAIResponsesModel();
+    if ("infra" in resolved) {
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("OpenAI /v1/models exposed no usable model for the Responses API");
+    }
+    const model = resolved.model;
 
-    const [realStream, mockStreamRes] = await Promise.all([
-      openaiResponsesStreaming(config, [{ role: "user", content: "Say hello" }]),
+    const sdkEvents = openaiResponsesTextEventShapes();
+    const input = [{ role: "user", content: "Say hello" }];
+
+    const [realRes, mockStreamRes] = await Promise.all([
+      fetchOpenAIResponses(model, input, undefined, true),
       httpPost(`${instance.url}/v1/responses`, {
-        model: "gpt-4o-mini",
-        input: [{ role: "user", content: "Say hello" }],
+        model,
+        input,
         stream: true,
       }),
     ]);
 
-    expect(realStream.rawEvents.length, "Real API returned no SSE events").toBeGreaterThan(0);
+    if (isInfraSkip(realRes.status) || isModelNotFound(realRes.status, realRes.raw)) {
+      ctx.skip();
+      return;
+    }
+    expect(realRes.status, `Real API error: ${realRes.raw.slice(0, 300)}`).toBe(200);
+
+    const realEvents = parseTypedSSE(realRes.raw);
+    expect(realEvents.length, "Real API returned no SSE events").toBeGreaterThan(0);
+    const realSSEShapes = realEvents.map((e) => ({
+      type: e.type,
+      dataShape: extractShape(e.data),
+    }));
 
     const mockEvents = parseTypedSSE(mockStreamRes.body);
     expect(mockEvents.length, "Mock returned no SSE events").toBeGreaterThan(0);
@@ -95,7 +210,7 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Responses API drift", () => {
       dataShape: extractShape(e.data),
     }));
 
-    const diffs = compareSSESequences(sdkEvents, realStream.events, mockSSEShapes);
+    const diffs = compareSSESequences(sdkEvents, realSSEShapes, mockSSEShapes);
     const report = formatDriftReport(
       "OpenAI Responses (streaming text events)",
       diffs,
@@ -108,7 +223,17 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Responses API drift", () => {
     ).toEqual([]);
   });
 
-  it("non-streaming tool call shape matches", async () => {
+  it("non-streaming tool call shape matches", async (ctx) => {
+    const resolved = await getOpenAIResponsesModel();
+    if ("infra" in resolved) {
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("OpenAI /v1/models exposed no usable model for the Responses API");
+    }
+    const model = resolved.model;
+
     const sdkShape = openaiResponsesNonStreamingShape();
 
     const tools = [
@@ -123,18 +248,25 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Responses API drift", () => {
         },
       },
     ];
+    const input = [{ role: "user", content: "Weather in Paris" }];
 
     const [realRes, mockRes] = await Promise.all([
-      openaiResponsesNonStreaming(config, [{ role: "user", content: "Weather in Paris" }], tools),
+      fetchOpenAIResponses(model, input, tools, false),
       httpPost(`${instance.url}/v1/responses`, {
-        model: "gpt-4o-mini",
-        input: [{ role: "user", content: "Weather in Paris" }],
+        model,
+        input,
         stream: false,
         tools,
       }),
     ]);
 
-    const realShape = extractShape(realRes.body);
+    if (isInfraSkip(realRes.status) || isModelNotFound(realRes.status, realRes.raw)) {
+      ctx.skip();
+      return;
+    }
+    expect(realRes.status, `Real API error: ${realRes.raw.slice(0, 300)}`).toBe(200);
+
+    const realShape = extractShape(JSON.parse(realRes.raw));
     const mockShape = extractShape(JSON.parse(mockRes.body));
 
     const diffs = triangulate(sdkShape, realShape, mockShape);
@@ -150,7 +282,17 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Responses API drift", () => {
     ).toEqual([]);
   });
 
-  it("streaming tool call event sequence matches", async () => {
+  it("streaming tool call event sequence matches", async (ctx) => {
+    const resolved = await getOpenAIResponsesModel();
+    if ("infra" in resolved) {
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("OpenAI /v1/models exposed no usable model for the Responses API");
+    }
+    const model = resolved.model;
+
     const sdkEvents = [
       ...openaiResponsesTextEventShapes().filter(
         (e) => e.type === "response.created" || e.type === "response.completed",
@@ -170,18 +312,30 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Responses API drift", () => {
         },
       },
     ];
+    const input = [{ role: "user", content: "Weather in Paris" }];
 
-    const [realStream, mockStreamRes] = await Promise.all([
-      openaiResponsesStreaming(config, [{ role: "user", content: "Weather in Paris" }], tools),
+    const [realRes, mockStreamRes] = await Promise.all([
+      fetchOpenAIResponses(model, input, tools, true),
       httpPost(`${instance.url}/v1/responses`, {
-        model: "gpt-4o-mini",
-        input: [{ role: "user", content: "Weather in Paris" }],
+        model,
+        input,
         stream: true,
         tools,
       }),
     ]);
 
-    expect(realStream.rawEvents.length, "Real API returned no SSE events").toBeGreaterThan(0);
+    if (isInfraSkip(realRes.status) || isModelNotFound(realRes.status, realRes.raw)) {
+      ctx.skip();
+      return;
+    }
+    expect(realRes.status, `Real API error: ${realRes.raw.slice(0, 300)}`).toBe(200);
+
+    const realEvents = parseTypedSSE(realRes.raw);
+    expect(realEvents.length, "Real API returned no SSE events").toBeGreaterThan(0);
+    const realSSEShapes = realEvents.map((e) => ({
+      type: e.type,
+      dataShape: extractShape(e.data),
+    }));
 
     const mockEvents = parseTypedSSE(mockStreamRes.body);
     expect(mockEvents.length, "Mock returned no SSE events").toBeGreaterThan(0);
@@ -191,7 +345,7 @@ describe.skipIf(!OPENAI_API_KEY)("OpenAI Responses API drift", () => {
       dataShape: extractShape(e.data),
     }));
 
-    const diffs = compareSSESequences(sdkEvents, realStream.events, mockSSEShapes);
+    const diffs = compareSSESequences(sdkEvents, realSSEShapes, mockSSEShapes);
     const report = formatDriftReport(
       "OpenAI Responses (streaming tool call events)",
       diffs,
