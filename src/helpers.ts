@@ -493,6 +493,8 @@ export function extractOverrides(
     ...(r.systemFingerprint !== undefined && { systemFingerprint: r.systemFingerprint }),
     ...(r.finishReason !== undefined && { finishReason: r.finishReason }),
     ...(r.role !== undefined && { role: r.role }),
+    ...(r.provider !== undefined && { provider: r.provider }),
+    ...(r.nativeFinishReason !== undefined && { nativeFinishReason: r.nativeFinishReason }),
   };
 }
 
@@ -525,16 +527,39 @@ export function estimatePromptTokens(messages: ChatCompletionRequest["messages"]
 
 /**
  * Build usage object: use explicit overrides if provided, otherwise estimate.
+ *
+ * Shared by BOTH the non-streaming completion builders (below) and the
+ * streaming usage-chunk sites in server.ts — the single source of truth for
+ * "explicit token override wins, cost-only override still estimates". Exported
+ * so the streaming path does not re-implement the estimation logic.
  */
-function resolveUsage(
+export function resolveUsage(
   overrides: ResponseOverrides | undefined,
   promptText: string,
   completionText: string,
 ): { prompt_tokens: number; completion_tokens: number; total_tokens: number } {
   if (overrides?.usage) {
     const u = overrides.usage;
-    const prompt = u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? 0;
-    const completion = u.completion_tokens ?? u.output_tokens ?? u.candidatesTokenCount ?? 0;
+    // A usage override that scripts only cost fields (e.g. `{ cost: 0.5 }`)
+    // carries NO token counts. Real providers always report real token usage,
+    // so estimate the counts rather than forcing them to 0 — otherwise a
+    // cost-scripting fixture is unfaithful (cost present, tokens 0). When the
+    // override DOES set any token count we preserve the explicit-or-zero merge
+    // behavior, and any explicit token value always wins.
+    const hasExplicitTokens =
+      u.prompt_tokens !== undefined ||
+      u.completion_tokens !== undefined ||
+      u.total_tokens !== undefined ||
+      u.input_tokens !== undefined ||
+      u.output_tokens !== undefined ||
+      u.promptTokenCount !== undefined ||
+      u.candidatesTokenCount !== undefined ||
+      u.totalTokenCount !== undefined;
+    const fallbackPrompt = hasExplicitTokens ? 0 : estimateTokens(promptText || "x");
+    const fallbackCompletion = hasExplicitTokens ? 0 : estimateTokens(completionText || "x");
+    const prompt = u.prompt_tokens ?? u.input_tokens ?? u.promptTokenCount ?? fallbackPrompt;
+    const completion =
+      u.completion_tokens ?? u.output_tokens ?? u.candidatesTokenCount ?? fallbackCompletion;
     return {
       prompt_tokens: prompt,
       completion_tokens: completion,

@@ -25,7 +25,18 @@ export interface StreamOptions {
   onChunkSent?: () => void;
   /** When set, emitted as the final chunk before [DONE] (OpenAI stream_options.include_usage). */
   usageChunk?: SSEChunk;
+  /**
+   * When true, a single OpenRouter `: OPENROUTER PROCESSING` SSE comment
+   * (keepalive) line is emitted FIRST — before the first data chunk — matching
+   * real OpenRouter bytes (or-capture/chat-stream.sse). A faithful client skips
+   * `:`-prefixed lines; opt-in, default off (so strict OpenAI parsers aren't
+   * surprised). Used only by the OpenRouter chat surface.
+   */
+  openRouterProcessing?: boolean;
 }
+
+/** OpenRouter's SSE keepalive comment line (colon-prefixed, per SSE syntax). */
+const OPENROUTER_PROCESSING_COMMENT = ": OPENROUTER PROCESSING\n\n";
 
 export function calculateDelay(
   chunkIndex: number,
@@ -95,6 +106,13 @@ export async function writeSSEStream(
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
+
+  // OpenRouter emits exactly ONE `: OPENROUTER PROCESSING` keepalive comment
+  // first — before any data frame (opt-in; see or-capture/chat-stream.sse). A
+  // faithful client discards `:`-prefixed lines before JSON-parsing a `data:`.
+  if (opts.openRouterProcessing && !res.writableEnded) {
+    res.write(OPENROUTER_PROCESSING_COMMENT);
+  }
 
   let chunkIndex = 0;
   for (const chunk of chunks) {
