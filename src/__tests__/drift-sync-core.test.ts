@@ -149,6 +149,30 @@ describe("detectDeprecatedFamiliesForSync (mirrors C4's detectDeprecatedFamilies
       candidates: [{ provider: "openai", family: "gpt-4o", stillReferenced: true }],
     });
   });
+
+  // FF1 item B: `claude-fable-5` is a deliberately forward-looking INCLUDE entry
+  // (see model-registry.ts's inline comment) — it is absent from every live
+  // `/models` listing until it launches, which is indistinguishable from a
+  // genuine retirement to a naive classified-minus-live diff. Without a guard,
+  // this family is proposed for removal on EVERY daily sync run (noisy —
+  // human has to reject/dismiss it every day). A genuinely-retired sibling
+  // missing from the same listing must still be proposed normally.
+  it("a forward-looking family (claude-fable-5) absent from live is NEVER proposed for removal, while a genuinely-retired sibling still is", () => {
+    const allAnthropic = [...includeFamilies.anthropic];
+    // Live listing omits BOTH claude-fable-5 (forward-looking, not launched)
+    // AND claude-3-opus (stand-in for a genuinely retired family).
+    const liveFamilies = allAnthropic.filter(
+      (f) => f !== "claude-fable-5" && f !== "claude-3-opus",
+    );
+    const liveIds = [...liveFamilies, ...liveFamilies.map((f) => `${f}-20250101`)];
+    const result = detectDeprecatedFamiliesForSync(liveIds, "anthropic", {
+      isReferenced: () => false,
+    });
+    expect(result.status).toBe("checked");
+    if (result.status !== "checked") return;
+    const families = result.candidates.map((c) => c.family).sort();
+    expect(families).toEqual(["claude-3-opus"]);
+  });
 });
 
 describe("unclassifiedFamiliesForSync (mirrors C4's unclassifiedFamilies)", () => {

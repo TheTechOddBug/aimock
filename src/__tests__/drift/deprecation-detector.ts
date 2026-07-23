@@ -98,3 +98,41 @@ export function isFamilyStillReferenced(family: string): boolean {
   const pattern = new RegExp(`(?<![\\w.-])${escapeRegExp(family)}(?![\\w.-])`);
   return pattern.test(allSourceText());
 }
+
+// ---------------------------------------------------------------------------
+// Forward-looking families — distinct concern from "still referenced" above.
+// ---------------------------------------------------------------------------
+
+type Provider = "openai" | "anthropic" | "gemini";
+
+/**
+ * Model families deliberately classified INCLUDE ahead of general
+ * availability (see `model-registry.ts`'s inline "forward-looking" comment on
+ * `claude-fable-5`). A forward-looking family is, BY CONSTRUCTION, absent
+ * from every live `/models` listing until it launches — that is
+ * indistinguishable, to a naive `classified − live` diff, from a genuine
+ * retirement. It is ALSO indistinguishable via `isFamilyStillReferenced`:
+ * aimock legitimately has no builder/fixture reference to a family it has not
+ * built yet, so that scan reports zero-reference too, same as a truly
+ * retired family would. Without this allowlist, a forward-looking family
+ * would be mechanically proposed for removal (or routed to a needs-human
+ * note) on EVERY daily drift-sync run — pure noise a human has to
+ * reject/dismiss every day, forever, until the family finally goes GA.
+ *
+ * A family listed here is excluded from `detectDeprecatedFamiliesForSync`'s
+ * `missing` candidate set entirely (see `scripts/drift-sync.ts`) — no removal
+ * proposal, no needs-human note, nothing. Reversible: delete the entry the
+ * same day the family actually appears in a live listing (at that point it is
+ * a real, launched family like any other, and ordinary deprecation detection
+ * applies to it going forward).
+ */
+export const FORWARD_LOOKING_FAMILIES: Record<Provider, ReadonlySet<string>> = {
+  openai: new Set(),
+  anthropic: new Set(["claude-fable-5"]),
+  gemini: new Set(),
+};
+
+/** True when `family` is a known forward-looking (not-yet-launched) INCLUDE entry. */
+export function isForwardLookingFamily(family: string, provider: Provider): boolean {
+  return FORWARD_LOOKING_FAMILIES[provider].has(family);
+}
