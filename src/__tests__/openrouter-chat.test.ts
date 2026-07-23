@@ -605,6 +605,183 @@ describe("OpenRouter chat: fail-closed + fallback correctness (round-1 fixes)", 
   });
 });
 
+// ---------------------------------------------------------------------------
+// v1.1 — error-class-bound fallthrough (`fallthrough: false` = terminal error)
+// ---------------------------------------------------------------------------
+
+describe("OpenRouter chat: error-class-bound fallthrough (v1.1)", () => {
+  let tmpDir: string | null = null;
+  afterEach(() => {
+    if (tmpDir) {
+      rmSync(tmpDir, { recursive: true, force: true });
+      tmpDir = null;
+    }
+  });
+
+  // A 403 whose error CLASS does not fail over on real OpenRouter (the
+  // openclaw #60191 pattern): the primary error is marked `fallthrough: false`,
+  // so it must be served as terminal even though a good fallback follows.
+  const terminalChain = (fallthrough?: boolean): Fixture[] => [
+    {
+      match: { model: "primary/bad", userMessage: "route" },
+      response: {
+        error: { message: "budget exceeded (non-failover class)" },
+        status: 403,
+        ...(fallthrough !== undefined && { fallthrough }),
+      },
+    },
+    {
+      match: { model: "fallback/good", userMessage: "route" },
+      response: { content: "served by fallback", usage: { cost: 0.5 } },
+    },
+  ];
+
+  it("fallthrough:false serves the primary error as terminal — NO failover", async () => {
+    instance = await createServer(terminalChain(false));
+    const res = await httpPost(`${instance.url}${OR}`, {
+      model: "primary/bad",
+      models: ["primary/bad", "fallback/good"],
+      messages: [{ role: "user", content: "route" }],
+    });
+    const json = JSON.parse(res.body);
+    // Terminal: the primary's 403 is served, the good fallback is never reached.
+    expect(res.status).toBe(403);
+    expect(json.error.code).toBe(403);
+    expect(json.error.message).toBe("budget exceeded (non-failover class)");
+  });
+
+  it("fallthrough absent (default) still falls through to the good fallback", async () => {
+    instance = await createServer(terminalChain(undefined));
+    const res = await httpPost(`${instance.url}${OR}`, {
+      model: "primary/bad",
+      models: ["primary/bad", "fallback/good"],
+      messages: [{ role: "user", content: "route" }],
+    });
+    const json = JSON.parse(res.body);
+    expect(res.status).toBe(200);
+    expect(json.model).toBe("fallback/good");
+    expect(json.choices[0].message.content).toBe("served by fallback");
+  });
+
+  it("fallthrough:true (explicit) still falls through to the good fallback", async () => {
+    instance = await createServer(terminalChain(true));
+    const res = await httpPost(`${instance.url}${OR}`, {
+      model: "primary/bad",
+      models: ["primary/bad", "fallback/good"],
+      messages: [{ role: "user", content: "route" }],
+    });
+    const json = JSON.parse(res.body);
+    expect(res.status).toBe(200);
+    expect(json.model).toBe("fallback/good");
+  });
+
+  it("fallthrough:false composes with allow_fallbacks:true — still terminal", async () => {
+    // The per-error gate is independent of the request-level gate: if EITHER
+    // says don't fall through, don't. allow_fallbacks:true does not override
+    // fallthrough:false.
+    instance = await createServer(terminalChain(false));
+    const res = await httpPost(`${instance.url}${OR}`, {
+      model: "primary/bad",
+      models: ["primary/bad", "fallback/good"],
+      provider: { allow_fallbacks: true },
+      messages: [{ role: "user", content: "route" }],
+    });
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.body).error.message).toBe("budget exceeded (non-failover class)");
+  });
+
+  it("fallthrough:false on an error does not affect a normal (non-error) fallback chain", async () => {
+    // Shipped behavior intact: a SUCCESS primary is served regardless of any
+    // fallthrough flag on a sibling error fixture; the terminal-error flag only
+    // gates the error candidate it lives on.
+    const fixtures: Fixture[] = [
+      {
+        match: { model: "primary/good", userMessage: "route" },
+        response: { content: "served by primary" },
+      },
+      {
+        match: { model: "other/bad", userMessage: "route" },
+        response: { error: { message: "non-failover" }, status: 403, fallthrough: false },
+      },
+    ];
+    instance = await createServer(fixtures);
+    const res = await httpPost(`${instance.url}${OR}`, {
+      model: "primary/good",
+      models: ["primary/good", "other/bad"],
+      messages: [{ role: "user", content: "route" }],
+    });
+    const json = JSON.parse(res.body);
+    expect(res.status).toBe(200);
+    expect(json.model).toBe("primary/good");
+    expect(json.choices[0].message.content).toBe("served by primary");
+  });
+
+  it("threads fallthrough:false through the real JSON fixture-loader path", async () => {
+    tmpDir = mkdtempSync(join(tmpdir(), "or-fallthrough-fixture-"));
+    const fixtureFile = join(tmpDir, "fallthrough.json");
+    writeFileSync(
+      fixtureFile,
+      JSON.stringify({
+        fixtures: [
+          {
+            match: { model: "primary/bad", userMessage: "route" },
+            response: {
+              error: { message: "budget exceeded (non-failover class)" },
+              status: 403,
+              fallthrough: false,
+            },
+          },
+          {
+            match: { model: "fallback/good", userMessage: "route" },
+            response: { content: "served by fallback" },
+          },
+        ],
+      }),
+      "utf-8",
+    );
+    const loaded = loadFixtureFile(fixtureFile);
+    const errors = validateFixtures(loaded).filter((r) => r.severity === "error");
+    expect(errors).toEqual([]);
+
+    instance = await createServer(loaded);
+    const res = await httpPost(`${instance.url}${OR}`, {
+      model: "primary/bad",
+      models: ["primary/bad", "fallback/good"],
+      messages: [{ role: "user", content: "route" }],
+    });
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.body).error.message).toBe("budget exceeded (non-failover class)");
+  });
+
+  it("rejects a non-boolean fallthrough at load (fail-closed cannot fail open)", async () => {
+    // A JSON/YAML author writing "false" (string), 0, or null would otherwise
+    // be silently treated as fall-through (`!== false` is true), the OPPOSITE
+    // of the intended terminal behavior. The loader must reject it up front.
+    const bad: Fixture[] = [
+      {
+        match: { model: "primary/bad", userMessage: "route" },
+        // Intentionally wrong type — mimics a JSON author's "false" string.
+        response: {
+          error: { message: "x" },
+          status: 403,
+          fallthrough: "false",
+        } as unknown as Fixture["response"],
+      },
+    ];
+    const errors = validateFixtures(bad).filter((r) => r.severity === "error");
+    expect(errors.some((e) => /fallthrough must be a boolean/.test(e.message))).toBe(true);
+
+    // A proper boolean is accepted (no error).
+    const good: Fixture[] = [
+      {
+        match: { model: "primary/bad", userMessage: "route" },
+        response: { error: { message: "x" }, status: 403, fallthrough: false },
+      },
+    ];
+    expect(validateFixtures(good).filter((r) => r.severity === "error")).toEqual([]);
+  });
+});
+
 describe("OpenRouter request extensions", () => {
   it("accepts and journals extension fields + attribution headers without rejecting", async () => {
     const fixtures: Fixture[] = [{ match: { userMessage: "hi" }, response: { content: "ok" } }];

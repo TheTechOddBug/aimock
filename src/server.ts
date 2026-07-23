@@ -52,7 +52,13 @@ import {
   handleOpenRouterKey,
   handleOpenRouterCredits,
 } from "./openrouter-chat.js";
-import type { FixtureResponse, ChatCompletion, SSEChunk, ResponseOverrides } from "./types.js";
+import type {
+  FixtureResponse,
+  ErrorResponse,
+  ChatCompletion,
+  SSEChunk,
+  ResponseOverrides,
+} from "./types.js";
 import { handleResponses } from "./responses.js";
 import { handleMessages } from "./messages.js";
 import { handleGemini } from "./gemini.js";
@@ -701,13 +707,23 @@ async function handleCompletions(
       // request see the increment (see the `let matchCounts` note above).
       matchCounts = journal.getFixtureMatchCountsForTest(testId);
       responseModel = candidate;
-      if (outcome.isError && allowFallbacks) {
-        // Runtime provider failure — remember it and fail over to the next.
-        lastErrorFixture = outcome.fixture;
-        lastErrorResponse = outcome.response;
-        continue;
+      if (outcome.isError) {
+        // Per-error-fixture failover gate. An ERROR fixture may set
+        // `fallthrough: false` to mark its error CLASS as non-failover-eligible
+        // — reproducing OpenRouter serving a 403/generic provider error as
+        // terminal instead of advancing to the next `models[]` candidate
+        // (openclaw #60191). Absent / `true` keeps the default fall-through.
+        // Composes with the request-level `allowFallbacks` gate: fail over only
+        // when BOTH allow it (if EITHER says don't, this candidate is terminal).
+        const errorFallsThrough = (outcome.response as ErrorResponse).fallthrough !== false;
+        if (allowFallbacks && errorFallsThrough) {
+          // Runtime provider failure — remember it and fail over to the next.
+          lastErrorFixture = outcome.fixture;
+          lastErrorResponse = outcome.response;
+          continue;
+        }
       }
-      // Success, or a primary error under allow_fallbacks:false — terminal.
+      // Success, or a terminal error (allow_fallbacks:false or fallthrough:false).
       fixture = outcome.fixture;
       preResolvedResponse = outcome.response;
       break;

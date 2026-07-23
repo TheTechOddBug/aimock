@@ -46,10 +46,17 @@ export interface ChatCompletionRequest {
   /**
    * OpenRouter fallback model list. When present (and the request arrived on
    * the OpenRouter `/api/v1/...` base), the candidate list `[model, ...models]`
-   * is attempted in order and the first NON-error fixture match wins — the
-   * winning slug is echoed back as the response `model`. Purely additive: a
-   * request without `models` behaves as a single-model match. Every other
-   * OpenRouter request extension (`provider`, `route`, `reasoning`, `plugins`,
+   * is attempted in order. A NON-error fixture match wins; an ERROR fixture
+   * candidate falls through to the next candidate by default — UNLESS it is
+   * terminal, in which case that error is served with no failover. An error is
+   * terminal when its fixture sets `fallthrough: false` (per-error-class gate)
+   * or when the request sets `provider.allow_fallbacks: false` (request-level
+   * gate). A winning (non-error) slug is echoed back as the response `model`;
+   * when the chain terminates on an error, the response is the OpenRouter error
+   * envelope (`{ error: { code, message, metadata? } }`), which carries no
+   * `model` field. Purely additive: a request without `models` behaves as a
+   * single-model match. Every other
+   * OpenRouter request extension (`route`, `reasoning`, `plugins`,
    * `prediction`, `usage`, and any unknown key) is accepted and journaled via
    * the index signature below — never required, never rejected. aimock does not
    * model those sub-shapes; unknown body keys pass straight through.
@@ -347,6 +354,22 @@ export interface ErrorResponse {
   status?: number;
   /** Override the Retry-After header value on 429 responses. Default: 1. */
   retryAfter?: number;
+  /**
+   * OpenRouter `models[]` failover eligibility for THIS error class. Real
+   * OpenRouter fails over INCONSISTENTLY by error class — a `403 budget-exceeded`
+   * or a generic "provider returned error" is served as terminal (it does NOT
+   * advance to the next `models[]` candidate), while 429/503 usually do fail
+   * over (openclaw #60191). This flag lets a fixture reproduce that:
+   * - absent / `true` (default) — the error candidate FALLS THROUGH to the next
+   *   `models[]` candidate (backward-compatible; existing fixtures unchanged).
+   * - `false` — the error is TERMINAL: the fallback loop stops and serves this
+   *   error with no failover, even if a later candidate would match.
+   *
+   * Composes with the request-level `provider.allow_fallbacks`: fall-through
+   * happens only when BOTH allow it (if EITHER says don't, don't). Only
+   * consulted for OpenRouter `models[]` fallback; ignored elsewhere.
+   */
+  fallthrough?: boolean;
 }
 
 export interface EmbeddingResponse {
