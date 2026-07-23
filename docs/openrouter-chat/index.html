@@ -344,6 +344,37 @@
           primary candidate is tried, and its error (or a miss) is terminal instead of walking the
           rest of the list.
         </p>
+        <p>
+          Real OpenRouter fails over <em>inconsistently</em> by error class: a
+          <code>403 budget-exceeded</code> or a generic "provider returned error" is served as
+          terminal (it does <em>not</em> advance to the next candidate), while 429/503 usually do
+          fail over. Reproduce that per error class with <code>fallthrough: false</code> on the
+          error fixture &mdash; the loop stops and serves that error as terminal, no failover, even
+          when a good candidate follows. Absent (or <code>true</code>) keeps the default
+          fall-through, so existing fixtures are unchanged. This composes with the request-level
+          gate: fall-through happens only when both allow it (if either
+          <code>allow_fallbacks: false</code> or <code>fallthrough: false</code> says stop, the
+          error is terminal). Model an error class a dev must handle themselves &mdash; the exact
+          failure that burned them &mdash; by setting <code>fallthrough: false</code> on that
+          class's fixture (e.g. the 403) and leaving 429/503 fixtures to default.
+        </p>
+        <div class="code-block">
+          <div class="code-block-header">
+            terminal-error.test.ts <span class="lang-tag">ts</span>
+          </div>
+          <pre><code><span class="cm">// a 403 that does NOT fail over — the app must handle it, no fallback</span>
+<span class="op">mock</span>.<span class="fn">on</span>(
+  { <span class="prop">model</span>: <span class="str">"openai/gpt-4o"</span>, <span class="prop">userMessage</span>: <span class="str">"route"</span> },
+  { <span class="prop">error</span>: { <span class="prop">message</span>: <span class="str">"budget exceeded"</span> }, <span class="prop">status</span>: <span class="num">403</span>, <span class="prop">fallthrough</span>: <span class="kw">false</span> }
+);
+<span class="op">mock</span>.<span class="fn">on</span>(
+  { <span class="prop">model</span>: <span class="str">"anthropic/claude-3.5-sonnet"</span>, <span class="prop">userMessage</span>: <span class="str">"route"</span> },
+  { <span class="prop">content</span>: <span class="str">"never reached"</span> }
+);
+
+<span class="cm">// models[] lists a good fallback, but the 403 is terminal — no failover</span>
+<span class="fn">expect</span>(<span class="op">res</span>.<span class="prop">status</span>).<span class="fn">toBe</span>(<span class="num">403</span>);</code></pre>
+        </div>
         <div class="info-box">
           <p>
             <strong>Deliberate non-goal.</strong> Real OpenRouter rejects an unknown/invalid model
