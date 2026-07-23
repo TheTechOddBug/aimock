@@ -633,6 +633,28 @@ export function extractRawLocation(msg: string): string {
   );
 }
 
+/**
+ * F1 — PER-LEG (single-message) infra classification. This is the primitive
+ * that keeps ONE leg's failure from batch-poisoning its siblings: each
+ * unparseable failure is judged ALONE, so an unparseable leg can never flip a
+ * genuine infra leg into the quarantine lane (nor a benign infra leg mask a
+ * genuinely-unparseable sibling).
+ *
+ * A message is benign infra iff it carries POSITIVE infra evidence AND shows no
+ * drift-like signal, both judged on the SAME stack-stripped text (A3 — the two
+ * scans must never disagree because they saw different inputs). A bare
+ * AssertionError with no infra token is NOT infra (returns false → the caller
+ * quarantines it for review), preserving the CLASS 1 "unrecognized ⇒ never a
+ * false all-clear" invariant at the per-leg grain.
+ */
+export function classifySingleUnparseableAsInfra(message: string): boolean {
+  // Normalize ONCE; both scans consume the identical normalized text (A3).
+  const normalized = stripStackFrames(message);
+  const hasInfraEvidence = INFRA_INDICATORS.some((re) => re.test(normalized));
+  const isDriftLike = DRIFT_LIKE_INDICATORS.some((re) => re.test(normalized));
+  return hasInfraEvidence && !isDriftLike;
+}
+
 export function classifyUnparseableAsInfra(unparseableMessages: string[]): boolean {
   // CLASS 1 — fail-loud on absent evidence. No messages means NO positive infra
   // evidence, so this is NOT a benign "all clear". `[].every(...)` is vacuously
@@ -641,17 +663,13 @@ export function classifyUnparseableAsInfra(unparseableMessages: string[]): boole
   // false all-clear.
   if (unparseableMessages.length === 0) return false;
 
-  // Normalize ONCE per message; both scans consume the identical normalized
-  // text (A3 — the two scans must never disagree due to differing inputs).
-  const normalized = unparseableMessages.map(stripStackFrames);
-
-  // Infra requires POSITIVE evidence on EVERY message AND zero drift signal on
-  // ALL of them. If any message lacks an infra indicator, or any message looks
-  // drift-like, we do NOT swallow — the caller throws (exit 1, investigate).
-  const allInfraErrors = normalized.every((msg) => INFRA_INDICATORS.some((re) => re.test(msg)));
-  const anyDriftLike = normalized.some((msg) => DRIFT_LIKE_INDICATORS.some((re) => re.test(msg)));
-
-  return allInfraErrors && !anyDriftLike;
+  // Batch semantics are exactly the conjunction of the per-leg predicate: the
+  // whole set is benign infra iff EVERY message is individually benign infra
+  // (every message has an infra indicator AND none is drift-like). Kept for the
+  // back-compat batch callers/tests; the collector's swallow-vs-quarantine
+  // decision below is now made PER LEG via classifySingleUnparseableAsInfra so a
+  // mixed batch no longer drags benign infra legs into quarantine.
+  return unparseableMessages.every(classifySingleUnparseableAsInfra);
 }
 
 /**
@@ -927,21 +945,33 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
       console.warn(`  Unparseable failure message (first 300 chars): ${msg.slice(0, 300)}`);
     }
 
-    if (classifyUnparseableAsInfra(unparseableMessages)) {
+    // F1: classify EACH unparseable failure on its own so one leg's genuinely-
+    // unparseable output never batch-poisons a sibling that failed on benign
+    // infra. Previously a single all-or-nothing classifyUnparseableAsInfra call
+    // over the whole batch meant one non-infra leg flipped the ENTIRE batch to
+    // "not infra" and dragged every benign infra sibling into quarantine (exit
+    // 5) — poisoning the shared base report for every downstream PR. Now an infra
+    // leg is swallowed on its own merits and only the genuinely-unparseable
+    // leg(s) are quarantined for review. A1.3: quarantine (exit 5), never a
+    // fail-loud crash (exit 1) — exit 1 is reserved for genuine collector bugs.
+    const infraCount = unparseableFailures.filter((f) =>
+      classifySingleUnparseableAsInfra(f.message),
+    ).length;
+    const quarantinedLegs = unparseableFailures.filter(
+      (f) => !classifySingleUnparseableAsInfra(f.message),
+    );
+    if (infraCount > 0) {
       console.warn(
-        `WARNING: ${unparseable} test failure(s) appear to be API/infrastructure errors ` +
-          `(not drift reports). Continuing with 0 drift entries.`,
+        `WARNING: ${infraCount} test failure(s) appear to be API/infrastructure errors ` +
+          `(not drift reports) — swallowed as benign infra.`,
       );
-    } else {
-      // A1.3: genuine-but-unparseable drift is no longer a fail-loud crash (exit
-      // 1). Each such failure is quarantined (exit 5) so it surfaces for human
-      // review without being silently swallowed as a green. Exit 1 is now
-      // reserved for genuine collector bugs (unhandled exceptions).
+    }
+    if (quarantinedLegs.length > 0) {
       console.warn(
-        `WARNING: ${unparseable} test failure(s) could not be parsed as drift reports — ` +
+        `WARNING: ${quarantinedLegs.length} test failure(s) could not be parsed as drift reports — ` +
           `quarantined for review (exit 5).`,
       );
-      for (const f of unparseableFailures) {
+      for (const f of quarantinedLegs) {
         quarantine.push({
           provider: "unknown",
           testName: f.testName,
