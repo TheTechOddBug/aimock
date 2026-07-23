@@ -929,6 +929,44 @@ describe("collectDriftEntries", () => {
       expect(exitCodeOf(result)).toBe(0);
     });
 
+    it("F1: a benign infra leg is NOT batch-poisoned into quarantine by an unparseable sibling (per-leg classification)", () => {
+      // The recurring session failure: one leg emits genuinely-unparseable output
+      // in the SAME run as sibling legs that failed on benign infra (network
+      // flake). Pre-fix, the all-or-nothing classifyUnparseableAsInfra gate saw a
+      // MIXED batch (not EVERY message is infra) and quarantined EVERY unparseable
+      // failure — dragging the benign infra leg into the shared base report's
+      // quarantine (exit 5) and poisoning it for every downstream PR. Per-leg
+      // classification swallows the infra leg on its own and quarantines ONLY the
+      // genuinely-unparseable leg.
+      const result = makeResult([
+        // Leg A: benign infra (network flake) — swallowed on its own merits.
+        makeAssertion({
+          status: "failed",
+          ancestorTitles: ["OpenAI Chat Completions drift"],
+          title: "non-streaming text matches real API",
+          failureMessages: [REAL_INFRA_BODY],
+        }),
+        // Leg B: genuinely unparseable (no infra token) — legitimately quarantined.
+        makeAssertion({
+          status: "failed",
+          ancestorTitles: ["Broken Suite"],
+          title: "unrecognized",
+          failureMessages: [
+            "AssertionError: expected 1 to be 2\n    at foo (/repo/src/__tests__/drift/b.drift.ts:1:1)",
+          ],
+        }),
+      ]);
+      const { entries, quarantine } = collectDriftEntries(result);
+      expect(entries).toEqual([]);
+      // GREEN: exactly ONE quarantine entry — leg B only; leg A (infra) swallowed.
+      // RED pre-fix: quarantine.length === 2 (leg A poisoned in alongside leg B).
+      expect(quarantine).toHaveLength(1);
+      expect(quarantine[0].testName).toContain("unrecognized");
+      // The genuinely-unparseable leg still legitimately reds the run (exit 5) —
+      // real drift/quarantine detection is NOT weakened.
+      expect(exitCodeOf(result)).toBe(5);
+    });
+
     it("canary (unknown-model) failure → critical entry + exit 2", () => {
       const result = makeResult([
         makeAssertion({

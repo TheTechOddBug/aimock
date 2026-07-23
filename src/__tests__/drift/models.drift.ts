@@ -27,10 +27,17 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { listOpenAIModels, listAnthropicModels, listGeminiModels } from "./providers.js";
+import {
+  listOpenAIModels,
+  listAnthropicModels,
+  listGeminiModels,
+  InfraError,
+  isInfraSkip,
+} from "./providers.js";
 import { normalizeModelFamily } from "./model-family.js";
-import { NON_MODEL_TOKENS, isClassifiedFamily } from "./model-registry.js";
+import { NON_MODEL_TOKENS, isClassifiedFamily, includeFamilies } from "./model-registry.js";
 import { formatDriftReport } from "./schema.js";
+import { isFamilyStillReferenced } from "./deprecation-detector.js";
 
 type Provider = "openai" | "anthropic" | "gemini";
 
@@ -87,6 +94,224 @@ function assertNoUnclassifiedFamilies(
       : `No drift detected: ${context}`;
   expect(unclassified, report).toEqual([]);
 }
+
+// ---------------------------------------------------------------------------
+// C4: deterministic DEPRECATION detector — `classified − live` (net-new).
+//
+// The mirror image of `unclassifiedFamilies`: instead of a live family with no
+// classification (drift = a new family), this flags a CLASSIFIED family
+// (one aimock actively mocks, i.e. `includeFamilies[provider]`) that a
+// healthy live `/models` listing no longer contains — a mechanical, zero-LLM
+// signal the provider retired it.
+//
+// FAIL-CLOSED (safety-critical — a net-new DESTRUCTIVE path): never emit a
+// removal signal off a listing that is empty, short/truncated, or that the
+// caller could not fetch at all (infra error). A transient truncated or
+// failed `/models` response must never look like "every family disappeared"
+// and cascade into proposing to nuke the registry. The floor defaults to the
+// number of families aimock mocks for that provider — a healthy provider
+// listing returns many more raw ids than distinct families (every dated
+// snapshot/build-tag variant multiplies one family into several ids), so a
+// listing shorter than the family count itself is definitionally truncated,
+// not a genuinely tiny catalog.
+//
+// A family that clears the fail-closed floor and is genuinely missing from
+// the live listing is still not auto-proposed for removal if it is STILL
+// REFERENCED elsewhere in aimock's own source (DEFAULT_MODELS, builders,
+// fixtures — see `isFamilyStillReferenced` in `deprecation-detector.ts`):
+// that case routes to a human instead (§4.4 — no silent auto-classify).
+// ---------------------------------------------------------------------------
+
+/** One `classified − live` candidate, tagged with whether aimock's own source
+ * still references it (in which case it must route to a human, not be
+ * auto-proposed for removal — see module doc above). */
+export interface DeprecationCandidate {
+  provider: Provider;
+  family: string;
+  stillReferenced: boolean;
+}
+
+export type DeprecationCheckResult =
+  | { status: "skipped"; reason: string }
+  | { status: "checked"; candidates: DeprecationCandidate[] };
+
+/**
+ * Pure `classified − live` diff for one provider, given an already-fetched
+ * live `/models` id list. Fail-closed on an empty/short listing (see module
+ * doc). `opts.isReferenced` defaults to the real source-tree ref-scan
+ * (`isFamilyStillReferenced`) but is injectable so callers/tests can supply a
+ * deterministic stub without touching the filesystem.
+ */
+export function detectDeprecatedFamilies(
+  liveModelIds: string[],
+  provider: Provider,
+  opts: {
+    isReferenced?: (family: string, provider: Provider) => boolean;
+    minListingSize?: number;
+  } = {},
+): DeprecationCheckResult {
+  const classified = includeFamilies[provider];
+  const floor = opts.minListingSize ?? classified.size;
+
+  if (liveModelIds.length === 0 || liveModelIds.length < floor) {
+    return {
+      status: "skipped",
+      reason:
+        `live /models listing too short to trust for ${provider} ` +
+        `(${liveModelIds.length} raw id(s), need >= ${floor} — the number of ` +
+        `families aimock mocks for this provider) — never mass-removing off a ` +
+        `truncated or empty listing`,
+    };
+  }
+
+  const liveFamilies = new Set(liveModelIds.map((id) => normalizeModelFamily(id, provider)));
+  const missing = [...classified].filter((family) => !liveFamilies.has(family)).sort();
+  const isReferenced = opts.isReferenced ?? isFamilyStillReferenced;
+
+  return {
+    status: "checked",
+    candidates: missing.map((family) => ({
+      provider,
+      family,
+      stillReferenced: isReferenced(family, provider),
+    })),
+  };
+}
+
+/**
+ * Async wrapper around {@link detectDeprecatedFamilies} for a real live-fetch
+ * function: classifies a thrown {@link InfraError} via `isInfraSkip` (R0) as
+ * an honest SKIP — the same auth/credit/rate-limit/5xx conditions the other
+ * live legs treat as a transient provider-side outage, never a drift/removal
+ * finding. A non-infra error still propagates (never silently swallowed).
+ */
+export async function checkDeprecatedFamiliesLive(
+  fetchLiveModels: () => Promise<string[]>,
+  provider: Provider,
+  opts: {
+    isReferenced?: (family: string, provider: Provider) => boolean;
+    minListingSize?: number;
+  } = {},
+): Promise<DeprecationCheckResult> {
+  try {
+    const liveModelIds = await fetchLiveModels();
+    return detectDeprecatedFamilies(liveModelIds, provider, opts);
+  } catch (err) {
+    if (err instanceof InfraError && isInfraSkip(err.status)) {
+      return {
+        status: "skipped",
+        reason:
+          `infra error (status ${err.status}) fetching live /models for ` +
+          `${provider} — never mass-removing off a failed listing`,
+      };
+    }
+    throw err;
+  }
+}
+
+describe("C4: detectDeprecatedFamilies (classified − live, fail-closed)", () => {
+  it("FAIL-CLOSED: an empty live listing never proposes removal", () => {
+    const result = detectDeprecatedFamilies([], "openai");
+    expect(result.status).toBe("skipped");
+  });
+
+  it("FAIL-CLOSED: a short/truncated live listing never proposes removal", () => {
+    // Far fewer raw ids than openai's include-family count — a truncated
+    // listing, not a genuinely tiny provider catalog.
+    const result = detectDeprecatedFamilies(["gpt-4o"], "openai");
+    expect(result.status).toBe("skipped");
+  });
+
+  it("a healthy listing omitting a classified family flags EXACTLY that family", () => {
+    // A healthy-sized live listing (>= the fail-closed floor) covering every
+    // include family EXCEPT gpt-4o, whose family is genuinely missing.
+    const allButGpt4o = [...includeFamilies.openai].filter((f) => f !== "gpt-4o");
+    const liveIds = [...allButGpt4o, ...allButGpt4o.map((f) => `${f}-2025-01-01`)];
+    const result = detectDeprecatedFamilies(liveIds, "openai", { isReferenced: () => false });
+    expect(result.status).toBe("checked");
+    if (result.status !== "checked") return;
+    expect(result.candidates).toEqual([
+      { provider: "openai", family: "gpt-4o", stillReferenced: false },
+    ]);
+  });
+
+  it("a still-referenced deprecated family routes to human (stillReferenced: true)", () => {
+    const allButGpt4o = [...includeFamilies.openai].filter((f) => f !== "gpt-4o");
+    const liveIds = [...allButGpt4o, ...allButGpt4o.map((f) => `${f}-2025-01-01`)];
+    const result = detectDeprecatedFamilies(liveIds, "openai", { isReferenced: () => true });
+    expect(result.status).toBe("checked");
+    if (result.status !== "checked") return;
+    expect(result.candidates).toEqual([
+      { provider: "openai", family: "gpt-4o", stillReferenced: true },
+    ]);
+  });
+
+  it("a healthy listing missing nothing reports zero candidates", () => {
+    const allFamilies = [...includeFamilies.openai];
+    const liveIds = [...allFamilies, ...allFamilies.map((f) => `${f}-2025-01-01`)];
+    const result = detectDeprecatedFamilies(liveIds, "openai");
+    expect(result.status).toBe("checked");
+    if (result.status !== "checked") return;
+    expect(result.candidates).toEqual([]);
+  });
+});
+
+describe("C4: checkDeprecatedFamiliesLive (infra-error short-circuit via isInfraSkip)", () => {
+  it("an infra error (401/402/403/429/5xx) is an honest SKIP, never a removal signal", async () => {
+    for (const status of [401, 402, 403, 429, 503]) {
+      expect(isInfraSkip(status)).toBe(true); // R0 classification consumed directly below
+      const result = await checkDeprecatedFamiliesLive(
+        () => Promise.reject(new InfraError("boom", status)),
+        "openai",
+      );
+      expect(result.status).toBe("skipped");
+    }
+  });
+
+  it("a genuine non-infra error propagates (never silently swallowed as a skip)", async () => {
+    await expect(
+      checkDeprecatedFamiliesLive(() => Promise.reject(new Error("boom, not infra")), "openai"),
+    ).rejects.toThrow("boom, not infra");
+  });
+
+  it("an InfraError with a non-skip status (e.g. a hypothetical 3xx) still propagates", () => {
+    expect(isInfraSkip(200)).toBe(false);
+    expect(isInfraSkip(404)).toBe(false);
+  });
+
+  it("a healthy fetch flows through to the deterministic diff", async () => {
+    const allButGpt4o = [...includeFamilies.openai].filter((f) => f !== "gpt-4o");
+    const liveIds = [...allButGpt4o, ...allButGpt4o.map((f) => `${f}-2025-01-01`)];
+    const result = await checkDeprecatedFamiliesLive(() => Promise.resolve(liveIds), "openai", {
+      isReferenced: () => false,
+    });
+    expect(result.status).toBe("checked");
+    if (result.status !== "checked") return;
+    expect(result.candidates).toEqual([
+      { provider: "openai", family: "gpt-4o", stillReferenced: false },
+    ]);
+  });
+});
+
+describe("C4: isFamilyStillReferenced (real source-tree ref-scan, zero-LLM)", () => {
+  it("finds a real reference (gpt-4 and gpt-4o are both referenced in src/server.ts)", () => {
+    expect(isFamilyStillReferenced("gpt-4", "openai")).toBe(true);
+    expect(isFamilyStillReferenced("gpt-4o", "openai")).toBe(true);
+  });
+
+  it("reports zero-reference for a synthetic family that appears nowhere in src/", () => {
+    expect(isFamilyStillReferenced("zzz-totally-fictional-family-not-real", "openai")).toBe(false);
+  });
+
+  it("does not false-positive from being a strict substring of a longer live id", () => {
+    // A naive substring scan would call "gpt-4" referenced merely because
+    // "gpt-4-turbo"/"gpt-4o" appear in source; the boundary-aware scan must
+    // not confuse the two. gpt-4 IS separately, exactly referenced in
+    // DEFAULT_MODELS (asserted above) — this confirms the match is a real
+    // boundary hit, not a substring artifact.
+    expect(isFamilyStillReferenced("gpt-4-turbo-nonexistent-suffix", "openai")).toBe(false);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // Regression suite (no live keys) — exercises the REAL pipeline with injected

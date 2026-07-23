@@ -1,0 +1,704 @@
+/**
+ * C2: deterministic drift-sync CORE — the DATA-only, ZERO-LLM replacement for
+ * the freewriter's DECISION role on the model-churn (add/deprecate) leg.
+ *
+ * Exercises `runDriftSyncCore` and its building blocks (the mirrored
+ * classification predicates, the AST-located mechanical registry edits, and
+ * the needs-human dedup note-file mechanism) purely over injected deps — no
+ * real fs/git/network I/O, so every scenario below is deterministic and fast.
+ *
+ * RED (observed before this module existed): `scripts/drift-sync.ts` exported
+ * only the C1 git/branch/commit/PR plumbing (todayStamp, exec, getChangedFiles,
+ * buildPrBody, gatedCommitFiles, ...) — none of `runDriftSyncCore`,
+ * `detectDeprecatedFamiliesForSync`, `removeFamilyLiteralInSource`, etc.
+ * existed, so a live churn scenario (a new classified model, or a retired
+ * family) had NO mechanical sync path at all: the only remediation route was
+ * the LLM freewriter. Verbatim capture of that RED state (this test file
+ * against the pre-C2 module) is in the slot's final report.
+ */
+import { describe, it, expect, vi } from "vitest";
+import { execFileSync } from "node:child_process";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { includeFamilies } from "./drift/model-registry.js";
+import {
+  detectDeprecatedFamiliesForSync,
+  unclassifiedFamiliesForSync,
+  removeFamilyLiteralInSource,
+  addFamilyLiteralInSource,
+  proposalNoteRelPath,
+  parseProposalDecision,
+  renderProposalNote,
+  runDriftSyncCore,
+  computeChangesetKey,
+  revertSyncFiles,
+  SyncCoreReason,
+  MODEL_REGISTRY_REL_PATH,
+  DRIFT_PROPOSALS_DIR,
+  type SyncCoreDeps,
+  type ProviderChurnInput,
+  type SyncCheckResultLike,
+} from "../../scripts/drift-sync.js";
+
+// ---------------------------------------------------------------------------
+// Test fixture: a minimal, synthetic "model-registry.ts"-shaped source text —
+// same array-literal-inside-a-2-arg-call-expression shape the real file uses,
+// seeded with the REAL openai includeFamilies set (so a removal target like
+// "gpt-4o" is guaranteed present, and an addition target like "gpt-live" is
+// guaranteed absent — mirrors C4's own test fixtures in models.drift.ts).
+// ---------------------------------------------------------------------------
+
+function fixtureRegistrySource(): string {
+  const openaiFamilies = [...includeFamilies.openai];
+  const lines = [
+    "export const includeFamilies = {",
+    '  openai: set("openai", [',
+    ...openaiFamilies.map((f) => `    "${f}",`),
+    "  ]),",
+    '  anthropic: set("anthropic", [',
+    '    "claude-3-5-sonnet",',
+    "  ]),",
+    '  gemini: set("gemini", [',
+    '    "gemini-2.5-flash",',
+    "  ]),",
+    "};",
+  ];
+  return lines.join("\n");
+}
+
+/** In-memory fake fs + gate for runDriftSyncCore — no real disk/git touched. */
+function makeFakeDeps(overrides: Partial<SyncCoreDeps> = {}): {
+  deps: SyncCoreDeps;
+  registry: { text: string };
+  notes: Map<string, string>;
+  writeRegistrySource: ReturnType<typeof vi.fn>;
+  writeProposalNote: ReturnType<typeof vi.fn>;
+  runSyncCheck: ReturnType<typeof vi.fn>;
+  revertFiles: ReturnType<typeof vi.fn>;
+} {
+  const registry = { text: fixtureRegistrySource() };
+  const notes = new Map<string, string>();
+
+  const writeRegistrySource = vi.fn((text: string) => {
+    registry.text = text;
+  });
+  const writeProposalNote = vi.fn((path: string, text: string) => {
+    notes.set(path, text);
+  });
+  const runSyncCheck = vi.fn(
+    (): SyncCheckResultLike => ({ ok: true, reason: "ok", detail: "gate passed" }),
+  );
+  const revertFiles = vi.fn();
+
+  const deps: SyncCoreDeps = {
+    readRegistrySource: () => registry.text,
+    writeRegistrySource,
+    readProposalNote: (path: string) => notes.get(path) ?? null,
+    writeProposalNote,
+    runSyncCheck,
+    revertFiles,
+    now: () => new Date("2026-07-22T00:00:00Z"),
+    ...overrides,
+  };
+
+  return {
+    deps,
+    registry,
+    notes,
+    writeRegistrySource,
+    writeProposalNote,
+    runSyncCheck,
+    revertFiles,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Mirrored classification predicates — parity with C4's models.drift.ts
+// (same fixtures/expectations as models.drift.ts's own C4 suite).
+// ---------------------------------------------------------------------------
+
+describe("detectDeprecatedFamiliesForSync (mirrors C4's detectDeprecatedFamilies)", () => {
+  it("FAIL-CLOSED: an empty live listing never proposes removal", () => {
+    expect(detectDeprecatedFamiliesForSync([], "openai").status).toBe("skipped");
+  });
+
+  it("FAIL-CLOSED: a short/truncated live listing never proposes removal", () => {
+    expect(detectDeprecatedFamiliesForSync(["gpt-4o"], "openai").status).toBe("skipped");
+  });
+
+  it("a healthy listing omitting a classified family flags EXACTLY that family", () => {
+    const allButGpt4o = [...includeFamilies.openai].filter((f) => f !== "gpt-4o");
+    const liveIds = [...allButGpt4o, ...allButGpt4o.map((f) => `${f}-2025-01-01`)];
+    const result = detectDeprecatedFamiliesForSync(liveIds, "openai", {
+      isReferenced: () => false,
+    });
+    expect(result).toEqual({
+      status: "checked",
+      candidates: [{ provider: "openai", family: "gpt-4o", stillReferenced: false }],
+    });
+  });
+
+  it("a still-referenced deprecated family is flagged with stillReferenced: true", () => {
+    const allButGpt4o = [...includeFamilies.openai].filter((f) => f !== "gpt-4o");
+    const liveIds = [...allButGpt4o, ...allButGpt4o.map((f) => `${f}-2025-01-01`)];
+    const result = detectDeprecatedFamiliesForSync(liveIds, "openai", { isReferenced: () => true });
+    expect(result).toEqual({
+      status: "checked",
+      candidates: [{ provider: "openai", family: "gpt-4o", stillReferenced: true }],
+    });
+  });
+});
+
+describe("unclassifiedFamiliesForSync (mirrors C4's unclassifiedFamilies)", () => {
+  it("a genuinely new family is flagged", () => {
+    expect(unclassifiedFamiliesForSync(["gpt-live"], "openai")).toEqual(["gpt-live"]);
+  });
+
+  it("a dated snapshot of a known family produces zero drift", () => {
+    expect(unclassifiedFamiliesForSync(["gpt-4o-2024-08-06"], "openai")).toEqual([]);
+  });
+
+  it("a -preview family auto-classifies with zero registry edits", () => {
+    expect(unclassifiedFamiliesForSync(["gpt-9-search-preview"], "openai")).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Mechanical registry edits — AST-located, single-line surgery.
+// ---------------------------------------------------------------------------
+
+describe("removeFamilyLiteralInSource / addFamilyLiteralInSource", () => {
+  it("removes an existing family, comment-marking the line, touching nothing else", () => {
+    const src = fixtureRegistrySource();
+    const result = removeFamilyLiteralInSource(
+      src,
+      "includeFamilies",
+      "openai",
+      "gpt-4o",
+      "TEST-REMOVE",
+    );
+    expect(result.changed).toBe(true);
+    expect(result.text).not.toContain('"gpt-4o"');
+    expect(result.text).toContain("// TEST-REMOVE");
+    // Every other seeded family is untouched.
+    for (const f of includeFamilies.openai) {
+      if (f === "gpt-4o") continue;
+      expect(result.text).toContain(`"${f}"`);
+    }
+  });
+
+  it("no-ops when the family is not present (never mangles the file)", () => {
+    const src = fixtureRegistrySource();
+    const result = removeFamilyLiteralInSource(
+      src,
+      "includeFamilies",
+      "openai",
+      "zzz-not-real",
+      "x",
+    );
+    expect(result.changed).toBe(false);
+    expect(result.text).toBe(src);
+  });
+
+  it("adds a new family literal, comment-marked", () => {
+    const src = fixtureRegistrySource();
+    const result = addFamilyLiteralInSource(
+      src,
+      "includeFamilies",
+      "openai",
+      "gpt-live",
+      "TEST-ADD",
+    );
+    expect(result.changed).toBe(true);
+    expect(result.text).toContain('"gpt-live", // TEST-ADD');
+  });
+
+  it("no-ops when the family is already present (never duplicates)", () => {
+    const src = fixtureRegistrySource();
+    const result = addFamilyLiteralInSource(src, "includeFamilies", "openai", "gpt-4o", "x");
+    expect(result.changed).toBe(false);
+  });
+
+  it("the edited text is still syntactically valid TypeScript (parser round-trip)", () => {
+    const src = fixtureRegistrySource();
+    const removed = removeFamilyLiteralInSource(src, "includeFamilies", "openai", "gpt-4o", "r");
+    const added = addFamilyLiteralInSource(
+      removed.text,
+      "includeFamilies",
+      "openai",
+      "gpt-live",
+      "a",
+    );
+    // A further edit against the already-edited text must still locate the
+    // array correctly — proves the AST-based locator survives a prior edit.
+    const secondAdd = addFamilyLiteralInSource(
+      added.text,
+      "includeFamilies",
+      "openai",
+      "gpt-live-2",
+      "b",
+    );
+    expect(secondAdd.changed).toBe(true);
+    expect(secondAdd.text).toContain('"gpt-live-2"');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Proposal note files — dedup + decision parsing.
+// ---------------------------------------------------------------------------
+
+describe("proposal notes", () => {
+  it("proposalNoteRelPath is family-keyed and stable (dedup key)", () => {
+    expect(proposalNoteRelPath("openai", "gpt-live", "new-family")).toBe(
+      `${DRIFT_PROPOSALS_DIR}/openai-gpt-live-new-family.md`,
+    );
+    expect(proposalNoteRelPath("openai", "gpt-live", "new-family")).toBe(
+      proposalNoteRelPath("openai", "gpt-live", "new-family"),
+    );
+  });
+
+  it("parseProposalDecision defaults to pending (fail-closed, never infers approval)", () => {
+    expect(parseProposalDecision("Status: NEEDS HUMAN REVIEW\n")).toBe("pending");
+    expect(parseProposalDecision("Decision: pending")).toBe("pending");
+    expect(parseProposalDecision("garbage with no Decision line")).toBe("pending");
+  });
+
+  it("parseProposalDecision recognizes an explicit human-authored approval", () => {
+    expect(parseProposalDecision("Decision: include")).toBe("include");
+  });
+
+  it("renderProposalNote never generates a Decision line for a deprecation note", () => {
+    const note = renderProposalNote(
+      "openai",
+      "gpt-4o",
+      "still-referenced-deprecation",
+      "detail",
+      "2026-07-22",
+    );
+    expect(note).not.toContain("## Decision");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runDriftSyncCore — the full orchestration, over injected deps.
+// ---------------------------------------------------------------------------
+
+describe("runDriftSyncCore", () => {
+  it("RED->GREEN (empty/short listing): fail-closed no-op — no edit, no gate run", () => {
+    const { deps, runSyncCheck, writeRegistrySource } = makeFakeDeps();
+    const inputs: ProviderChurnInput[] = [{ provider: "openai", liveModelIds: [] }];
+    const outcome = runDriftSyncCore(inputs, deps);
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reason).toBe(SyncCoreReason.OK_NO_CHURN);
+    expect(outcome.outcomes).toEqual([]);
+    expect(outcome.skipped).toHaveLength(1);
+    expect(outcome.skipped[0].reason).toMatch(/too short to trust/);
+    expect(writeRegistrySource).not.toHaveBeenCalled();
+    expect(runSyncCheck).not.toHaveBeenCalled();
+  });
+
+  it("RED->GREEN (deprecation, zero-reference): mechanical removal + gate passes", () => {
+    const { deps, registry, runSyncCheck } = makeFakeDeps({ isReferenced: () => false });
+    const allButGpt4o = [...includeFamilies.openai].filter((f) => f !== "gpt-4o");
+    const liveIds = [...allButGpt4o, ...allButGpt4o.map((f) => `${f}-2025-01-01`)];
+    const inputs: ProviderChurnInput[] = [{ provider: "openai", liveModelIds: liveIds }];
+
+    const outcome = runDriftSyncCore(inputs, deps);
+
+    expect(outcome.outcomes).toContainEqual(
+      expect.objectContaining({ provider: "openai", family: "gpt-4o", action: "removed" }),
+    );
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reason).toBe(SyncCoreReason.OK_APPLIED);
+    expect(runSyncCheck).toHaveBeenCalledTimes(1);
+    // The active Set element ("gpt-4o", with trailing comma) is gone — the
+    // family name may still appear in the human-readable removal comment.
+    expect(registry.text).not.toContain('"gpt-4o",');
+    expect(registry.text).toContain("drift-sync");
+  });
+
+  it("RED->GREEN (deprecation, STILL-REFERENCED): routed to human, no auto-edit", () => {
+    const { deps, registry, writeProposalNote, runSyncCheck } = makeFakeDeps({
+      isReferenced: () => true,
+    });
+    const allButGpt4o = [...includeFamilies.openai].filter((f) => f !== "gpt-4o");
+    const liveIds = [...allButGpt4o, ...allButGpt4o.map((f) => `${f}-2025-01-01`)];
+    const inputs: ProviderChurnInput[] = [{ provider: "openai", liveModelIds: liveIds }];
+
+    const outcome = runDriftSyncCore(inputs, deps);
+
+    expect(outcome.outcomes).toContainEqual(
+      expect.objectContaining({
+        provider: "openai",
+        family: "gpt-4o",
+        action: "needs-human-still-referenced",
+      }),
+    );
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toBe(SyncCoreReason.NEEDS_HUMAN);
+    // Registry data itself was NEVER mechanically touched for a still-referenced family.
+    expect(registry.text).toContain('"gpt-4o"');
+    expect(writeProposalNote).toHaveBeenCalledWith(
+      `${DRIFT_PROPOSALS_DIR}/openai-gpt-4o-deprecated-referenced.md`,
+      expect.stringContaining("still references it"),
+    );
+    // D-M1: a note-only run has NO registry edit to re-verify, so it is NEVER
+    // gated behind the (recollect-bearing) drift-sync-check — otherwise gate-3
+    // would re-detect the un-actioned family it just routed to a human and
+    // revert the note. The gate is not consulted at all here.
+    expect(runSyncCheck).not.toHaveBeenCalled();
+  });
+
+  it("RED->GREEN (genuinely new family, no prior decision): RED alert + single deduped note, no auto-classify", () => {
+    const { deps, registry, writeProposalNote, notes } = makeFakeDeps();
+    const inputs: ProviderChurnInput[] = [{ provider: "openai", liveModelIds: ["gpt-live"] }];
+    // NOTE: a single unclassified live id also fails the deprecation floor
+    // check (too short) — that is an independent, correctly-skipped signal;
+    // this test only asserts the ADDITION half's behavior.
+
+    const outcome = runDriftSyncCore(inputs, deps);
+
+    expect(outcome.outcomes).toContainEqual(
+      expect.objectContaining({
+        provider: "openai",
+        family: "gpt-live",
+        action: "needs-human-new-family",
+      }),
+    );
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toBe(SyncCoreReason.NEEDS_HUMAN);
+    // NEVER auto-classified: no registry edit occurred.
+    expect(registry.text).not.toContain("gpt-live");
+    expect(writeProposalNote).toHaveBeenCalledTimes(1);
+    const [path, noteText] = writeProposalNote.mock.calls[0] as [string, string];
+    expect(path).toBe(`${DRIFT_PROPOSALS_DIR}/openai-gpt-live-new-family.md`);
+    expect(noteText).toContain("Decision: pending");
+    expect(notes.size).toBe(1);
+
+    // Re-fire: same alert, same run again — must NOT spam a second note/PR.
+    writeProposalNote.mockClear();
+    const outcome2 = runDriftSyncCore(inputs, deps);
+    expect(writeProposalNote).not.toHaveBeenCalled();
+    expect(outcome2.reason).toBe(SyncCoreReason.NEEDS_HUMAN);
+    expect(outcome2.ok).toBe(false);
+  });
+
+  it("ADDITION (human-approved via note Decision: include): mechanical registry edit + gate passes", () => {
+    const { deps, registry, notes, runSyncCheck } = makeFakeDeps();
+    // Simulate a human having already reviewed the RED alert and flipped the
+    // note's Decision line to `include` (the only path that can ever add a
+    // genuinely-new family — never automatic, never LLM-authored).
+    const notePath = proposalNoteRelPath("openai", "gpt-live", "new-family");
+    notes.set(
+      notePath,
+      renderProposalNote("openai", "gpt-live", "new-family", "detail", "2026-07-20").replace(
+        "Decision: pending",
+        "Decision: include",
+      ),
+    );
+
+    const inputs: ProviderChurnInput[] = [{ provider: "openai", liveModelIds: ["gpt-live"] }];
+    const outcome = runDriftSyncCore(inputs, deps);
+
+    expect(outcome.outcomes).toContainEqual(
+      expect.objectContaining({ provider: "openai", family: "gpt-live", action: "added" }),
+    );
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reason).toBe(SyncCoreReason.OK_APPLIED);
+    expect(registry.text).toContain('"gpt-live"');
+    expect(registry.text).toContain(`approved via ${notePath}`);
+    expect(runSyncCheck).toHaveBeenCalledTimes(1);
+  });
+
+  it("a FAILING drift-sync-check gate reverts every touched file and reports GATE_FAILED", () => {
+    const { deps, revertFiles } = makeFakeDeps({
+      isReferenced: () => false,
+      runSyncCheck: vi.fn(
+        (): SyncCheckResultLike => ({
+          ok: false,
+          reason: "pin-check-failed",
+          detail: "a pinned rule moved",
+        }),
+      ),
+    });
+    const allButGpt4o = [...includeFamilies.openai].filter((f) => f !== "gpt-4o");
+    const liveIds = [...allButGpt4o, ...allButGpt4o.map((f) => `${f}-2025-01-01`)];
+    const inputs: ProviderChurnInput[] = [{ provider: "openai", liveModelIds: liveIds }];
+
+    const outcome = runDriftSyncCore(inputs, deps);
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.reason).toBe(SyncCoreReason.GATE_FAILED);
+    expect(outcome.detail).toContain("pin-check-failed");
+    expect(revertFiles).toHaveBeenCalledWith([MODEL_REGISTRY_REL_PATH]);
+  });
+
+  it("a provider whose live listing was skipped (no key / infra error) is recorded, not treated as churn", () => {
+    const { deps } = makeFakeDeps();
+    const inputs: ProviderChurnInput[] = [
+      { provider: "anthropic", liveModelIds: null, skipReason: "ANTHROPIC_API_KEY not set" },
+    ];
+    const outcome = runDriftSyncCore(inputs, deps);
+    expect(outcome.ok).toBe(true);
+    expect(outcome.reason).toBe(SyncCoreReason.OK_NO_CHURN);
+    expect(outcome.skipped).toEqual([
+      { provider: "anthropic", reason: "ANTHROPIC_API_KEY not set" },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D-M1: the recollect gate must NOT destroy the route-to-human invariant.
+//
+// De-masks the default `makeFakeDeps` gate (which returned {ok:true}
+// unconditionally and hid this bug): these gates model the REAL drift-sync-check
+// — gate-1 (allowlist) + gate-2 (pin) pass for a data-only change, but gate-3
+// (the live re-collect) STILL reports the un-actioned family this run routed to
+// a human as residual critical drift, so a `skipRecollect:false` call fails.
+// ---------------------------------------------------------------------------
+
+/** A faithful drift-sync-check: passes with recollect skipped, FAILS with it on. */
+function faithfulRecollectGate(): ReturnType<typeof vi.fn> {
+  return vi.fn(
+    (opts?: { skipRecollect?: boolean }): SyncCheckResultLike =>
+      opts?.skipRecollect
+        ? { ok: true, reason: "ok", detail: "allowlist + pin ok; live re-collect skipped" }
+        : {
+            ok: false,
+            reason: "residual-critical-drift",
+            detail: "1 critical diff — un-actioned family the collector still sees",
+          },
+  );
+}
+
+describe("D-M1: recollect gate vs route-to-human invariant", () => {
+  it("RED->GREEN (note-only new family): faithful gate does NOT revert the note; NEEDS_HUMAN", () => {
+    const runSyncCheck = faithfulRecollectGate();
+    const { deps, revertFiles } = makeFakeDeps({ runSyncCheck });
+    const inputs: ProviderChurnInput[] = [{ provider: "openai", liveModelIds: ["gpt-live"] }];
+
+    const outcome = runDriftSyncCore(inputs, deps);
+
+    // GREEN: the genuinely-new family persists its note and reaches the
+    // human-approval protocol. RED (pre-fix): the core ran the recollect gate,
+    // which failed, so the note was reverted and the run reported GATE_FAILED.
+    expect(outcome.reason).toBe(SyncCoreReason.NEEDS_HUMAN);
+    expect(outcome.ok).toBe(false);
+    expect(revertFiles).not.toHaveBeenCalled();
+    // A note-only run has no registry edit to re-verify → the recollect-bearing
+    // gate is never even consulted.
+    expect(runSyncCheck).not.toHaveBeenCalled();
+  });
+
+  it("RED->GREEN (mixed: valid removal + new-family note): removal kept, gate-3 skipped, NEEDS_HUMAN", () => {
+    const runSyncCheck = faithfulRecollectGate();
+    const { deps, registry, revertFiles } = makeFakeDeps({
+      isReferenced: () => false,
+      runSyncCheck,
+    });
+    const allButGpt4o = [...includeFamilies.openai].filter((f) => f !== "gpt-4o");
+    const liveIds = [...allButGpt4o, ...allButGpt4o.map((f) => `${f}-2025-01-01`), "gpt-live"];
+    const inputs: ProviderChurnInput[] = [{ provider: "openai", liveModelIds: liveIds }];
+
+    const outcome = runDriftSyncCore(inputs, deps);
+
+    // GREEN: the valid zero-reference removal is applied AND kept; the new
+    // family is deferred to a human. RED (pre-fix): the recollect gate saw the
+    // deferred new family as residual drift and reverted the valid removal too.
+    expect(outcome.reason).toBe(SyncCoreReason.NEEDS_HUMAN);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.outcomes).toContainEqual(
+      expect.objectContaining({ family: "gpt-4o", action: "removed" }),
+    );
+    expect(outcome.outcomes).toContainEqual(
+      expect.objectContaining({ family: "gpt-live", action: "needs-human-new-family" }),
+    );
+    expect(revertFiles).not.toHaveBeenCalled();
+    // The gate ran (a registry edit WAS applied) but with the live re-collect
+    // skipped, because a family was simultaneously deferred to a human.
+    expect(runSyncCheck).toHaveBeenCalledTimes(1);
+    expect(runSyncCheck).toHaveBeenCalledWith({ skipRecollect: true });
+    // The registry edit was persisted (writeRegistrySource ran with the removal).
+    expect(registry.text).not.toContain('"gpt-4o",');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// G#1: a registry structural mismatch (AST locator miss) must route-to-human,
+// never collapse into a silent benign no-op.
+// ---------------------------------------------------------------------------
+
+describe("G#1: locator miss routes to human", () => {
+  it("RED->GREEN (deprecation locator miss): writes a note + NEEDS_HUMAN, never a silent no-op", () => {
+    // A registry source the AST locator cannot parse into includeFamilies —
+    // models the real file's structure changing out from under the editor.
+    const brokenSource = "export const somethingElse = { openai: [] };\n";
+    const brokenRegistry = { text: brokenSource };
+    const { deps, notes } = makeFakeDeps({
+      isReferenced: () => false,
+      readRegistrySource: () => brokenRegistry.text,
+      writeRegistrySource: (t: string) => {
+        brokenRegistry.text = t;
+      },
+    });
+    const allButGpt4o = [...includeFamilies.openai].filter((f) => f !== "gpt-4o");
+    const liveIds = [...allButGpt4o, ...allButGpt4o.map((f) => `${f}-2025-01-01`)];
+    const inputs: ProviderChurnInput[] = [{ provider: "openai", liveModelIds: liveIds }];
+
+    const outcome = runDriftSyncCore(inputs, deps);
+
+    // GREEN: routed to a human. RED (pre-fix): a silent `no-op` action, no note,
+    // ok-no-churn, exit 0 — a real deprecation vanishing silently.
+    expect(outcome.reason).toBe(SyncCoreReason.NEEDS_HUMAN);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.outcomes).toContainEqual(
+      expect.objectContaining({ family: "gpt-4o", action: "needs-human-structural-mismatch" }),
+    );
+    // A note actually alerts a human.
+    expect(notes.has(`${DRIFT_PROPOSALS_DIR}/openai-gpt-4o-structural-mismatch.md`)).toBe(true);
+    // The unparseable registry was never mutated.
+    expect(brokenRegistry.text).toBe(brokenSource);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D-M2: revertSyncFiles must handle untracked note files without throwing.
+// Exercises the REAL revert surface (real git, real untracked file).
+// ---------------------------------------------------------------------------
+
+describe("revertSyncFiles (D-M2: revert must not throw on untracked notes)", () => {
+  it("RED->GREEN: reverts a tracked edit AND deletes an untracked note without throwing", () => {
+    const repo = mkdtempSync(join(tmpdir(), "drift-sync-revert-"));
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "ignore" });
+    git("init");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "Test");
+
+    // A TRACKED file with committed content, then locally modified by the sync.
+    const trackedRel = "src/__tests__/drift/model-registry.ts";
+    mkdirSync(join(repo, "src/__tests__/drift"), { recursive: true });
+    writeFileSync(join(repo, trackedRel), "ORIGINAL\n");
+    git("add", trackedRel);
+    git("commit", "-m", "seed");
+    writeFileSync(join(repo, trackedRel), "MODIFIED BY SYNC\n");
+
+    // An UNTRACKED note git has never seen (the D-M2 trigger).
+    const noteRel = "drift-proposals/openai-gpt-live-new-family.md";
+    mkdirSync(join(repo, "drift-proposals"), { recursive: true });
+    writeFileSync(join(repo, noteRel), "note body\n");
+
+    const prevCwd = process.cwd();
+    process.chdir(repo);
+    try {
+      // GREEN: partitions tracked vs untracked and never throws. RED (pre-fix):
+      // `git checkout -- <tracked> <untracked>` errors on the untracked note,
+      // reverts NOTHING, and throws uncaught.
+      expect(() => revertSyncFiles([trackedRel, noteRel])).not.toThrow();
+    } finally {
+      process.chdir(prevCwd);
+    }
+
+    // Tracked file restored to its committed content; untracked note removed.
+    expect(readFileSync(join(repo, trackedRel), "utf-8")).toBe("ORIGINAL\n");
+    expect(existsSync(join(repo, noteRel))).toBe(false);
+
+    rmSync(repo, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Zero-LLM guarantee — static sanity check on the module's own source.
+// ---------------------------------------------------------------------------
+
+describe("the sync core never invokes an LLM", () => {
+  it("scripts/drift-sync.ts contains no Claude Code invocation / free-form generation call", () => {
+    const src = readFileSync(new URL("../../scripts/drift-sync.ts", import.meta.url), "utf-8");
+    // Check for actual invocation syntax, not the module's own explanatory
+    // prose (which legitimately names these as what this file does NOT do).
+    expect(src).not.toMatch(/invokeClaudeCode\(/);
+    expect(src).not.toMatch(/from ["']@anthropic-ai\/claude-code["']/);
+    expect(src).not.toMatch(/\bbuildPrompt\(/);
+    expect(src).not.toMatch(/\bspawn\(/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// G#3: computeChangesetKey — the STABLE, date-independent dedup key the CI
+// workflow uses to keep BOTH PR-open paths idempotent across daily re-fires.
+//
+// The bug it exists to fix: the workflow's needs-human persist step deduped
+// SOLELY on the committed `drift-proposals/*` note paths. In the D-M1 "mixed
+// run" (a mechanical registry removal committed the SAME run a *different*
+// family is deferred to a human whose note ALREADY sits on main), the diff
+// carries ONLY the registry edit and NO note file — so a note-path key was
+// EMPTY, the dedup was bypassed, and a brand-new near-identical PR opened on
+// every daily cron run (unbounded PR-spam). The changeset key is non-empty in
+// that shape (it carries the removal AND the deferred family) and identical on
+// every re-fire, so the workflow can find the already-open PR and skip.
+// ---------------------------------------------------------------------------
+
+describe("computeChangesetKey (G#3: stable, date-independent PR-dedup key)", () => {
+  // The D-M1 mixed run: gpt-4o removed (registry edit) + gpt-live deferred
+  // (needs-human) — the exact shape whose committed diff has a registry edit
+  // but no NEW note file, where a note-path-only dedup key is empty.
+  function mixedRunInputs(): ProviderChurnInput[] {
+    const allButGpt4o = [...includeFamilies.openai].filter((f) => f !== "gpt-4o");
+    const liveIds = [...allButGpt4o, ...allButGpt4o.map((f) => `${f}-2025-01-01`), "gpt-live"];
+    return [{ provider: "openai", liveModelIds: liveIds }];
+  }
+
+  it("is NON-EMPTY for a mixed run (registry edit + deferred family) — the shape a note-path-only key misses", () => {
+    const { deps } = makeFakeDeps({ isReferenced: () => false });
+    const outcome = runDriftSyncCore(mixedRunInputs(), deps);
+    expect(outcome.reason).toBe(SyncCoreReason.NEEDS_HUMAN);
+    // The mixed-run committed diff carries NO new note file, yet the key is set
+    // — this is precisely what makes the workflow dedup fire on this shape.
+    expect(computeChangesetKey(outcome)).not.toBe("");
+    // Carries BOTH the applied removal and the deferred family in its identity.
+    expect(outcome.outcomes).toContainEqual(
+      expect.objectContaining({ family: "gpt-4o", action: "removed" }),
+    );
+    expect(outcome.outcomes).toContainEqual(
+      expect.objectContaining({ family: "gpt-live", action: "needs-human-new-family" }),
+    );
+  });
+
+  it("is IDENTICAL across re-fires of the same drift on DIFFERENT dates (date-independent — so daily re-fires dedup)", () => {
+    const day1 = makeFakeDeps({ isReferenced: () => false, now: () => new Date("2026-07-22") });
+    const day2 = makeFakeDeps({ isReferenced: () => false, now: () => new Date("2026-08-15") });
+    const key1 = computeChangesetKey(runDriftSyncCore(mixedRunInputs(), day1.deps));
+    const key2 = computeChangesetKey(runDriftSyncCore(mixedRunInputs(), day2.deps));
+    expect(key1).toBe(key2);
+  });
+
+  it("is EMPTY for a no-churn run (nothing applied or deferred — no PR to dedup)", () => {
+    const { deps } = makeFakeDeps();
+    const outcome = runDriftSyncCore([{ provider: "openai", liveModelIds: [] }], deps);
+    expect(outcome.reason).toBe(SyncCoreReason.OK_NO_CHURN);
+    expect(computeChangesetKey(outcome)).toBe("");
+  });
+
+  it("DIFFERS for a different changeset (a pure deferral vs a mixed run) — distinct drifts get distinct PRs", () => {
+    const pure = makeFakeDeps();
+    const pureOutcome = runDriftSyncCore(
+      [{ provider: "openai", liveModelIds: ["gpt-live"] }],
+      pure.deps,
+    );
+    const mixed = makeFakeDeps({ isReferenced: () => false });
+    const mixedOutcome = runDriftSyncCore(mixedRunInputs(), mixed.deps);
+    const pureKey = computeChangesetKey(pureOutcome);
+    const mixedKey = computeChangesetKey(mixedOutcome);
+    expect(pureKey).not.toBe("");
+    expect(mixedKey).not.toBe("");
+    expect(pureKey).not.toBe(mixedKey);
+  });
+
+  it("is a fixed-length 16-hex-char token (no substring collision between distinct keys in the PR-body marker match)", () => {
+    const { deps } = makeFakeDeps({ isReferenced: () => false });
+    const key = computeChangesetKey(runDriftSyncCore(mixedRunInputs(), deps));
+    expect(key).toMatch(/^[0-9a-f]{16}$/);
+  });
+});

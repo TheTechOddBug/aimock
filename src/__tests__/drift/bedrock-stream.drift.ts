@@ -28,6 +28,22 @@ const HAS_CREDENTIALS =
   !!process.env.AWS_REGION;
 
 // ---------------------------------------------------------------------------
+// Model pin
+// ---------------------------------------------------------------------------
+//
+// This leg never makes a live Bedrock call — nothing in this repo implements
+// AWS SigV4 request signing (no `@aws-sdk` dependency, no HMAC-based signer
+// anywhere), so every HAS_CREDENTIALS-gated test below only exercises the
+// LOCAL aimock mock server against a static SDK-shape stub. The
+// infra-unavailable / model-not-found "honest skip" classification used by
+// the other retrofit legs (which DO drive a real provider endpoint) does not
+// apply here: a 4xx/5xx from the mock server is never a live-provider
+// condition, it is a mock regression, and must hard-fail like any other drift
+// finding. This constant just collapses the dated snapshot id into ONE named
+// value (was duplicated across every URL literal below).
+const BEDROCK_MODEL_ID = "anthropic.claude-3-haiku-20240307-v1:0";
+
+// ---------------------------------------------------------------------------
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
@@ -184,37 +200,29 @@ describe.skipIf(!HAS_CREDENTIALS)("Bedrock drift", () => {
 
     // Bedrock streaming uses binary event-stream framing, so we test the
     // mock's JSON response shape for the non-streaming invoke endpoint.
-    const mockRes = await httpPost(
-      `${instance.url}/model/anthropic.claude-3-haiku-20240307-v1:0/invoke`,
-      {
-        anthropic_version: "bedrock-2023-05-31",
-        max_tokens: 10,
-        messages: [{ role: "user", content: "Say hello" }],
-      },
-    );
+    const mockRes = await httpPost(`${instance.url}/model/${BEDROCK_MODEL_ID}/invoke`, {
+      anthropic_version: "bedrock-2023-05-31",
+      max_tokens: 10,
+      messages: [{ role: "user", content: "Say hello" }],
+    });
 
     expect(mockRes.status).toBe(200);
 
-    // When real AWS credentials are available, send the same request to
-    // the real Bedrock API and compare shapes. For now, validate mock
-    // against the SDK shape as both real and expected.
-    if (mockRes.status === 200) {
-      const mockShape = extractShape(JSON.parse(mockRes.body));
-      const diffs = triangulate(sdkShape, sdkShape, mockShape);
-      const report = formatDriftReport("Bedrock Invoke", diffs, "bedrock-invoke");
+    const mockShape = extractShape(JSON.parse(mockRes.body));
+    const diffs = triangulate(sdkShape, sdkShape, mockShape);
+    const report = formatDriftReport("Bedrock Invoke", diffs, "bedrock-invoke");
 
-      expect(
-        diffs.filter((d) => d.severity === "critical"),
-        report,
-      ).toEqual([]);
-    }
+    expect(
+      diffs.filter((d) => d.severity === "critical"),
+      report,
+    ).toEqual([]);
   });
 
   it("invoke-with-response-stream mock shape matches SDK expectations", async () => {
     const sdkEvents = bedrockInvokeStreamEventShapes();
 
     const mockRes = await httpPostBinary(
-      `${instance.url}/model/anthropic.claude-3-haiku-20240307-v1:0/invoke-with-response-stream`,
+      `${instance.url}/model/${BEDROCK_MODEL_ID}/invoke-with-response-stream`,
       {
         anthropic_version: "bedrock-2023-05-31",
         max_tokens: 10,
@@ -277,36 +285,31 @@ describe.skipIf(!HAS_CREDENTIALS)("Bedrock drift", () => {
   it("converse mock shape matches SDK expectations", async () => {
     const sdkShape = bedrockConverseResponseShape();
 
-    const mockRes = await httpPost(
-      `${instance.url}/model/anthropic.claude-3-haiku-20240307-v1:0/converse`,
-      {
-        messages: [
-          {
-            role: "user",
-            content: [{ text: "Say hello" }],
-          },
-        ],
-        inferenceConfig: { maxTokens: 10 },
-      },
-    );
+    const mockRes = await httpPost(`${instance.url}/model/${BEDROCK_MODEL_ID}/converse`, {
+      messages: [
+        {
+          role: "user",
+          content: [{ text: "Say hello" }],
+        },
+      ],
+      inferenceConfig: { maxTokens: 10 },
+    });
 
     expect(mockRes.status).toBe(200);
 
-    if (mockRes.status === 200) {
-      const mockShape = extractShape(JSON.parse(mockRes.body));
-      const diffs = triangulate(sdkShape, sdkShape, mockShape);
-      const report = formatDriftReport("Bedrock Converse", diffs, "bedrock-converse");
+    const mockShape = extractShape(JSON.parse(mockRes.body));
+    const diffs = triangulate(sdkShape, sdkShape, mockShape);
+    const report = formatDriftReport("Bedrock Converse", diffs, "bedrock-converse");
 
-      expect(
-        diffs.filter((d) => d.severity === "critical"),
-        report,
-      ).toEqual([]);
-    }
+    expect(
+      diffs.filter((d) => d.severity === "critical"),
+      report,
+    ).toEqual([]);
   });
 
   it("converse-stream payloads are flat (not double-wrapped with event type name)", async () => {
     const mockRes = await httpPostBinary(
-      `${instance.url}/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream`,
+      `${instance.url}/model/${BEDROCK_MODEL_ID}/converse-stream`,
       {
         messages: [
           {
@@ -416,7 +419,7 @@ describe.skipIf(!HAS_CREDENTIALS)("Bedrock drift", () => {
 
   it("converse-stream tool-call event shapes match SDK expectations", async () => {
     const mockRes = await httpPostBinary(
-      `${instance.url}/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream`,
+      `${instance.url}/model/${BEDROCK_MODEL_ID}/converse-stream`,
       {
         messages: [
           {
@@ -519,7 +522,7 @@ describe.skipIf(!HAS_CREDENTIALS)("Bedrock drift", () => {
 
     try {
       const mockRes = await httpPostBinary(
-        `${reasoningInstance.url}/model/anthropic.claude-3-haiku-20240307-v1:0/converse-stream`,
+        `${reasoningInstance.url}/model/${BEDROCK_MODEL_ID}/converse-stream`,
         {
           messages: [
             {

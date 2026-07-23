@@ -44,6 +44,103 @@ export function classifyGeminiMessage(msg: Record<string, unknown>): string {
 }
 
 // ---------------------------------------------------------------------------
+// Self-healing WS classification (shared by the WS live-leg retrofits)
+// ---------------------------------------------------------------------------
+//
+// Generalizes the HTTP self-healing patterns (providers.ts `resolveLiveModel` /
+// `isInfraSkip` / `isModelNotFound`) to the WS surface, which has TWO distinct
+// failure channels a plain HTTP probe doesn't:
+//   1. Handshake-level: the upgrade request itself gets a non-101 HTTP
+//      response (auth/rate-limit/5xx) — surfaced as {@link WSHandshakeError}
+//      with the parsed status so callers can classify it with
+//      `isInfraSkip(status)` exactly like an HTTP leg.
+//   2. Message-level: the socket upgrades fine but a request-level problem
+//      (e.g. a retired/invalid model id) is reported IN-BAND as a
+//      `{"type":"error",...}` protocol frame, since the Responses WS protocol
+//      validates the model per-message rather than via a connect-time query
+//      param (unlike Realtime's `?model=`). {@link extractWSErrorBody} surfaces
+//      that frame's body so callers can classify it with
+//      `isModelNotFound(400, body)`.
+
+/**
+ * Raised by {@link connectTLSWebSocket} when the WS upgrade handshake itself
+ * fails (a non-101 HTTP response). Carries the parsed numeric status (0 when
+ * unparseable) so callers can classify an auth/rate-limit/5xx condition as an
+ * honest skip via `isInfraSkip(status)` — the same classification an HTTP leg
+ * gets from a non-2xx response, just surfaced through a different channel.
+ */
+export class WSHandshakeError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "WSHandshakeError";
+    this.status = status;
+  }
+}
+
+/**
+ * Extract the numeric HTTP status code from a WS handshake's status line
+ * (e.g. `"HTTP/1.1 401 Unauthorized"` -> `401`). Returns `null` when no
+ * 3-digit code is present (a malformed/unexpected response).
+ */
+export function parseHandshakeStatus(statusLine: string): number | null {
+  const match = statusLine.match(/^HTTP\/\d\.\d\s+(\d{3})/);
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * True when a raw WS protocol message is a request-level error frame
+ * (`{"type":"error",...}`) rather than a successful completion event.
+ */
+export function isResponsesWSError(msg: unknown): boolean {
+  return !!msg && typeof msg === "object" && (msg as Record<string, unknown>).type === "error";
+}
+
+/**
+ * Terminal predicate for the OpenAI Responses WS protocol: a successful
+ * completion (`response.completed` / `response.done`, both observed in the
+ * wild) OR a request-level error frame. Including the error frame as terminal
+ * means a retired/invalid model id surfaces here promptly instead of the
+ * `waitUntil` call timing out after 30s waiting for a completion event that
+ * will never arrive.
+ */
+export function isResponsesWSTerminal(msg: unknown): boolean {
+  const m = msg as Record<string, unknown> | null;
+  return m?.type === "response.completed" || m?.type === "response.done" || isResponsesWSError(msg);
+}
+
+/**
+ * Extract the JSON body of a terminal error frame for {@link isModelNotFound}
+ * classification, or `null` when the messages ended in a normal completion.
+ */
+export function extractWSErrorBody(messages: unknown[]): string | null {
+  const last = messages[messages.length - 1];
+  return isResponsesWSError(last) ? JSON.stringify(last) : null;
+}
+
+/**
+ * Build the `response.create` WS message body. The model is a PARAMETER, never
+ * hardcoded here, so callers thread a live-discovered id (via
+ * `resolveLiveModel` in providers.ts) instead of baking a value into this file
+ * that the provider can later retire out from under the drift suite.
+ */
+export function buildResponsesCreateMessage(
+  model: string,
+  input: object[],
+  tools?: object[],
+): Record<string, unknown> {
+  const msg: Record<string, unknown> = {
+    type: "response.create",
+    model,
+    input,
+    max_output_tokens: 50,
+  };
+  if (tools) msg.tools = tools;
+  return msg;
+}
+
+// ---------------------------------------------------------------------------
 // Masked frame helpers
 // ---------------------------------------------------------------------------
 
@@ -150,7 +247,16 @@ export function connectTLSWebSocket(
           if (headerEnd === -1) return;
           const headerStr = buffer.subarray(0, headerEnd).toString();
           if (!headerStr.includes("101")) {
-            reject(new Error(`WebSocket upgrade failed: ${headerStr.split("\r\n")[0]}`));
+            const statusLine = headerStr.split("\r\n")[0];
+            // Structured, not a bare Error: callers classify an auth/rate-limit/
+            // 5xx handshake failure as an honest skip via `isInfraSkip(status)`
+            // (see WSHandshakeError above) instead of the whole leg hard-failing.
+            reject(
+              new WSHandshakeError(
+                `WebSocket upgrade failed: ${statusLine}`,
+                parseHandshakeStatus(statusLine) ?? 0,
+              ),
+            );
             return;
           }
           handshakeDone = true;
@@ -313,27 +419,23 @@ export async function openaiResponsesWS(
   config: ProviderConfig,
   input: object[],
   tools?: object[],
+  model = "gpt-4o-mini",
 ): Promise<WSResult> {
   const ws = await connectTLSWebSocket("api.openai.com", "/v1/responses", {
     Authorization: `Bearer ${config.apiKey}`,
   });
 
   // Real Responses WS API uses flat format: model/input/tools at the top level
-  // of the response.create message (not nested inside a "response" object)
-  const msg: Record<string, unknown> = {
-    type: "response.create",
-    model: "gpt-4o-mini",
-    input,
-    max_output_tokens: 50,
-  };
-  if (tools) msg.tools = tools;
+  // of the response.create message (not nested inside a "response" object).
+  // `model` is a caller-supplied parameter (default retained for back-compat)
+  // so the drift leg can thread a live-discovered id via `resolveLiveModel`
+  // instead of this file hardcoding one the provider can later retire.
+  ws.send(JSON.stringify(buildResponsesCreateMessage(model, input, tools)));
 
-  ws.send(JSON.stringify(msg));
-
-  // Terminal event: "response.completed" or "response.done" (both observed in the wild)
-  const rawMessages = await ws.waitUntil(
-    (msg: any) => msg?.type === "response.completed" || msg?.type === "response.done",
-  );
+  // Terminal: a completion event ("response.completed"/"response.done", both
+  // observed in the wild) OR a request-level error frame — see
+  // isResponsesWSTerminal for why the error frame must be terminal too.
+  const rawMessages = await ws.waitUntil(isResponsesWSTerminal);
 
   ws.close();
 
@@ -430,14 +532,19 @@ export async function geminiLiveWS(
   config: ProviderConfig,
   text: string,
   tools?: object[],
+  model = "models/gemini-2.5-flash",
 ): Promise<WSResult> {
   const path = `/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${config.apiKey}`;
 
   const ws = await connectTLSWebSocket("generativelanguage.googleapis.com", path);
 
-  // Step 1: Send setup
+  // Step 1: Send setup. `model` is a caller-supplied parameter (default
+  // retained for back-compat) so the drift leg can thread a live-discovered
+  // id via `resolveLiveModel` instead of this file hardcoding one that the
+  // provider can later retire out from under the drift suite (mirrors the
+  // `buildResponsesCreateMessage` model-as-parameter pattern above).
   const setup: Record<string, unknown> = {
-    model: "models/gemini-2.5-flash",
+    model,
     generationConfig: { responseModalities: ["TEXT"] },
   };
   if (tools) setup.tools = tools;

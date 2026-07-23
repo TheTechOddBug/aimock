@@ -5,7 +5,7 @@
  */
 
 import http from "node:http";
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import type { ServerInstance } from "../../server.js";
 import { extractShape, triangulate, compareSSESequences, formatDriftReport } from "./schema.js";
 import {
@@ -16,7 +16,15 @@ import {
   anthropicThinkingMessageShape,
   anthropicThinkingStreamEventShapes,
 } from "./sdk-shapes.js";
-import { anthropicNonStreaming, anthropicStreaming } from "./providers.js";
+import {
+  isInfraSkip,
+  isModelNotFound,
+  listAnthropicModels,
+  resolveLiveModel,
+  __resetResolveLiveModelCache,
+  type LiveModelEntry,
+  type ResolvedModel,
+} from "./providers.js";
 import { httpPost, parseTypedSSE, startDriftServer, stopDriftServer } from "./helpers.js";
 
 // ---------------------------------------------------------------------------
@@ -35,26 +43,111 @@ afterAll(async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Live model resolution (self-healing — replaces the dated hardcoded pin)
+// ---------------------------------------------------------------------------
+//
+// `claude-haiku-4-5-20251001` is a dated snapshot pin: Anthropic retires
+// dated snapshots on a schedule, and a retired pin used to 404/400 the real
+// API leg, batch-quarantining the whole drift baseline (exit 5) rather than
+// honestly skipping. Instead of hardcoding a model id, discover a live one
+// from Anthropic's own `/v1/models` listing via R0's shared
+// `resolveLiveModel` helper (generalized from the cohere #325 pattern), and
+// honest-skip when the listing itself hits an infra condition.
+
+const PREFERRED_ANTHROPIC_MODELS = [
+  "claude-haiku-4-5-20251001",
+  "claude-3-5-haiku-20241022",
+  "claude-3-haiku-20240307",
+];
+
+/** Map Anthropic's `/v1/models` listing shape onto `resolveLiveModel`'s. */
+async function fetchAnthropicModelListing(): Promise<{
+  status: number;
+  models: LiveModelEntry[];
+}> {
+  const ids = await listAnthropicModels(ANTHROPIC_API_KEY!);
+  // A successful listing call always means status 200 here — `listAnthropicModels`
+  // throws an `InfraError` (caught by `resolveLiveModel`) on any non-2xx status.
+  // Anthropic's listing only ever exposes currently-available model ids (a
+  // retired snapshot simply disappears from it), so there is no `deprecated`
+  // flag to map.
+  return { status: 200, models: ids.map((id) => ({ id })) };
+}
+
+/** Memoized (per `resolveLiveModel`) so the whole leg makes one listing call. */
+function getAnthropicModel(): Promise<ResolvedModel> {
+  return resolveLiveModel("anthropic", fetchAnthropicModelListing, PREFERRED_ANTHROPIC_MODELS);
+}
+
+// ---------------------------------------------------------------------------
+// Real API helper (local, model-parameterized — mirrors the cohere.drift.ts
+// template so the retrofit stays scoped to this file per R0's ownership of
+// providers.ts's static-model anthropicNonStreaming/anthropicStreaming).
+// ---------------------------------------------------------------------------
+
+async function anthropicMessagesLive(
+  model: string,
+  messages: { role: string; content: string }[],
+  opts: { tools?: object[]; stream?: boolean; maxTokens?: number } = {},
+): Promise<{ status: number; body: string }> {
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    max_tokens: opts.maxTokens ?? 10,
+    stream: opts.stream ?? false,
+  };
+  if (opts.tools) body.tools = opts.tools;
+
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": ANTHROPIC_API_KEY ?? "",
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, body: await res.text() };
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!ANTHROPIC_API_KEY)("Anthropic Claude Messages drift", () => {
-  const config = { apiKey: ANTHROPIC_API_KEY! };
+  it("non-streaming text shape matches", async (ctx) => {
+    const resolved = await getAnthropicModel();
+    if ("infra" in resolved) {
+      // Provider-side auth/credit/rate-limit/5xx — honest skip, not drift.
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("Anthropic /v1/models exposed no usable non-deprecated model");
+    }
+    const model = resolved.model;
 
-  it("non-streaming text shape matches", async () => {
     const sdkShape = anthropicMessageShape();
+    const messages = [{ role: "user", content: "Say hello" }];
 
     const [realRes, mockRes] = await Promise.all([
-      anthropicNonStreaming(config, [{ role: "user", content: "Say hello" }]),
+      anthropicMessagesLive(model, messages),
       httpPost(`${instance.url}/v1/messages`, {
-        model: "claude-haiku-4-5-20251001",
+        model,
         max_tokens: 10,
-        messages: [{ role: "user", content: "Say hello" }],
+        messages,
         stream: false,
       }),
     ]);
 
-    const realShape = extractShape(realRes.body);
+    if (isInfraSkip(realRes.status) || isModelNotFound(realRes.status, realRes.body)) {
+      // Real probe hit a transient provider-side condition, or the resolved
+      // model went stale between listing and probe — honest skip, not drift.
+      ctx.skip();
+      return;
+    }
+
+    const realShape = extractShape(JSON.parse(realRes.body));
     const mockShape = extractShape(JSON.parse(mockRes.body));
 
     const diffs = triangulate(sdkShape, realShape, mockShape);
@@ -66,20 +159,41 @@ describe.skipIf(!ANTHROPIC_API_KEY)("Anthropic Claude Messages drift", () => {
     ).toEqual([]);
   });
 
-  it("streaming text event sequence and shapes match", async () => {
-    const sdkEvents = anthropicStreamEventShapes();
+  it("streaming text event sequence and shapes match", async (ctx) => {
+    const resolved = await getAnthropicModel();
+    if ("infra" in resolved) {
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("Anthropic /v1/models exposed no usable non-deprecated model");
+    }
+    const model = resolved.model;
 
-    const [realStream, mockStreamRes] = await Promise.all([
-      anthropicStreaming(config, [{ role: "user", content: "Say hello" }]),
+    const sdkEvents = anthropicStreamEventShapes();
+    const messages = [{ role: "user", content: "Say hello" }];
+
+    const [realRaw, mockStreamRes] = await Promise.all([
+      anthropicMessagesLive(model, messages, { stream: true }),
       httpPost(`${instance.url}/v1/messages`, {
-        model: "claude-haiku-4-5-20251001",
+        model,
         max_tokens: 10,
-        messages: [{ role: "user", content: "Say hello" }],
+        messages,
         stream: true,
       }),
     ]);
 
-    expect(realStream.rawEvents.length, "Real API returned no SSE events").toBeGreaterThan(0);
+    if (isInfraSkip(realRaw.status) || isModelNotFound(realRaw.status, realRaw.body)) {
+      ctx.skip();
+      return;
+    }
+
+    const realParsed = parseTypedSSE(realRaw.body);
+    expect(realParsed.length, "Real API returned no SSE events").toBeGreaterThan(0);
+    const realEvents = realParsed.map((e) => ({
+      type: e.type,
+      dataShape: extractShape(e.data),
+    }));
 
     const mockEvents = parseTypedSSE(mockStreamRes.body);
     expect(mockEvents.length, "Mock returned no SSE events").toBeGreaterThan(0);
@@ -89,7 +203,7 @@ describe.skipIf(!ANTHROPIC_API_KEY)("Anthropic Claude Messages drift", () => {
       dataShape: extractShape(e.data),
     }));
 
-    const diffs = compareSSESequences(sdkEvents, realStream.events, mockSSEShapes);
+    const diffs = compareSSESequences(sdkEvents, realEvents, mockSSEShapes);
     const report = formatDriftReport(
       "Anthropic Claude (streaming text events)",
       diffs,
@@ -102,7 +216,17 @@ describe.skipIf(!ANTHROPIC_API_KEY)("Anthropic Claude Messages drift", () => {
     ).toEqual([]);
   });
 
-  it("non-streaming tool call shape matches", async () => {
+  it("non-streaming tool call shape matches", async (ctx) => {
+    const resolved = await getAnthropicModel();
+    if ("infra" in resolved) {
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("Anthropic /v1/models exposed no usable non-deprecated model");
+    }
+    const model = resolved.model;
+
     const sdkShape = anthropicMessageToolCallShape();
 
     const tools = [
@@ -116,19 +240,25 @@ describe.skipIf(!ANTHROPIC_API_KEY)("Anthropic Claude Messages drift", () => {
         },
       },
     ];
+    const messages = [{ role: "user", content: "Weather in Paris" }];
 
     const [realRes, mockRes] = await Promise.all([
-      anthropicNonStreaming(config, [{ role: "user", content: "Weather in Paris" }], tools),
+      anthropicMessagesLive(model, messages, { tools, maxTokens: 50 }),
       httpPost(`${instance.url}/v1/messages`, {
-        model: "claude-haiku-4-5-20251001",
+        model,
         max_tokens: 50,
-        messages: [{ role: "user", content: "Weather in Paris" }],
+        messages,
         stream: false,
         tools,
       }),
     ]);
 
-    const realShape = extractShape(realRes.body);
+    if (isInfraSkip(realRes.status) || isModelNotFound(realRes.status, realRes.body)) {
+      ctx.skip();
+      return;
+    }
+
+    const realShape = extractShape(JSON.parse(realRes.body));
     const mockShape = extractShape(JSON.parse(mockRes.body));
 
     const diffs = triangulate(sdkShape, realShape, mockShape);
@@ -144,7 +274,17 @@ describe.skipIf(!ANTHROPIC_API_KEY)("Anthropic Claude Messages drift", () => {
     ).toEqual([]);
   });
 
-  it("streaming tool call event sequence matches", async () => {
+  it("streaming tool call event sequence matches", async (ctx) => {
+    const resolved = await getAnthropicModel();
+    if ("infra" in resolved) {
+      ctx.skip();
+      return;
+    }
+    if ("unavailable" in resolved) {
+      throw new Error("Anthropic /v1/models exposed no usable non-deprecated model");
+    }
+    const model = resolved.model;
+
     const sdkEvents = [
       ...anthropicStreamEventShapes().filter(
         (e) =>
@@ -164,19 +304,30 @@ describe.skipIf(!ANTHROPIC_API_KEY)("Anthropic Claude Messages drift", () => {
         },
       },
     ];
+    const messages = [{ role: "user", content: "Weather in Paris" }];
 
-    const [realStream, mockStreamRes] = await Promise.all([
-      anthropicStreaming(config, [{ role: "user", content: "Weather in Paris" }], tools),
+    const [realRaw, mockStreamRes] = await Promise.all([
+      anthropicMessagesLive(model, messages, { tools, stream: true, maxTokens: 50 }),
       httpPost(`${instance.url}/v1/messages`, {
-        model: "claude-haiku-4-5-20251001",
+        model,
         max_tokens: 50,
-        messages: [{ role: "user", content: "Weather in Paris" }],
+        messages,
         stream: true,
         tools,
       }),
     ]);
 
-    expect(realStream.rawEvents.length, "Real API returned no SSE events").toBeGreaterThan(0);
+    if (isInfraSkip(realRaw.status) || isModelNotFound(realRaw.status, realRaw.body)) {
+      ctx.skip();
+      return;
+    }
+
+    const realParsed = parseTypedSSE(realRaw.body);
+    expect(realParsed.length, "Real API returned no SSE events").toBeGreaterThan(0);
+    const realEvents = realParsed.map((e) => ({
+      type: e.type,
+      dataShape: extractShape(e.data),
+    }));
 
     const mockEvents = parseTypedSSE(mockStreamRes.body);
     expect(mockEvents.length, "Mock returned no SSE events").toBeGreaterThan(0);
@@ -186,7 +337,7 @@ describe.skipIf(!ANTHROPIC_API_KEY)("Anthropic Claude Messages drift", () => {
       dataShape: extractShape(e.data),
     }));
 
-    const diffs = compareSSESequences(sdkEvents, realStream.events, mockSSEShapes);
+    const diffs = compareSSESequences(sdkEvents, realEvents, mockSSEShapes);
     const report = formatDriftReport(
       "Anthropic Claude (streaming tool call events)",
       diffs,
@@ -197,6 +348,180 @@ describe.skipIf(!ANTHROPIC_API_KEY)("Anthropic Claude Messages drift", () => {
       diffs.filter((d) => d.severity === "critical"),
       report,
     ).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression guard for the drift-live-pr exit-5 quarantine (cross-block memo
+// pollution).
+// ---------------------------------------------------------------------------
+//
+// When ANTHROPIC_API_KEY is armed in CI, the live block above runs FIRST and
+// populates `resolveLiveModel`'s per-key memo under "anthropic" with the real
+// resolved id — and, exactly like the real live block, has no afterEach cache
+// reset. This block SIMULATES that seeding with no credentials (a stubbed
+// listing exposing the still-live `claude-haiku-4-5-20251001`) so the fixture
+// self-healing block below is proven to reset the shared memo BEFORE it runs.
+//
+// Without that reset, the fixture block's first test read the leaked live id
+// and asserted a raw `.toBe()` on model ids — an unparseable AssertionError
+// (`expected 'claude-haiku-4-5-20251001' to be 'claude-haiku-5-1-20260201'`)
+// that the drift collector could not parse as a structured report and
+// quarantined as a fatal exit 5 (the drift-live-pr failure). Declared
+// immediately before the fixture block so declaration order (vitest runs
+// in-file tests in order; no shuffle configured) reproduces the CI sequence.
+describe("Anthropic live-leg memo seeding (simulates the armed-key live block running first)", () => {
+  it("populates the shared resolveLiveModel memo under 'anthropic' (no reset — mirrors the live block)", async () => {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL) => {
+      if (String(url).includes("/v1/models")) {
+        return new Response(JSON.stringify({ data: [{ id: "claude-haiku-4-5-20251001" }] }), {
+          status: 200,
+        });
+      }
+      throw new Error(`Unexpected fetch in seeding test: ${String(url)}`);
+    }) as typeof fetch;
+    try {
+      // The live leg resolves and MEMOIZES the still-live real id under
+      // "anthropic". Intentionally NOT cleared here — the fixture block below
+      // must be the thing that resets it.
+      const resolved = await getAnthropicModel();
+      expect(resolved).toEqual({ model: "claude-haiku-4-5-20251001" });
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Self-healing proof (fixture-driven — no live credentials required)
+// ---------------------------------------------------------------------------
+//
+// Drives the REAL `getAnthropicModel`/`fetchAnthropicModelListing` resolution
+// path and the REAL `isInfraSkip`/`isModelNotFound`/`triangulate` the live
+// leg above uses (no reimplementation) against a simulated "Anthropic
+// retired the pinned snapshot" condition. Runs unconditionally — no
+// ANTHROPIC_API_KEY required — so it always exercises the retrofit even when
+// live credentials aren't armed locally or in CI.
+//
+//   RED (pre-retrofit behavior, not committed): the old hardcoded pin
+//   (`claude-haiku-4-5-20251001`) was sent directly to `/v1/messages` with no
+//   discovery/skip layer. Against this same fixture (pin retired, listing
+//   only exposes a newer id) that call 404s, and the old code had no honest-
+//   skip path — the leg would throw/critical-diff and quarantine.
+//   GREEN (this retrofit): `getAnthropicModel()` discovers the live id from
+//   the listing instead of using the stale pin, the probe against the
+//   discovered id succeeds, and shape-grading reports zero critical drift.
+describe("Anthropic live-leg self-healing (fixture-driven, no credentials required)", () => {
+  const origFetch = globalThis.fetch;
+  // Reset the shared per-key `resolveLiveModel` memo BEFORE each case, not only
+  // after. The live block (and the seeding guard) above run first and leave the
+  // "anthropic" key memoized with a real/still-live id; without this the first
+  // fixture case would resolve to that leaked id instead of its own stub and
+  // fail a raw `.toBe()` on model ids (the drift-live-pr exit-5 quarantine).
+  beforeEach(() => {
+    __resetResolveLiveModelCache();
+  });
+  afterEach(() => {
+    globalThis.fetch = origFetch;
+    __resetResolveLiveModelCache();
+  });
+
+  const RETIRED_PIN = "claude-haiku-4-5-20251001";
+  const LIVE_DISCOVERED_MODEL = "claude-haiku-5-1-20260201";
+
+  function stubRetiredPinFixture(): void {
+    globalThis.fetch = (async (url: string | URL, init?: RequestInit) => {
+      const href = String(url);
+      if (href.includes("/v1/models")) {
+        // The pinned snapshot no longer appears in the listing — retired.
+        return new Response(JSON.stringify({ data: [{ id: LIVE_DISCOVERED_MODEL }] }), {
+          status: 200,
+        });
+      }
+      if (href.includes("/v1/messages")) {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+        if (body.model === RETIRED_PIN) {
+          // Documenting the RED this retrofit removes from the driven path:
+          // the retired pin genuinely 404s as "model not found".
+          return new Response(
+            JSON.stringify({
+              type: "error",
+              error: { type: "not_found_error", message: `model: ${RETIRED_PIN}` },
+            }),
+            { status: 404 },
+          );
+        }
+        if (body.model === LIVE_DISCOVERED_MODEL) {
+          return new Response(
+            JSON.stringify({
+              id: "msg_fixture",
+              type: "message",
+              role: "assistant",
+              content: [{ type: "text", text: "Hello!" }],
+              model: LIVE_DISCOVERED_MODEL,
+              stop_reason: "end_turn",
+              stop_sequence: null,
+              usage: { input_tokens: 8, output_tokens: 3 },
+            }),
+            { status: 200 },
+          );
+        }
+      }
+      throw new Error(`Unexpected fetch in fixture test: ${href}`);
+    }) as typeof fetch;
+  }
+
+  it("REGRESSION: discovers a live model and shape-grades it when the pinned snapshot is retired", async () => {
+    stubRetiredPinFixture();
+
+    // RED evidence (documented, not re-executed here): sending the retired
+    // pin straight through — what the pre-retrofit code did — 404s against
+    // this exact fixture:
+    const staleProbe = await anthropicMessagesLive(RETIRED_PIN, [
+      { role: "user", content: "Say hello" },
+    ]);
+    expect(staleProbe.status).toBe(404);
+    expect(isModelNotFound(staleProbe.status, staleProbe.body)).toBe(true);
+
+    // GREEN: the retrofitted resolution step never returns the retired pin —
+    // it discovers the listing's live id instead.
+    const resolved = await getAnthropicModel();
+    if ("infra" in resolved || "unavailable" in resolved) {
+      throw new Error(`Expected a resolved model, got ${JSON.stringify(resolved)}`);
+    }
+    expect(resolved.model).toBe(LIVE_DISCOVERED_MODEL);
+    expect(resolved.model).not.toBe(RETIRED_PIN);
+
+    const realRes = await anthropicMessagesLive(resolved.model, [
+      { role: "user", content: "Say hello" },
+    ]);
+    expect(isInfraSkip(realRes.status)).toBe(false);
+    expect(isModelNotFound(realRes.status, realRes.body)).toBe(false);
+    expect(realRes.status).toBe(200);
+
+    // Shape-graded on the discovered-model envelope — a real drift would
+    // still be caught here; this fixture's envelope matches the SDK shape.
+    const sdkShape = anthropicMessageShape();
+    const realShape = extractShape(JSON.parse(realRes.body));
+    const diffs = triangulate(sdkShape, realShape, realShape);
+    expect(diffs.filter((d) => d.severity === "critical")).toEqual([]);
+  });
+
+  it("honest-skips (not a drift finding) when the model listing itself hits an infra condition", async () => {
+    // 403 avoids RETRYABLE_STATUSES (429/5xx) so the fixture stays fast.
+    globalThis.fetch = (async () => new Response("Forbidden", { status: 403 })) as typeof fetch;
+
+    const resolved = await getAnthropicModel();
+    expect(resolved).toEqual({ infra: 403 });
+  });
+
+  it("classifies model-not-found probe responses (404, and 400 with a model-not-found body)", () => {
+    expect(isModelNotFound(404)).toBe(true);
+    expect(
+      isModelNotFound(400, JSON.stringify({ error: { message: "model_not_found: foo" } })),
+    ).toBe(true);
+    expect(isModelNotFound(400, JSON.stringify({ error: { message: "bad request" } }))).toBe(false);
   });
 });
 
