@@ -49,6 +49,135 @@ export class InfraError extends Error {
 }
 
 // ---------------------------------------------------------------------------
+// Shared self-healing helpers (live-model discovery + infra-skip)
+// ---------------------------------------------------------------------------
+//
+// Generalizes the two already-merged self-healing patterns so the live-leg
+// retrofits reuse ONE util instead of each inlining a divergent copy:
+//   - Cohere dynamic model discovery (#325 / cohere-model.ts): resolve a live,
+//     non-deprecated model id from the provider's own `/models` listing rather
+//     than hardcoding one the provider later retires (the `command-r-plus` 404
+//     that quarantined the leg as exit 5).
+//   - fal infra-skip (#332): classify a provider-side auth/credit/rate-limit/5xx
+//     condition as an HONEST SKIP so a transient outage never quarantines the
+//     shared drift baseline.
+
+/**
+ * Environmental HTTP statuses that indicate a provider-side condition
+ * (auth / out-of-credit / rate-limit / upstream outage) rather than a real
+ * API-envelope drift. Mirrors the {@link InfraError} classification:
+ *   401 | 403 → stale-key      402 → out-of-credit
+ *   429       → rate-limited    5xx → infra-transient
+ *
+ * A live leg converts these to an HONEST SKIP so a transient provider-side
+ * condition never quarantines the drift collector and reds the PR. A real
+ * shape drift (a 2xx response with an unexpected envelope) is NEVER an infra
+ * status, so genuine drift still fails. Status-only by design — a 404 on a
+ * listing endpoint is a broken listing (unavailable), not a skip; the
+ * retired-MODEL case is {@link isModelNotFound}.
+ */
+export function isInfraSkip(status: number): boolean {
+  return status === 401 || status === 402 || status === 403 || status === 429 || status >= 500;
+}
+
+/**
+ * True when a PROBE response indicates the requested MODEL does not exist (the
+ * pinned model id was retired) rather than a live-envelope drift. Providers
+ * signal this as a 404, or a 400 whose error body names a model-not-found
+ * condition (OpenAI `model_not_found`, "does not exist", "unknown model",
+ * etc.). The retrofit legs convert this to an honest skip — a stale pin is an
+ * operational nudge to re-discover, not a drift finding that should red the PR.
+ *
+ * Distinct from {@link isInfraSkip} because it is PROBE-scoped and body-aware:
+ * the model-listing/discovery path treats a 404 as `unavailable` (fail-loud),
+ * whereas a driven-probe 404 means the model id went stale.
+ */
+export function isModelNotFound(status: number, body?: string): boolean {
+  if (status === 404) return true;
+  if (status === 400 && body) {
+    return /model[_\s-]?not[_\s-]?found|does\s+not\s+exist|not\s+a\s+valid\s+model|unknown\s+model/i.test(
+      body,
+    );
+  }
+  return false;
+}
+
+/** Minimal shape of a `/models` listing entry we depend on for selection. */
+export interface LiveModelEntry {
+  /** The model identifier (OpenAI `id`, Cohere/Gemini `name`, …). */
+  id: string;
+  /** True when the provider marks this model deprecated/retired. */
+  deprecated?: boolean;
+}
+
+/**
+ * Select a currently-valid, NON-deprecated model id from a `/models` listing,
+ * generalizing `selectCohereChatModel`. Prefers an id from `preferred` (in
+ * order) when it is present AND live, else falls back to the first live model.
+ * Returns null when the listing exposes no usable (non-deprecated, non-empty)
+ * model.
+ */
+export function selectLiveModel(models: LiveModelEntry[], preferred: string[] = []): string | null {
+  const liveIds = models
+    .filter((m) => typeof m.id === "string" && m.id.length > 0 && m.deprecated !== true)
+    .map((m) => m.id);
+  return preferred.find((p) => liveIds.includes(p)) ?? liveIds[0] ?? null;
+}
+
+/**
+ * Outcome of resolving a live model for a leg:
+ *   - `{ model }`       → a valid, non-deprecated id to drive the leg
+ *   - `{ infra }`       → the listing hit an auth/credit/rate-limit/5xx
+ *                         condition; the caller SKIPS honestly (not drift)
+ *   - `{ unavailable }` → the listing succeeded (or hit a non-infra error) but
+ *                         exposed no usable model — a genuinely broken state to
+ *                         fail loud on
+ */
+export type ResolvedModel = { model: string } | { infra: number } | { unavailable: true };
+
+/** Per-key memo so the whole leg makes exactly one listing call. */
+const resolvedModelCache = new Map<string, Promise<ResolvedModel>>();
+
+/**
+ * Resolve a live model from a provider's own listing endpoint, MEMOIZED per
+ * `key` so repeated calls within one leg make a single listing call.
+ * Generalizes cohere's `resolveCohereChatModel` + `getCohereChatModel`.
+ *
+ * `fetchListing` is provider-specific: it performs the raw listing call and
+ * normalizes it to `{ status, models }` (mapping the provider's field names
+ * onto {@link LiveModelEntry}). An {@link InfraError} thrown from it (e.g. a
+ * network failure surfaced through {@link withInfraErrorTag}) is mapped to an
+ * honest `{ infra }` skip rather than propagating.
+ */
+export function resolveLiveModel(
+  key: string,
+  fetchListing: () => Promise<{ status: number; models: LiveModelEntry[] }>,
+  preferred: string[] = [],
+): Promise<ResolvedModel> {
+  const cached = resolvedModelCache.get(key);
+  if (cached) return cached;
+  const promise = (async (): Promise<ResolvedModel> => {
+    try {
+      const { status, models } = await fetchListing();
+      if (isInfraSkip(status)) return { infra: status };
+      if (status >= 400) return { unavailable: true };
+      const model = selectLiveModel(models, preferred);
+      return model ? { model } : { unavailable: true };
+    } catch (err) {
+      if (err instanceof InfraError) return { infra: err.status };
+      throw err;
+    }
+  })();
+  resolvedModelCache.set(key, promise);
+  return promise;
+}
+
+/** Test-only: clear the {@link resolveLiveModel} memo cache between cases. */
+export function __resetResolveLiveModelCache(): void {
+  resolvedModelCache.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Retry helper
 // ---------------------------------------------------------------------------
 
