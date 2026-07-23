@@ -371,11 +371,14 @@ export async function openaiRealtimeWS(
   // Step 1: Wait for session.created
   const sessionCreated = await ws.waitUntil((msg: any) => msg?.type === "session.created");
 
-  // Step 2: Send session.update
-  const session: Record<string, unknown> = {
-    model: "gpt-realtime-mini",
-    modalities: ["text"],
-  };
+  // Step 2: Send session.update.
+  // GA (no Beta header) requires session.type:"realtime" and renames the legacy
+  // `modalities` field to `output_modalities`. Beta keeps the legacy field name
+  // and has no session.type. Confirmed live: a GA session.update without
+  // session.type is rejected with "Missing required parameter: 'session.type'".
+  const session: Record<string, unknown> = beta
+    ? { model: "gpt-realtime-mini", modalities: ["text"] }
+    : { type: "realtime", model: "gpt-realtime-mini", output_modalities: ["text"] };
   if (tools) session.tools = tools;
   ws.send(JSON.stringify({ type: "session.update", session }));
 
