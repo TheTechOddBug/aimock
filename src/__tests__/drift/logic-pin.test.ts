@@ -204,7 +204,7 @@ const DATA_FROZEN: Record<string, { members: string[]; pin: string }> = {
   },
   "includeFamilies.gemini": {
     members: [...includeFamilies.gemini].sort(),
-    pin: "4a9428b64ffcff0fbb79878d88ed993ffac53e43d64e26bcf5d86509626f593d",
+    pin: "c2e2c56b8f8d5fc56152b4633e7d3782e95b7eeb9bc123da71f00e884a54a743",
   },
   "excludeFamilies.openai": {
     members: [...excludeFamilies.openai].sort(),
@@ -216,7 +216,7 @@ const DATA_FROZEN: Record<string, { members: string[]; pin: string }> = {
   },
   "excludeFamilies.gemini": {
     members: [...excludeFamilies.gemini].sort(),
-    pin: "e3545138234ad782937f66760bef942fca7d4bd0934a87da30bf6e5816ba69b1",
+    pin: "c95dedab7588212bbba0bf9ab6434bfd43a449adbe7b35f81f48271ee849a9c2",
   },
 };
 
