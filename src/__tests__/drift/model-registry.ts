@@ -135,9 +135,7 @@ export const includeFamilies: Record<Provider, Set<string>> = {
     "claude-fable-5",
   ]),
   gemini: familySet("gemini", [
-    // Gemini 1.5 / 2.0 / 2.5 text families
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
+    // Gemini 2.0 / 2.5 text families
     "gemini-2.0-flash",
     "gemini-2.5-flash",
     "gemini-2.5-pro",
@@ -226,6 +224,14 @@ export const excludeFamilies: Record<Provider, Set<string>> = {
     // Retired / legacy specialty
     "gemini-pro",
     "aqa",
+    // Gemini 1.5 retired upstream 2026-07 (absent from the live /models listing)
+    // but aimock still mocks it for clients pinned to older SDKs, and
+    // `isReasoningModel()` must keep answering false for it (model-utils.ts's
+    // NONREASONING_FAMILIES). Same treatment as gemini-pro above: still
+    // referenced + still mocked, just not counted as text-generation drift.
+    // See drift-proposals/gemini-gemini-1.5-{pro,flash}-deprecated-referenced.md.
+    "gemini-1.5-pro",
+    "gemini-1.5-flash",
     // Embeddings (non-text-generation)
     "text-embedding-004",
     "gemini-embedding",
