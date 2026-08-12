@@ -494,23 +494,43 @@ export interface WSServerClose {
 }
 
 /**
+ * The RFC 6455 §7.4.1 close codes that mean "what this end sent was
+ * unacceptable" — the peer is describing OUR payload, protocol or policy. These
+ * are genuine, attributable drift.
+ *
+ * Enumerated rather than expressed as a range, because the numeric span is not
+ * semantically contiguous: 1004 is reserved, and 1005/1006 are codes that are
+ * NEVER sent on the wire (they are local placeholders for "no status received"
+ * and "closed abnormally"). A `1002..1010` range silently swept those three in
+ * and would have reported "the provider refused us" for a connection that
+ * dropped without any code at all.
+ */
+const WS_REFUSAL_CLOSE_CODES: ReadonlySet<number> = new Set([
+  1002, // protocol error
+  1003, // unsupported data
+  1007, // invalid frame payload data
+  1008, // policy violation
+  1009, // message too big
+  1010, // mandatory extension missing
+]);
+
+/**
  * Does this close code mean the provider REFUSED what this end sent?
  *
- * 1002-1010 are the "your frame/protocol/policy was unacceptable" range —
- * protocol error, unsupported data, invalid payload, policy violation, message
- * too big, failed extension negotiation. 4000-4999 is the application-defined
- * range, which is where a provider puts its own refusal semantics. Those are
- * genuine, attributable drift: the provider is describing something WE sent.
+ * True for the §7.4.1 rejection codes above and for the 4000-4999
+ * application-defined range, which is where a provider puts its own refusal
+ * semantics.
  *
- * Everything else is the connection ending for the peer's or the transport's own
- * reasons — 1000 normal, 1001 going away, 1005 no code at all, 1006 abnormal,
- * 1011 internal error, 1012/1013 restarting / try again later, 1015 TLS failure.
- * Calling any of those "drift" would page the team about a provider's own hiccup
- * and hand it to the auto-fixer, which is the false-drift alarm `drift-retry.ts`
- * exists to suppress. They are real and worth seeing, but they are not findings.
+ * False for everything else — the connection ending for the peer's or the
+ * transport's own reasons: 1000 normal, 1001 going away, 1004 reserved, 1005 no
+ * code, 1006 abnormal, 1011 internal error, 1012/1013 restarting / try again
+ * later, 1014/1015 gateway and TLS failures. Calling any of those "drift" would
+ * page the team about a provider's own hiccup and hand it to the auto-fixer,
+ * which is the false-drift alarm `drift-retry.ts` exists to suppress. They are
+ * real and worth seeing, but they are not findings about us.
  */
 export function isRefusalCloseCode(code: number): boolean {
-  return (code >= 1002 && code <= 1010) || (code >= 4000 && code <= 4999);
+  return WS_REFUSAL_CLOSE_CODES.has(code) || (code >= 4000 && code <= 4999);
 }
 
 /**

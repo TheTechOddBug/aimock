@@ -30,6 +30,8 @@ import {
   conclusionForExitCode,
   classifyUnparseableAsInfra,
   parseLiveTimeout,
+  parseWSServerClose,
+  isRefusalCloseCode,
   INFRA_INDICATOR_SOURCES,
   infraIndicatorSample,
   NO_GA_DELTA_ID,
@@ -1196,6 +1198,192 @@ describe("what a drift block prints is what the collector collects", () => {
       "     Real:    nope\n" +
       "     Mock:    nope\n";
     expect(parseDriftBlock(text)!.diffs).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Server-initiated CLOSE: refusal vs hang-up vs silence
+//
+// `fix/ws-preserve-close-code` taught the drift probe to preserve an RFC 6455
+// CLOSE frame instead of discarding it, which introduces a failure string no
+// parser here had seen:
+//
+//   WSClosedError: WebSocket closed by server during waitUntil: code=1008
+//   reason="Requested model is not supported for BidiGenerateContent.".
+//   Collected 0 messages: [] bodies=[]
+//
+// Measured against this collector before the refusal lane existed, that string
+// matched no infra indicator, no handshake recognizer and no timeout recognizer,
+// and landed on `exit 5 — manual triage`. That is the same daily hard stop the
+// timeout lane was built to remove, re-entering through a new input.
+//
+// So there are now THREE lanes and they must stay distinguishable, because
+// telling them apart is the whole point:
+//   - REFUSAL — the frame names something WE sent as unacceptable → attributed
+//     critical drift (exit 2), with the code and reason carried into the report.
+//   - HANG-UP — the peer left for its own reasons (1011 internal error, 1012
+//     restarting, 1000 normal) → nothing graded, exit 6. NOT a finding: calling a
+//     provider's own hiccup "drift" pages the team and hands it to the auto-fixer.
+//   - SILENCE / GARBAGE — unchanged: exit 6 and exit 5 respectively.
+// ---------------------------------------------------------------------------
+
+/** The exact shape `fix/ws-preserve-close-code` emits, per its own source template. */
+function wsServerClose(code: number, reason: string, collected = 0): string {
+  return (
+    `WSClosedError: WebSocket closed by server during waitUntil: code=${code} ` +
+    `reason=${JSON.stringify(reason)}. Collected ${collected} messages: [] bodies=[]\n` +
+    "    at Timeout._onTimeout (/repo/src/__tests__/drift/ws-providers.ts:319:23)\n" +
+    "    at /repo/src/__tests__/drift/ws-gemini-live.drift.ts:88:11"
+  );
+}
+
+function resultFor(message: string, ancestor = "Gemini Live WS drift"): VitestJsonResult {
+  return makeResult([
+    makeAssertion({
+      status: "failed",
+      ancestorTitles: [ancestor],
+      title: "WS text event sequence and shapes match",
+      failureMessages: [message],
+    }),
+  ]);
+}
+
+describe("a provider that closes the session states its own cause", () => {
+  const GEMINI_REASON = "Requested model is not supported for BidiGenerateContent.";
+
+  it("the production refusal (code 1008) becomes attributed critical drift, not triage", () => {
+    const result = resultFor(wsServerClose(1008, GEMINI_REASON));
+    expect(quarantineOf(result)).toEqual([]);
+    expect(timeoutsOf(result)).toEqual([]);
+    const entries = entriesOf(result);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].provider).toBe("Gemini Live");
+    expect(entries[0].builderFile).toBe("src/ws-gemini-live.ts");
+    expect(entries[0].scenario).toBe("WS session refused");
+    expect(exitCodeOf(result)).toBe(2);
+  });
+
+  it("the close code AND the stated reason survive into the report", () => {
+    // The reason is the entire diagnosis; an entry that dropped it would be
+    // actionable in name only.
+    const diff = entriesOf(resultFor(wsServerClose(1008, GEMINI_REASON)))[0].diffs[0];
+    expect(diff.severity).toBe("critical");
+    expect(diff.issue).toContain("1008");
+    expect(diff.issue).toContain(GEMINI_REASON);
+    expect(diff.real).toContain(GEMINI_REASON);
+    expect(diff.id).toBe("ws-close:1008");
+  });
+
+  it("the delta key is the close CODE, so rewording the reason does not move it", () => {
+    // Providers reword reason prose freely. A key derived from it would re-report
+    // the same standing refusal as new-in-head on every PR.
+    const a = entriesOf(resultFor(wsServerClose(1008, "Requested model is not supported.")))[0];
+    const b = entriesOf(resultFor(wsServerClose(1008, "totally different wording")))[0];
+    expect(a.diffs[0].id).toBe(b.diffs[0].id);
+  });
+
+  it("a reason containing quotes, backslashes and newlines is decoded, not mangled", () => {
+    // The probe emits the reason JSON-quoted, so it is decoded with JSON.parse
+    // rather than by hand — provider text is not under our control.
+    const nasty = 'model "x\\y" is bad\nsecond line';
+    const diff = entriesOf(resultFor(wsServerClose(1008, nasty)))[0].diffs[0];
+    expect(diff.real).toContain(nasty);
+  });
+
+  it.each([
+    [1002, "protocol error"],
+    [1003, "unsupported data"],
+    [1007, "invalid payload"],
+    [1008, "policy violation"],
+    [1009, "message too big"],
+    [1010, "mandatory extension missing"],
+    [4000, "provider-defined"],
+    [4999, "provider-defined upper bound"],
+  ])("close code %i (%s) is a refusal → exit 2", (code) => {
+    expect(isRefusalCloseCode(code as number)).toBe(true);
+    expect(exitCodeOf(resultFor(wsServerClose(code as number, "why")))).toBe(2);
+  });
+
+  it.each([
+    [1000, "normal closure"],
+    [1001, "going away"],
+    [1004, "reserved, never assigned"],
+    [1005, "no status received — never sent on the wire"],
+    [1006, "abnormal closure — never sent on the wire"],
+    [1011, "server internal error"],
+    [1012, "service restarting"],
+    [1013, "try again later"],
+    [1015, "TLS handshake failure"],
+    [3999, "below the application range"],
+    [5000, "above the application range"],
+  ])("NEGATIVE CONTROL: close code %i (%s) is a hang-up, NOT drift → exit 6", (code) => {
+    // Treating a provider's own hiccup as drift pages the team and feeds the
+    // auto-fixer a phantom finding. It is surfaced, not swallowed and not blamed.
+    expect(isRefusalCloseCode(code as number)).toBe(false);
+    const result = resultFor(wsServerClose(code as number, "peer left"));
+    expect(entriesOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toEqual([]);
+    const timeouts = timeoutsOf(result);
+    expect(timeouts).toHaveLength(1);
+    expect(timeouts[0].serverClose).toEqual({ code: code as number, reason: "peer left" });
+    expect(exitCodeOf(result)).toBe(6);
+  });
+
+  it("a hang-up is distinguishable from silence in the record, not just in the exit code", () => {
+    // Both are exit 6, so the report is the only place a reader can tell "the peer
+    // hung up on us" from "nobody said anything". It has to carry that.
+    const hangUp = timeoutsOf(resultFor(wsServerClose(1011, "internal error")))[0];
+    expect(hangUp.serverClose).toEqual({ code: 1011, reason: "internal error" });
+    expect(hangUp.timeoutMs).toBeUndefined();
+
+    const silence = timeoutsOf(resultFor(CI_ZERO_OBSERVATION_TIMEOUT))[0];
+    expect(silence.serverClose).toBeUndefined();
+    expect(silence.timeoutMs).toBe(30000);
+  });
+
+  it("NEGATIVE CONTROL: silence is STILL exit 6 and garbage is STILL exit 5", () => {
+    // The two pre-existing lanes must be untouched by the third.
+    expect(exitCodeOf(resultFor(CI_ZERO_OBSERVATION_TIMEOUT))).toBe(6);
+    const garbage = resultFor(
+      "AssertionError: expected 'gpt-4o-realtime' to be one of\n    at /repo/src/a.ts:1:1",
+      "Some unmapped suite",
+    );
+    expect(quarantineOf(garbage)).toHaveLength(1);
+    expect(exitCodeOf(garbage)).toBe(5);
+  });
+
+  it("NEGATIVE CONTROL: a refusal from an UNREGISTERED probe quarantines, and says why", () => {
+    // An unattributable refusal must not be guessed at — but the quarantine
+    // message must name the refusal and the missing registration, not read as
+    // "unparseable".
+    const msg = wsServerClose(1008, GEMINI_REASON).replace(
+      "ws-gemini-live.drift.ts",
+      "ws-something-new.drift.ts",
+    );
+    const result = resultFor(msg, "Some future WS drift");
+    expect(entriesOf(result)).toEqual([]);
+    const q = quarantineOf(result);
+    expect(q).toHaveLength(1);
+    expect(q[0].message).toContain("REFUSED");
+    expect(q[0].message).toContain("1008");
+    expect(q[0].message).toContain("WS_HANDSHAKE_PROBES");
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("NEGATIVE CONTROL: an undecodable reason is not a diagnosis → quarantine", () => {
+    // A reason we cannot decode must never become a confident cause.
+    const broken =
+      "WSClosedError: WebSocket closed by server during waitUntil: code=1008 reason=not-quoted. " +
+      "Collected 0 messages: []\n    at /repo/src/__tests__/drift/ws-gemini-live.drift.ts:88:11";
+    expect(parseWSServerClose(broken)).toBeNull();
+    expect(exitCodeOf(resultFor(broken))).toBe(5);
+  });
+
+  it("a refusal that also carried messages is still a refusal", () => {
+    // The close frame is the terminal fact regardless of what arrived first.
+    const result = resultFor(wsServerClose(1008, GEMINI_REASON, 3));
+    expect(entriesOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(2);
   });
 });
 
