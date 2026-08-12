@@ -422,6 +422,11 @@ const WS_HANDSHAKE_PROBES: readonly {
   { file: "ws-responses.drift.ts", surface: "openai-responses-ws" },
 ];
 
+/** The registered surface a WS failure's stack frames attribute it to, or null. */
+function resolveWSProbeSurface(text: string): keyof typeof SURFACE_REGISTRY | null {
+  return WS_HANDSHAKE_PROBES.find((p) => text.includes(p.file))?.surface ?? null;
+}
+
 /**
  * A parsed WS handshake failure. The socket UPGRADED (101) and the live API sent
  * back an `error` event, but the expected session-lifecycle event never arrived,
@@ -455,14 +460,85 @@ export function parseWSHandshakeFailure(text: string): WSHandshakeFailure | null
   // flake or a silent surface carries no error body, fails Gate 3, and is left to
   // the timeout/quarantine lanes.
   if (!/waitUntil timeout/.test(text)) return null;
-  const probe = WS_HANDSHAKE_PROBES.find((p) => text.includes(p.file));
-  if (probe === undefined) return null;
+  const surface = resolveWSProbeSurface(text);
+  if (surface === null) return null;
   if (!/"type"\s*:\s*"error"/.test(text)) return null;
 
   const errorType = text.match(/"error"\s*:\s*\{[^}]*?"type"\s*:\s*"([^"]+)"/)?.[1] ?? "unknown";
   const errorCode = text.match(/"code"\s*:\s*"([^"]+)"/)?.[1] ?? "unknown";
   const errorMessage = text.match(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/)?.[1] ?? "unknown";
-  return { surface: probe.surface, errorType, errorCode, errorMessage };
+  return { surface, errorType, errorCode, errorMessage };
+}
+
+// ---------------------------------------------------------------------------
+// Server-initiated CLOSE recognizer (provider refusal vs provider hang-up)
+// ---------------------------------------------------------------------------
+
+/**
+ * A server-initiated WebSocket CLOSE observed while a probe was waiting.
+ *
+ * This is a THIRD failure channel, distinct from both lanes around it. The socket
+ * upgrades, and the provider then ends the session out-of-band with an RFC 6455
+ * CLOSE frame instead of an in-band `error` event. Until the drift probe was
+ * taught to preserve the frame, the code and reason were dropped and this arrived
+ * as an ordinary zero-message timeout — byte-identical to a provider that simply
+ * said nothing. Now the frame states its own cause, and a stated cause is the most
+ * actionable signal this system can produce, so it must not be flattened back into
+ * either neighbouring lane.
+ */
+export interface WSServerClose {
+  /** RFC 6455 status code (1005 when the frame carried no code). */
+  code: number;
+  /** The frame's reason text, decoded. Empty when the frame carried none. */
+  reason: string;
+}
+
+/**
+ * Does this close code mean the provider REFUSED what this end sent?
+ *
+ * 1002-1010 are the "your frame/protocol/policy was unacceptable" range —
+ * protocol error, unsupported data, invalid payload, policy violation, message
+ * too big, failed extension negotiation. 4000-4999 is the application-defined
+ * range, which is where a provider puts its own refusal semantics. Those are
+ * genuine, attributable drift: the provider is describing something WE sent.
+ *
+ * Everything else is the connection ending for the peer's or the transport's own
+ * reasons — 1000 normal, 1001 going away, 1005 no code at all, 1006 abnormal,
+ * 1011 internal error, 1012/1013 restarting / try again later, 1015 TLS failure.
+ * Calling any of those "drift" would page the team about a provider's own hiccup
+ * and hand it to the auto-fixer, which is the false-drift alarm `drift-retry.ts`
+ * exists to suppress. They are real and worth seeing, but they are not findings.
+ */
+export function isRefusalCloseCode(code: number): boolean {
+  return (code >= 1002 && code <= 1010) || (code >= 4000 && code <= 4999);
+}
+
+/**
+ * Recognize the drift probe's server-close failure message and recover the
+ * frame's code and reason.
+ *
+ * The reason is emitted `JSON.stringify`-quoted, so it is decoded with `JSON.parse`
+ * rather than by hand — a reason containing a quote, a backslash or a newline is
+ * exactly the input a hand-rolled unquoter gets wrong, and provider reason text is
+ * not under our control.
+ */
+export function parseWSServerClose(text: string): WSServerClose | null {
+  const match = text.match(
+    /WebSocket closed by server during waitUntil:\s*code=(\d+)\s*reason=("(?:[^"\\]|\\.)*")/,
+  );
+  if (!match) return null;
+  let reason: string;
+  try {
+    const decoded: unknown = JSON.parse(match[2]);
+    if (typeof decoded !== "string") return null;
+    reason = decoded;
+  } catch {
+    // A reason we cannot decode is not a reason. Returning null leaves the
+    // failure to the quarantine lane rather than reporting a mangled cause —
+    // an undecodable payload must never become a confident diagnosis.
+    return null;
+  }
+  return { code: Number(match[1]), reason };
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1084,74 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
           continue;
         }
 
+        // A session the provider ENDED. Split by what the CLOSE frame actually
+        // says, because the two halves are different evidence:
+        //   - a REFUSAL code names something WE sent as unacceptable → genuine,
+        //     attributable critical drift, exactly like an in-band error event;
+        //   - any other code says only that the peer left → a hang-up, which is
+        //     real and worth seeing but is not a finding about our payload.
+        // Neither half may fall through to the unparseable lane: this message
+        // states its own cause, and a stated cause routed to "manual triage" is
+        // the failure that blocked every drift PR in the first place.
+        const closed = parseWSServerClose(fullMessage);
+        if (closed !== null) {
+          const testName = `${assertion.ancestorTitles.join(" ")} > ${assertion.title}`;
+          const rawLocation = extractRawLocation(fullMessage);
+          const surface = resolveWSProbeSurface(fullMessage);
+          if (isRefusalCloseCode(closed.code)) {
+            if (surface === null) {
+              // A refusal we cannot attribute. Held for review rather than guessed
+              // at — the same rule the handshake lane follows, and the message says
+              // what is missing so the human is not left reading a stack trace.
+              quarantine.push({
+                provider: "unknown",
+                testName,
+                rawLocation,
+                message:
+                  `Provider REFUSED the WS session (close code ${closed.code}` +
+                  `${closed.reason ? `: ${closed.reason}` : ""}) but the reporting probe is not ` +
+                  `registered in WS_HANDSHAKE_PROBES, so the owning surface is unknown. ` +
+                  `Add the probe to attribute this automatically.\n${fullMessage}`,
+              });
+              continue;
+            }
+            const mapping = SURFACE_REGISTRY[surface];
+            entries.push({
+              provider: mapping.provider,
+              scenario: "WS session refused",
+              builderFile: mapping.builderFile,
+              builderFunctions: mapping.builderFunctions,
+              typesFile: mapping.typesFile ?? null,
+              sdkShapesFile: SDK_SHAPES_FILE,
+              diffs: [
+                {
+                  severity: "critical" as const,
+                  issue:
+                    `${mapping.provider} REFUSED the WS session — the provider closed the ` +
+                    `connection with RFC 6455 code ${closed.code} instead of completing the ` +
+                    `exchange. The stated reason is the diagnosis: ` +
+                    `${closed.reason || "(the frame carried no reason text)"}`,
+                  // Display only; the delta key is the explicit `id` below.
+                  path: `ws-close.${closed.code}`,
+                  expected: "(the session proceeds: the awaited message is received)",
+                  real: `close ${closed.code}${closed.reason ? `: ${closed.reason}` : ""}`,
+                  mock: "<no mock leg — live session probe>",
+                  // Keyed by close CODE, not by the reason prose: providers reword
+                  // reason text freely, and a key that moves on a reword would
+                  // re-report the same refusal as new-in-head on every PR.
+                  id: `ws-close:${closed.code}`,
+                },
+              ],
+            });
+            continue;
+          }
+          // Not a refusal — the peer hung up for its own reasons. Nothing was
+          // graded, so this shares the exit-6 lane: visible, alerted, and never a
+          // clean baseline, but not a finding and not a hard stop.
+          timeouts.push({ testName, rawLocation, message: fullMessage, serverClose: closed });
+          continue;
+        }
+
         // A live leg that reached its wait budget having observed NOTHING. A
         // recognized outcome with its own lane (exit 6) — see parseLiveTimeout
         // for why it is neither drift nor unparseable. Checked AFTER the two
@@ -1125,6 +1269,9 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
           // Recognized zero-observation live timeouts were claimed by the
           // timeout lane in the pass above; they are not unparseable.
           if (parseLiveTimeout(fullMessage) !== null) continue;
+          // A recognized server close was claimed above too — either as an
+          // attributed refusal, an explicit quarantine entry, or the exit-6 lane.
+          if (parseWSServerClose(fullMessage) !== null) continue;
           unparseableFailures.push({
             message: fullMessage,
             testName: `${assertion.ancestorTitles.join(" ")} > ${assertion.title}`,
@@ -1191,14 +1338,17 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
         `to triage. Check the surface below for an outage, a retired model, or a rejected session.`,
     );
     for (const t of timeouts) {
-      console.warn(
-        `  - ${t.testName} — no messages in ${t.timeoutMs}ms @ ${t.rawLocation || "<no frame>"}`,
-      );
+      const why = t.serverClose
+        ? `session closed by the server (code ${t.serverClose.code}` +
+          `${t.serverClose.reason ? `: ${t.serverClose.reason}` : ", no reason given"})`
+        : `no messages in ${t.timeoutMs}ms`;
+      console.warn(`  - ${t.testName} — ${why} @ ${t.rawLocation || "<no frame>"}`);
     }
     console.warn(
-      `  If this persists across runs it is not a flake. Note that src/__tests__/drift/ws-providers.ts ` +
-        `discards a server CLOSE frame without recording its code/reason, so a session the provider ` +
-        `REJECTED presents here as silence — that close code is the missing diagnosis.`,
+      `  If this persists across runs it is not a flake. A leg that reports NO close code and no ` +
+        `messages was met with genuine silence; one that reports a close code was hung up on, and ` +
+        `the code names who ended it. A close code in the refusal range is reported separately, as ` +
+        `attributed critical drift, not here.`,
     );
   }
 

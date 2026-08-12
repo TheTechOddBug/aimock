@@ -293,7 +293,7 @@ jobs:
             # either: each silent leg gets a named ::warning::, the report keeps
             # its `timeouts[]`, and the `notify` job below alerts on exit 6 with
             # its own wording. A day that graded nothing is never a clean day.
-            jq -r '.timeouts[]? | "::warning title=live-timeout::\(.testName) — no messages in \(.timeoutMs)ms (live surface silent; nothing graded on this surface)"' \
+            jq -r '.timeouts[]? | "::warning title=live-timeout::\(.testName) — \(if .serverClose then "session closed by the server (code \(.serverClose.code))" else "no messages in \(.timeoutMs)ms" end); nothing graded on this surface"' \
               drift-report.json || true
             echo "::warning::Drift collector: $(jq -r '.timeouts | length' drift-report.json) live leg(s) observed nothing (exit 6) — the surface is silent, not drifting. Nothing was graded there."
           elif [ "$EXIT_CODE" -ne 0 ]; then
@@ -717,7 +717,7 @@ jobs:
               exit "$BASE_EXIT"
             fi
             if [ "$BASE_EXIT" -eq 6 ]; then
-              jq -r '.timeouts[]? | "::warning title=live-timeout (base)::\(.testName) — no messages in \(.timeoutMs)ms; this surface was not graded on main"' \
+              jq -r '.timeouts[]? | "::warning title=live-timeout (base)::\(.testName) — \(if .serverClose then "session closed by the server (code \(.serverClose.code))" else "no messages in \(.timeoutMs)ms" end); this surface was not graded on main"' \
                 drift-report-base.json || true
             fi
             if [ "$BASE_EXIT" -ne 0 ] && [ "$BASE_EXIT" -ne 2 ] && [ "$BASE_EXIT" -ne 6 ]; then
@@ -781,7 +781,7 @@ jobs:
             exit "$HEAD_EXIT"
           fi
           if [ "$HEAD_EXIT" -eq 6 ]; then
-            jq -r '.timeouts[]? | "::warning title=live-timeout (head)::\(.testName) — no messages in \(.timeoutMs)ms; this surface was not graded on the PR ref"' \
+            jq -r '.timeouts[]? | "::warning title=live-timeout (head)::\(.testName) — \(if .serverClose then "session closed by the server (code \(.serverClose.code))" else "no messages in \(.timeoutMs)ms" end); this surface was not graded on the PR ref"' \
               drift-report-head.json || true
           fi
           if [ "$HEAD_EXIT" -ne 0 ] && [ "$HEAD_EXIT" -ne 2 ] && [ "$HEAD_EXIT" -ne 6 ]; then

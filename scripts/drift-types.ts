@@ -98,8 +98,21 @@ export interface TimeoutEntry {
    * stripping. Empty string when no frame was available.
    */
   rawLocation: string;
-  /** The wait budget that expired, in milliseconds, as reported by the probe. */
-  timeoutMs: number;
+  /**
+   * The wait budget that expired, in milliseconds, as reported by the probe.
+   * Absent when the leg produced nothing because the server CLOSED the session
+   * rather than because a wait ran out — in that case `serverClose` explains it.
+   */
+  timeoutMs?: number;
+  /**
+   * Set when the provider ended the session with an RFC 6455 CLOSE frame whose
+   * code does NOT indicate a refusal (see `isRefusalCloseCode`): 1000 normal,
+   * 1001 going away, 1011 internal error, 1012/1013 restarting, and so on. The
+   * peer stated that it left, not that anything we sent was wrong — so this is a
+   * hang-up, not a finding, and it shares the timeout lane's outcome. A REFUSAL
+   * code is not recorded here; it becomes an attributed critical drift entry.
+   */
+  serverClose?: { code: number; reason: string };
   /** The full failure message, retained verbatim for the reader. */
   message: string;
 }
