@@ -1218,6 +1218,21 @@ describe("what a drift block prints is what the collector collects", () => {
 // and a drift marker always wins.
 // ---------------------------------------------------------------------------
 
+/**
+ * A timeout that DID surface a provider `error` body, reported from a given WS
+ * drift probe. The frame is the only thing that varies, because the frame is what
+ * attribution is supposed to key off.
+ */
+function wsErrorTimeoutFrom(driftFile: string): string {
+  return (
+    "Error: waitUntil timeout after 30000ms. Collected 1 messages: [error] " +
+    'bodies=[{"type":"error","error":{"type":"invalid_request_error",' +
+    '"code":"bad_setup","message":"nope"}}]\n' +
+    "    at Timeout._onTimeout (/repo/src/__tests__/drift/ws-providers.ts:319:23)\n" +
+    `    at /repo/src/__tests__/drift/${driftFile}:88:11`
+  );
+}
+
 /** Verbatim CI failure message, run 31571018005 (PR #370), Gemini Live WS legs. */
 const CI_ZERO_OBSERVATION_TIMEOUT =
   "Error: waitUntil timeout after 30000ms. Collected 0 messages: [] bodies=[]\n" +
@@ -1409,41 +1424,80 @@ describe("zero-observation live timeouts are reported AS timeouts (exit 6)", () 
   // (quarantine). Pinned explicitly so the taxonomy is a measured fact rather
   // than something a reader has to reconstruct from three recognizers.
   //
-  // The middle row also records a real GAP, deliberately asserted as it behaves
-  // today rather than left unknown: the error-body recognizer is gated on the
-  // `ws-realtime.drift.ts` frame and hardcodes the openai-realtime surface, so an
-  // error-carrying timeout on ANY OTHER WS surface — including gemini-live, the
-  // one actually going quiet — is not attributed and still exits 5. Closing that
-  // means resolving the handshake lane's surface from the frame (both slugs are
-  // already in SURFACE_REGISTRY) instead of hardcoding one; it is NOT closed here
-  // because that variant has never been observed in a real run and the fix would
-  // move display strings that drift-remediation-strings.test.ts pins.
+  // Attribution now follows the PROBE, for every registered WS surface. It used to
+  // test for a `ws-realtime.drift.ts` frame and hardcode openai-realtime, so a
+  // rejected `gemini-live` handshake — the surface that actually goes quiet in
+  // production — resolved to nothing and quarantined at exit 5, back into the hard
+  // stop this lane exists to avoid. Each row below asserts the surface the failure
+  // is routed to, not merely that it was routed somewhere: a lane that attributed
+  // every provider to OpenAI Realtime would satisfy a count-only assertion.
   it.each([
-    ["ws-realtime.drift.ts", 1, 0, 0, 2],
-    ["ws-gemini-live.drift.ts", 0, 1, 0, 5],
+    ["ws-realtime.drift.ts", "OpenAI Realtime", "src/ws-realtime.ts"],
+    ["ws-gemini-live.drift.ts", "Gemini Live", "src/ws-gemini-live.ts"],
+    ["ws-responses.drift.ts", "OpenAI Responses WS", "src/ws-responses.ts"],
   ])(
-    "a timeout carrying an error body from %s → entries=%i quarantine=%i timeouts=%i exit=%i",
-    (frame, wantEntries, wantQuarantine, wantTimeouts, wantExit) => {
-      const msg =
-        "Error: waitUntil timeout after 30000ms. Collected 1 messages: [error] " +
-        'bodies=[{"type":"error","error":{"type":"invalid_request_error",' +
-        '"code":"bad_setup","message":"nope"}}]\n' +
-        "    at Timeout._onTimeout (/repo/src/__tests__/drift/ws-providers.ts:319:23)\n" +
-        `    at /repo/src/__tests__/drift/${frame}:88:11`;
+    "an error-carrying timeout from %s is critical drift owned by %s",
+    (frame, wantProvider, wantBuilderFile) => {
       const result = makeResult([
         makeAssertion({
           status: "failed",
+          // The ancestor title deliberately says Gemini Live for every row: it must
+          // not be what decides the owner, or the frame-based attribution would be
+          // untested for the two rows whose title disagrees with their probe.
           ancestorTitles: ["Gemini Live WS drift"],
           title: "WS text event sequence and shapes match",
-          failureMessages: [msg],
+          failureMessages: [wsErrorTimeoutFrom(frame)],
         }),
       ]);
-      expect(entriesOf(result)).toHaveLength(wantEntries);
-      expect(quarantineOf(result)).toHaveLength(wantQuarantine);
-      expect(timeoutsOf(result)).toHaveLength(wantTimeouts);
-      expect(exitCodeOf(result)).toBe(wantExit);
+      expect(quarantineOf(result)).toEqual([]);
+      expect(timeoutsOf(result)).toEqual([]);
+      const entries = entriesOf(result);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].provider).toBe(wantProvider);
+      expect(entries[0].builderFile).toBe(wantBuilderFile);
+      expect(entries[0].diffs[0].severity).toBe("critical");
+      expect(entries[0].diffs[0].id).toBe("ws-handshake:bad_setup");
+      expect(exitCodeOf(result)).toBe(2);
     },
   );
+
+  it("NEGATIVE CONTROL: an error-carrying timeout from an UNREGISTERED probe still quarantines", () => {
+    // An unknown WS surface must not be guessed at. A confident wrong owner routes
+    // remediation at the wrong file and fails OPEN, which is worse than the stop.
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some future WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [wsErrorTimeoutFrom("ws-something-new.drift.ts")],
+      }),
+    ]);
+    expect(entriesOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("NEGATIVE CONTROL: a registered probe with NO error body is a timeout, not drift", () => {
+    // Gate 3 still separates the lanes: silence from a known probe is exit 6, so
+    // widening attribution did not let the timeout lane be swallowed by the drift
+    // lane.
+    const silent =
+      "Error: waitUntil timeout after 30000ms. Collected 0 messages: [] bodies=[]\n" +
+      "    at Timeout._onTimeout (/repo/src/__tests__/drift/ws-providers.ts:319:23)\n" +
+      "    at /repo/src/__tests__/drift/ws-gemini-live.drift.ts:88:11";
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [silent],
+      }),
+    ]);
+    expect(entriesOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toEqual([]);
+    expect(timeoutsOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(6);
+  });
 
   it("a WS handshake failure WITH an error body is still critical drift, not a timeout", () => {
     // parseWSHandshakeFailure runs first and must keep its claim.

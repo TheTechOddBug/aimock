@@ -396,20 +396,50 @@ export function parseKnownModelsCanary(text: string): CanaryParseResult | null {
 // ---------------------------------------------------------------------------
 
 /**
- * A parsed OpenAI-Realtime WS handshake failure. The socket UPGRADED (101) and
- * the live API sent back an `error` event, but the expected session-lifecycle
- * event never arrived, so the probe's `waitUntil(...)` timed out. That shape is
- * a genuine, actionable protocol drift (e.g. a GA session-config field the
- * probe/mock stopped sending) — NOT a benign network flake (a flake times out
- * having collected ZERO messages and carries no `error` body).
+ * Which WS drift probe a failure came from, and therefore which surface owns it.
+ *
+ * The recognizer below used to test for a `ws-realtime.drift.ts` frame and then
+ * hardcode the `openai-realtime` surface, which made it useful for exactly one of
+ * the three WS surfaces this repo probes. A `gemini-live` handshake that the
+ * provider REJECTED with an error body — the surface most likely to hit this,
+ * since it is the one that actually goes quiet in production — resolved to no
+ * surface and fell through to the exit-5 quarantine, i.e. straight back into the
+ * hard human-triage stop this whole lane exists to avoid.
+ *
+ * Attribution is by the probe's own stack frame, and it is a CLOSED table on
+ * purpose. A frame that names no registered probe yields null and the failure
+ * stays quarantined — an unknown WS surface must not be guessed at, because a
+ * confident wrong owner routes remediation at the wrong file and fails OPEN.
+ */
+const WS_HANDSHAKE_PROBES: readonly {
+  /** The drift probe's filename as it appears in a stack frame. */
+  file: string;
+  /** The registered surface whose failures that probe reports. */
+  surface: keyof typeof SURFACE_REGISTRY;
+}[] = [
+  { file: "ws-realtime.drift.ts", surface: "openai-realtime" },
+  { file: "ws-gemini-live.drift.ts", surface: "gemini-live" },
+  { file: "ws-responses.drift.ts", surface: "openai-responses-ws" },
+];
+
+/**
+ * A parsed WS handshake failure. The socket UPGRADED (101) and the live API sent
+ * back an `error` event, but the expected session-lifecycle event never arrived,
+ * so the probe's `waitUntil(...)` timed out. That shape is a genuine, actionable
+ * protocol drift (e.g. a session-config field the probe/mock stopped sending) —
+ * NOT a benign network flake, and NOT the zero-observation timeout lane (a silent
+ * surface collects ZERO messages and carries no `error` body; see
+ * `parseLiveTimeout`, which this recognizer deliberately runs ahead of).
  *
  * Recognizing it here diverts it from the opaque exit-5 quarantine into a
  * parseable, attributed critical DriftEntry (exit 2), so the failing handshake
  * and its error payload are visible and route to a builder for remediation.
- * Narrowly gated (realtime probe origin + a surfaced `error` event body) so it
- * can never reclassify another provider's failure or a bare network timeout.
+ * Gated on a KNOWN probe origin plus a surfaced `error` event body, so it can
+ * neither reclassify an unrelated failure nor claim a bare network timeout.
  */
 export interface WSHandshakeFailure {
+  /** The registered surface slug the failure is attributed to. */
+  surface: keyof typeof SURFACE_REGISTRY;
   errorType: string;
   errorCode: string;
   errorMessage: string;
@@ -417,20 +447,22 @@ export interface WSHandshakeFailure {
 
 export function parseWSHandshakeFailure(text: string): WSHandshakeFailure | null {
   // Gate 1: the probe timed out waiting for a lifecycle event (handshake never
-  // completed). Gate 2: it is the OpenAI Realtime WS probe (its stack frame is
-  // always present on a real failure; the surfaced `error` body comes from
-  // ws-providers' openaiRealtimeWS). Gate 3: an `error` event body was surfaced
-  // — this is the "connect succeeded but handshake didn't complete WITH a
-  // protocol error" case. A pure network flake (zero messages, no error body)
-  // fails Gate 3 and stays in the quarantine lane for human review.
+  // completed). Gate 2: the failure came from a KNOWN WS drift probe, which also
+  // resolves WHICH surface owns it (its stack frame is always present on a real
+  // failure; the surfaced `error` body comes from the ws-providers helper).
+  // Gate 3: an `error` event body was surfaced — this is the "connect succeeded
+  // but handshake didn't complete WITH a protocol error" case. A pure network
+  // flake or a silent surface carries no error body, fails Gate 3, and is left to
+  // the timeout/quarantine lanes.
   if (!/waitUntil timeout/.test(text)) return null;
-  if (!/ws-realtime\.drift\.ts/.test(text)) return null;
+  const probe = WS_HANDSHAKE_PROBES.find((p) => text.includes(p.file));
+  if (probe === undefined) return null;
   if (!/"type"\s*:\s*"error"/.test(text)) return null;
 
   const errorType = text.match(/"error"\s*:\s*\{[^}]*?"type"\s*:\s*"([^"]+)"/)?.[1] ?? "unknown";
   const errorCode = text.match(/"code"\s*:\s*"([^"]+)"/)?.[1] ?? "unknown";
   const errorMessage = text.match(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/)?.[1] ?? "unknown";
-  return { errorType, errorCode, errorMessage };
+  return { surface: probe.surface, errorType, errorCode, errorMessage };
 }
 
 // ---------------------------------------------------------------------------
@@ -943,9 +975,13 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
         // timeout (no error body) still falls through to the quarantine lane.
         const wsFailure = parseWSHandshakeFailure(fullMessage);
         if (wsFailure !== null) {
-          const mapping = SURFACE_REGISTRY["openai-realtime"];
+          // Attribution follows the probe that reported the failure, resolved in
+          // parseWSHandshakeFailure. Hardcoding openai-realtime here is what made
+          // a rejected gemini-live handshake quarantine instead of routing to
+          // src/ws-gemini-live.ts.
+          const mapping = SURFACE_REGISTRY[wsFailure.surface];
           entries.push({
-            provider: "OpenAI Realtime",
+            provider: mapping.provider,
             scenario: "WS handshake",
             builderFile: mapping.builderFile,
             builderFunctions: mapping.builderFunctions,
@@ -955,12 +991,14 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
               {
                 severity: "critical" as const,
                 issue:
-                  "OpenAI Realtime WS handshake did not complete — the live API returned an " +
+                  `${mapping.provider} WS handshake did not complete — the live API returned an ` +
                   `error event (${wsFailure.errorType}/${wsFailure.errorCode}) and the expected ` +
-                  "session lifecycle event never arrived. The realtime session config sent by the " +
+                  "session lifecycle event never arrived. The session config sent by the " +
                   `probe/mock likely drifted from the live protocol. Error: ${wsFailure.errorMessage}`,
-                path: `session.${wsFailure.errorCode}`,
-                expected: "(handshake completes: session.created/updated received)",
+                // Display only — the delta key is the explicit `id` below, so this
+                // string is free to be provider-neutral without moving any key.
+                path: `handshake.${wsFailure.errorCode}`,
+                expected: "(handshake completes: the session lifecycle event is received)",
                 real: `error ${wsFailure.errorType}: ${wsFailure.errorMessage}`,
                 mock: "<no mock leg — live handshake probe>",
                 id: `ws-handshake:${wsFailure.errorCode}`,
