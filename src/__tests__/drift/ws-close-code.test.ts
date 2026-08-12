@@ -297,6 +297,27 @@ describe("GUARD: normal operation is unchanged", () => {
     expect(messages).toEqual([{ setupComplete: {} }]);
   });
 
+  it("prefers a buffered satisfying message over an already-recorded close", async () => {
+    // A provider that answers and immediately hangs up. Both frames are already
+    // buffered and no waiter existed when they landed, so the FIRST thing the
+    // next waitUntil does decides the verdict: the answer must win over the
+    // close, or a successful turn would be misreported as a refusal.
+    const messages = await withClient(
+      (socket) =>
+        setTimeout(() => {
+          socket.write(serverTextFrame(JSON.stringify({ setupComplete: {} })));
+          socket.write(serverCloseFrame(1000, "done"));
+        }, 10),
+      async (ws) => {
+        ws.send(JSON.stringify({ setup: {} }));
+        await new Promise((r) => setTimeout(r, 150));
+        return await ws.waitUntil(isSetupComplete, 2000);
+      },
+    );
+
+    expect(messages).toEqual([{ setupComplete: {} }]);
+  });
+
   it("a clean close after a satisfied predicate raises nothing", async () => {
     const unhandled: unknown[] = [];
     const onUnhandled = (e: unknown) => unhandled.push(e);
