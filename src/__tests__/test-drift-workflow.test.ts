@@ -412,7 +412,11 @@ const observeCollectorLeg = (
   job: string,
   reportPath: string,
   collectorExit: number,
-  timeouts: { testName: string; timeoutMs: number }[] = [],
+  timeouts: {
+    testName: string;
+    timeoutMs?: number;
+    serverClose?: { code: number; reason: string };
+  }[] = [],
 ): LegRun => {
   const dir = mkdtempSync(join(tmpdir(), "test-drift-leg-"));
   try {
@@ -642,7 +646,11 @@ describe("test-drift.yml — a surface that stopped being graded reaches a human
  * and while main's own scheduled run is failing there is no such report — which is
  * exactly why every PR ends up running a fresh live base and meeting this routing.
  */
-const observeBaseLeg = (collectorExit: number, timeoutTestName?: string): LegRun => {
+const observeBaseLeg = (
+  collectorExit: number,
+  timeoutTestName?: string,
+  serverClose?: { code: number; reason: string },
+): LegRun => {
   const parent = mkdtempSync(join(tmpdir(), "test-drift-base-"));
   try {
     const ws = join(parent, "workspace");
@@ -652,10 +660,15 @@ const observeBaseLeg = (collectorExit: number, timeoutTestName?: string): LegRun
     const report = JSON.stringify({
       timestamp: "2026-08-12T06:42:00.000Z",
       entries: [],
-      ...(timeoutTestName
+      ...(timeoutTestName || serverClose
         ? {
             timeouts: [
-              { testName: timeoutTestName, timeoutMs: 30000, rawLocation: "", message: "" },
+              {
+                testName: timeoutTestName ?? "Gemini Live WS drift > WS text event sequence",
+                rawLocation: "",
+                message: "",
+                ...(serverClose ? { serverClose } : { timeoutMs: 30000 }),
+              },
             ],
           }
         : {}),
@@ -733,5 +746,58 @@ describe("test-drift.yml — the base leg that blocked every drift PR", () => {
   it("EXECUTED POSITIVE CONTROL: base exits 0 and 2 stay non-fatal", () => {
     expect(observeBaseLeg(0).stepExit).toBe(0);
     expect(observeBaseLeg(2).stepExit).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A hang-up and a silence are both exit 6, so the ANNOTATION is the only place a
+// reader can tell them apart. `fix/ws-preserve-close-code` makes a server close
+// report its code, and a run that says "no messages in nullms" would be worse
+// than the silence it replaced — so the rendering is executed, not read.
+// ---------------------------------------------------------------------------
+
+describe("test-drift.yml — a hang-up is annotated as a close, not as a timeout", () => {
+  it("EXECUTED: a serverClose entry names the close code, and never renders null", () => {
+    const run = observeCollectorLeg(HEAD_STEP, "drift-live-pr", "drift-report-head.json", 6, [
+      {
+        testName: "Gemini Live WS drift > WS text event sequence and shapes match",
+        serverClose: { code: 1011, reason: "internal error" },
+      },
+    ]);
+    expect(run.stepExit, `head leg failed on a hang-up:\n${run.stdio}`).toBe(0);
+    expect(run.stdio).toContain("session closed by the server (code 1011)");
+    // The failure mode of a naive template: `\(.timeoutMs)` on an absent field.
+    expect(run.stdio).not.toContain("nullms");
+    expect(run.stdio).not.toContain("no messages in null");
+  });
+
+  it("EXECUTED: a silence entry still renders its wait budget", () => {
+    // The other branch of the same template must not regress.
+    const run = observeCollectorLeg(HEAD_STEP, "drift-live-pr", "drift-report-head.json", 6, [
+      { testName: "Gemini Live WS drift > WS tool call event sequence matches", timeoutMs: 30000 },
+    ]);
+    expect(run.stepExit).toBe(0);
+    expect(run.stdio).toContain("no messages in 30000ms");
+    expect(run.stdio).not.toContain("session closed by the server");
+  });
+
+  it("EXECUTED: the daily job renders a hang-up the same way", () => {
+    const run = observeCollectorLeg(SCHEDULED_STEP, DRIFT_JOB, "drift-report.json", 6, [
+      {
+        testName: "Gemini Live WS drift > WS text event sequence and shapes match",
+        serverClose: { code: 1012, reason: "restarting" },
+      },
+    ]);
+    expect(run.stepExit).toBe(0);
+    expect(run.stdio).toContain("session closed by the server (code 1012)");
+    expect(run.stdio).not.toContain("nullms");
+    expect(run.output).toContain("exit_code=6");
+  });
+
+  it("EXECUTED: the base leg renders a hang-up the same way", () => {
+    const run = observeBaseLeg(6, undefined, { code: 1011, reason: "internal error" });
+    expect(run.stepExit, `base leg failed on a hang-up:\n${run.stdio}`).toBe(0);
+    expect(run.stdio).toContain("session closed by the server (code 1011)");
+    expect(run.stdio).not.toContain("nullms");
   });
 });

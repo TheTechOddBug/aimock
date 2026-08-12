@@ -549,9 +549,13 @@ export function parseWSServerClose(text: string): WSServerClose | null {
   if (!match) return null;
   let reason: string;
   try {
-    const decoded: unknown = JSON.parse(match[2]);
-    if (typeof decoded !== "string") return null;
-    reason = decoded;
+    // The pattern captures a COMPLETE JSON string literal — the surrounding
+    // quotes are part of the match — so a successful parse always yields a
+    // string. `String()` is an identity here; it types the result without a cast
+    // and without an unreachable `typeof` branch. (A branch for "parsed to a
+    // non-string" was here and could not be made to fail under mutation, which
+    // is the definition of coverage that does not exist, so it is gone.)
+    reason = String(JSON.parse(match[2]));
   } catch {
     // A reason we cannot decode is not a reason. Returning null leaves the
     // failure to the quarantine lane rather than reporting a mangled cause —
