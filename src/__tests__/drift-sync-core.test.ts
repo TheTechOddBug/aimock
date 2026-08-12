@@ -632,7 +632,9 @@ describe("runDriftSyncCore", () => {
     expect(runSyncCheck).toHaveBeenCalledTimes(1);
     expect(runSyncCheck).toHaveBeenCalledWith({
       skipRecollect: true,
-      skipRecollectReason: expect.stringContaining("no live drift surface reads deprecatedFamilies"),
+      skipRecollectReason: expect.stringContaining(
+        "no live drift surface reads deprecatedFamilies",
+      ),
     });
   });
 

@@ -291,12 +291,12 @@ describe("the 2026-08-11/12 changeset key 74f6efa43753f7d0", () => {
     // The premise of the whole investigation: the key does not distinguish them.
     expect(day1.changesetKey).toBe(day2.changesetKey);
     expect(day1.changesetKey).not.toBe("");
-    expect(day1.outcome.outcomes.map((o) => `${o.action}:${o.provider}/${o.family}`).sort()).toEqual(
-      [
-        "deprecation-recorded:gemini/gemini-2.0-flash",
-        "deprecation-recorded:gemini/gemini-2.0-flash-lite",
-      ],
-    );
+    expect(
+      day1.outcome.outcomes.map((o) => `${o.action}:${o.provider}/${o.family}`).sort(),
+    ).toEqual([
+      "deprecation-recorded:gemini/gemini-2.0-flash",
+      "deprecation-recorded:gemini/gemini-2.0-flash-lite",
+    ]);
   });
 
   it("the mechanical edit is CORRECT on both mornings (+2 recorded, nothing else touched)", () => {
@@ -472,7 +472,10 @@ describe("negative controls — the gate still refuses a wrong edit", () => {
     const verdict = evaluateSyncCheck(
       {
         getChangedFiles: () => [MODEL_REGISTRY_REL_PATH],
-        runPinCheck: () => ({ ok: false, output: "FAIL logic-pin.test.ts > freezes PREVIEW_FAMILY" }),
+        runPinCheck: () => ({
+          ok: false,
+          output: "FAIL logic-pin.test.ts > freezes PREVIEW_FAMILY",
+        }),
         recollect: () => {
           throw new Error("gate-2 must refuse before any re-collect");
         },

@@ -344,12 +344,21 @@ export function evaluateSyncCheck(
   // gate-3 (live re-collect) is skipped when it cannot observe THIS run's edit —
   // see EvaluateSyncCheckOptions.skipRecollect.
   if (opts.skipRecollect) {
+    // A skip with no stated reason reads in the log exactly like a gate that ran
+    // and passed, so it is a CONFIG ERROR rather than a silent default: the
+    // caller that turns gate-3 off must say what it could not observe.
+    if (!opts.skipRecollectReason) {
+      throw new SyncCheckConfigError(
+        "skipRecollect was set with no skipRecollectReason — a gate that is turned off " +
+          "must record why, or its verdict is indistinguishable from a gate that ran",
+      );
+    }
     return {
       ok: true,
       reason: SyncCheckReason.OK,
       detail:
         "drift-sync-check passed: changed files are data-only, classification pins intact " +
-        `(live re-collect NOT RUN — ${opts.skipRecollectReason ?? "no reason recorded"}; ` +
+        `(live re-collect NOT RUN — ${opts.skipRecollectReason}; ` +
         "this edit is carried by gate-1 + gate-2, not by a re-collect)",
       offendingFiles: [],
     };

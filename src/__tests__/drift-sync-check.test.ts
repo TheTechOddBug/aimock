@@ -318,11 +318,22 @@ describe("evaluateSyncCheck — RED/GREEN value-test surface", () => {
     expect(verdict.detail).not.toContain("clean re-collect");
   });
 
+  it("turning gate-3 OFF with no stated reason is a CONFIG ERROR, not a silent pass", () => {
+    expect(() => evaluateSyncCheck(deps({}), { skipRecollect: true })).toThrow(
+      SyncCheckConfigError,
+    );
+  });
+
   it("an UNTRUSTWORTHY zero passes but is reported UNCONFIRMED, never as a clean re-collect", () => {
     const quarantined = report([0]);
     quarantined.conclusion = "quarantine";
     quarantined.quarantine = [
-      { provider: "unknown", testName: "Gemini Live WS drift", rawLocation: "", message: "timeout" },
+      {
+        provider: "unknown",
+        testName: "Gemini Live WS drift",
+        rawLocation: "",
+        message: "timeout",
+      },
     ];
     const verdict = evaluateSyncCheck(deps({ recollect: () => quarantined }));
     expect(verdict.ok).toBe(true);
