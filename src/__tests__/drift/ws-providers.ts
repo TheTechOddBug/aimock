@@ -431,10 +431,25 @@ export function connectTLSWebSocket(
                     );
                     return;
                   }
-                  // Scan all new messages since last check. Deliberately BEFORE
-                  // the close check: if a terminal message and the CLOSE frame
-                  // arrive together, the predicate still wins and this resolves
-                  // exactly as it did before.
+                  // Scan all new messages since last check.
+                  //
+                  // The ORDER of this block relative to the close check below is
+                  // inert here, not protective: the resolver wake sits inside the
+                  // per-frame parse loop and fires on each TEXT frame, so an
+                  // answer arriving in the same segment as a CLOSE has already
+                  // settled this promise before the CLOSE frame is parsed. No
+                  // reachable state in this function has BOTH an unscanned
+                  // satisfying message and `closeInfo` set, so swapping the two
+                  // blocks changes nothing observable — do not read this ordering
+                  // as a guard. It is kept only to match the pre-check above,
+                  // which is where the ordering IS load-bearing (a buffered
+                  // answer plus an already-recorded close) and is covered by the
+                  // "prefers a buffered satisfying message over an
+                  // already-recorded close" test.
+                  //
+                  // The close check itself is NOT dead: a server that sends only
+                  // a CLOSE frame leaves this scan empty, and deleting that
+                  // branch reds the refusal regression test.
                   if (scanFromCursor()) {
                     settled = true;
                     clearTimeout(timer);
