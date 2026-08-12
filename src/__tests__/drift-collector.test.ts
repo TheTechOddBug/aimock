@@ -1370,13 +1370,77 @@ describe("a provider that closes the session states its own cause", () => {
     expect(exitCodeOf(result)).toBe(5);
   });
 
-  it("NEGATIVE CONTROL: an undecodable reason is not a diagnosis → quarantine", () => {
-    // A reason we cannot decode must never become a confident cause.
+  // An undecodable reason must never become a confident cause. Three inputs,
+  // because they fail at DIFFERENT points and an earlier one masks the later:
+  // an unquoted reason never matches the pattern at all, whereas an invalid JSON
+  // escape and a raw control character DO match it and then throw in the decoder.
+  // Testing only the unquoted form left the decoder's failure path unexercised —
+  // a mutation that swallowed the decode error and reported `reason: ""` survived
+  // until these two were added.
+  it.each([
+    ["an unquoted reason (never matches the pattern)", "not-quoted"],
+    ["an invalid JSON escape (matches, then throws)", '"bad \\q escape"'],
+    ["a raw newline inside the quotes (matches, then throws)", '"line1\nline2"'],
+  ])("NEGATIVE CONTROL: %s is not a diagnosis → quarantine", (_label, rawReason) => {
     const broken =
-      "WSClosedError: WebSocket closed by server during waitUntil: code=1008 reason=not-quoted. " +
+      `WSClosedError: WebSocket closed by server during waitUntil: code=1008 reason=${rawReason}. ` +
       "Collected 0 messages: []\n    at /repo/src/__tests__/drift/ws-gemini-live.drift.ts:88:11";
     expect(parseWSServerClose(broken)).toBeNull();
+    // Not drift, not the exit-6 lane — an unreadable cause is unreadable output.
+    expect(entriesOf(resultFor(broken))).toEqual([]);
+    expect(timeoutsOf(resultFor(broken))).toEqual([]);
     expect(exitCodeOf(resultFor(broken))).toBe(5);
+  });
+
+  // The second classification pass re-scans every failed assertion, and it only
+  // runs when there is at least one unparseable failure AND no entries. So a
+  // recognized close is only at risk of being counted TWICE in a run that ALSO
+  // contains garbage — which is exactly the mixed run below. Without the skip in
+  // that pass, the hang-up is quarantined on top of being recorded, and the run
+  // reports two failures needing triage when only one does.
+  it("a hang-up alongside garbage is recorded ONCE, not also quarantined", () => {
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some unmapped suite"],
+        title: "something broke",
+        failureMessages: ["AssertionError: expected 'x' to be one of\n    at /repo/src/a.ts:1:1"],
+      }),
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [wsServerClose(1011, "internal error")],
+      }),
+    ]);
+    // Exactly the garbage is quarantined; the hang-up stays in its own lane.
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(quarantineOf(result)[0].testName).toContain("something broke");
+    expect(timeoutsOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("an unattributable refusal alongside garbage is quarantined ONCE", () => {
+    const unowned = wsServerClose(1008, "nope").replace(
+      "ws-gemini-live.drift.ts",
+      "ws-something-new.drift.ts",
+    );
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some unmapped suite"],
+        title: "something broke",
+        failureMessages: ["AssertionError: expected 'x' to be one of\n    at /repo/src/a.ts:1:1"],
+      }),
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some future WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [unowned],
+      }),
+    ]);
+    expect(quarantineOf(result)).toHaveLength(2);
+    expect(quarantineOf(result).filter((q) => q.message.includes("REFUSED"))).toHaveLength(1);
   });
 
   it("a refusal that also carried messages is still a refusal", () => {
