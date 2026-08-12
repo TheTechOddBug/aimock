@@ -3,6 +3,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createServer as createHttpServer, type Server } from "node:http";
 import {
   existsSync,
+  statSync,
   mkdtempSync,
   writeFileSync,
   readFileSync,
@@ -17,7 +18,26 @@ import { AddressInfo } from "node:net";
 import { createHash } from "node:crypto";
 
 const CLI_PATH = resolve(__dirname, "../../dist/cli.js");
+const CLI_SOURCE = resolve(__dirname, "../cli.ts");
 const CLI_AVAILABLE = existsSync(CLI_PATH);
+
+/**
+ * These tests exercise the BUILT CLI, and `pnpm test` does not build. A dist older than
+ * the source is a different program: a test of behaviour that only exists in the source
+ * then reports the very bug it was written to detect, and the report is about the build,
+ * not the code. Say so instead, for any test whose verdict depends on that distinction.
+ */
+function assertBuiltCliIsCurrent(): void {
+  const builtAt = statSync(CLI_PATH).mtimeMs;
+  const editedAt = statSync(CLI_SOURCE).mtimeMs;
+  if (builtAt < editedAt) {
+    throw new Error(
+      `dist/cli.js was built before src/cli.ts was last edited — run \`pnpm build\`. ` +
+        `This test exercises the built artifact, so its result would describe the stale ` +
+        `build rather than the current source.`,
+    );
+  }
+}
 
 // CLI integration tests use child processes and file watchers. Give healthy
 // children time to be scheduled while the full parallel suite is busy.
@@ -223,16 +243,25 @@ describe.skipIf(!CLI_AVAILABLE)("CLI: fixture loading", () => {
    *
    * SIGSTOP pins the child at exactly the instant it announced readiness, which is the
    * same state a preempted process is in on a loaded CI runner — it makes the window
-   * observable instead of leaving it to a race.  Repeat a few times because the failure
-   * mode is probabilistic in the RED direction; once the listener is registered before
-   * the announcement it cannot fail at all.
+   * observable instead of leaving it to a race.  With the listener registered after the
+   * announcement, one attempt catches the bug a little under half the time when measured
+   * from inside the running suite (10 of 23 attempts over ten runs), so twelve attempts
+   * miss it about once in a thousand runs; with the listener registered first, no attempt
+   * can fail, because the write of the line polled for below happens after the
+   * registration and stdout is synchronous.
+   *
+   * Scope: from the announcement onward, which is the only moment a supervisor can act
+   * on.  A SIGTERM delivered BEFORE readiness — while the server is still binding — is
+   * still fatal (code null / signal SIGTERM, no "Shutting down..."), and nothing here
+   * claims otherwise.
    */
   it.skipIf(process.platform === "win32")(
-    "handles a SIGTERM delivered the instant readiness is announced",
+    "handles a SIGTERM delivered at or after the instant readiness is announced",
     async () => {
+      assertBuiltCliIsCurrent();
       const fixturePath = writeFixture(tmpDir, "test.json");
 
-      for (let attempt = 0; attempt < 3; attempt++) {
+      for (let attempt = 0; attempt < 12; attempt++) {
         const outFile = join(tmpDir, `announce-${attempt}.log`);
         writeFileSync(outFile, "");
         const fd = openSync(outFile, "a");
