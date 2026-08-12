@@ -621,10 +621,19 @@ describe("runDriftSyncCore", () => {
     // optional cleanup is safe — it no longer selects a different route.
     expect(registry.text).toContain("no remaining aimock reference");
 
-    // A real registry edit was made, so the real gate DOES run — and with the
-    // live re-collect ON, because this run deferred nothing to a human.
+    // A real registry edit was made, so the real gate DOES run — gate-1
+    // (allowlist) and gate-2 (pin), with gate-3's live re-collect OFF and the
+    // reason recorded. A recorded deprecation is invisible to every live drift
+    // surface (nothing in the collector's `*.drift.ts` glob reads
+    // `deprecatedFamilies`), so a re-collect can only veto this edit on
+    // unrelated drift — which is how the identical changeset 74f6efa43753f7d0
+    // was refused on 2026-08-11 and applied on 2026-08-12. See
+    // `gate3SkipReason` and drift-sync-gate-determinism.test.ts.
     expect(runSyncCheck).toHaveBeenCalledTimes(1);
-    expect(runSyncCheck).toHaveBeenCalledWith({ skipRecollect: false });
+    expect(runSyncCheck).toHaveBeenCalledWith({
+      skipRecollect: true,
+      skipRecollectReason: expect.stringContaining("no live drift surface reads deprecatedFamilies"),
+    });
   });
 
   it("RED->GREEN (deprecation, STILL-REFERENCED): also recorded, and the mock is NOT removed", () => {
@@ -924,9 +933,13 @@ describe("D-M1: recollect gate vs route-to-human invariant", () => {
     );
     expect(revertFiles).not.toHaveBeenCalled();
     // The gate ran (a registry edit WAS applied) but with the live re-collect
-    // skipped, because a family was simultaneously deferred to a human.
+    // skipped, because a family was simultaneously deferred to a human — and the
+    // verdict records that as the reason, not just the fact of the skip.
     expect(runSyncCheck).toHaveBeenCalledTimes(1);
-    expect(runSyncCheck).toHaveBeenCalledWith({ skipRecollect: true });
+    expect(runSyncCheck).toHaveBeenCalledWith({
+      skipRecollect: true,
+      skipRecollectReason: expect.stringContaining("deferred a family to a human"),
+    });
     // The registry edit was persisted (writeRegistrySource ran with the addition).
     expect(registry.text).toContain('"gpt-live"');
   });

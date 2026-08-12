@@ -15,6 +15,9 @@ import {
   isAllowedSyncFile,
   checkChangedFileAllowlist,
   countCriticalDiffs,
+  listCriticalDiffs,
+  formatCriticalDiffs,
+  reportTrustNote,
   evaluateSyncCheck,
   runPinCheck,
   recollect,
@@ -149,6 +152,66 @@ describe("countCriticalDiffs", () => {
   });
 });
 
+describe("listCriticalDiffs / formatCriticalDiffs", () => {
+  it("IDENTIFIES each critical diff, not just a count", () => {
+    const refs = listCriticalDiffs(report([0, 2]));
+    expect(refs).toEqual([
+      { provider: "provider-1", scenario: "scenario", path: "field-0" },
+      { provider: "provider-1", scenario: "scenario", path: "field-1" },
+    ]);
+  });
+
+  it("prefers a stable `id` over the prose-coupled `path` when one exists", () => {
+    const r = report([1]);
+    r.entries[0].diffs[0].id = "openai-realtime:no-ga-family";
+    expect(formatCriticalDiffs(listCriticalDiffs(r))).toBe(
+      "provider-0/scenario: openai-realtime:no-ga-family",
+    );
+  });
+
+  it("ignores non-critical diffs", () => {
+    const r = report([1]);
+    r.entries[0].diffs[0].severity = "warning";
+    expect(listCriticalDiffs(r)).toEqual([]);
+  });
+});
+
+describe("reportTrustNote — a zero that cannot be believed is not a clean re-collect", () => {
+  function withConclusion(conclusion: string | undefined, quarantine?: number): DriftReport {
+    const r = report([0]);
+    if (conclusion !== undefined) r.conclusion = conclusion;
+    if (quarantine !== undefined) {
+      r.quarantine = Array.from({ length: quarantine }, (_, i) => ({
+        provider: "unknown",
+        testName: `t-${i}`,
+        rawLocation: "",
+        message: "waitUntil timeout after 30000ms",
+      }));
+    }
+    return r;
+  }
+
+  it("trusts a positively-clean report", () => {
+    expect(reportTrustNote(withConclusion("clean"))).toBeNull();
+  });
+
+  it("trusts a report whose criticals ARE the determination", () => {
+    expect(reportTrustNote(withConclusion("critical"))).toBeNull();
+  });
+
+  it("does NOT trust a quarantined report (the 74f6efa43753f7d0 mornings' shape)", () => {
+    expect(reportTrustNote(withConclusion("quarantine", 2))).toContain("quarantined 2 failure(s)");
+  });
+
+  it("does NOT trust a report whose AG-UI leg could not run (entries are incomplete)", () => {
+    expect(reportTrustNote(withConclusion("skipped"))).toContain("AG-UI");
+  });
+
+  it("does NOT trust a report with no `conclusion` at all (UNKNOWN never passes as clean)", () => {
+    expect(reportTrustNote(withConclusion(undefined))).toContain("no `conclusion`");
+  });
+});
+
 describe("recollect", () => {
   it("fails closed (SyncCheckConfigError) when the collector produced no report file", () => {
     const runner = vi.fn((): CommandResult => ({ status: 0, output: "" }));
@@ -231,6 +294,49 @@ describe("evaluateSyncCheck — RED/GREEN value-test surface", () => {
     expect(verdict.ok).toBe(false);
     expect(verdict.reason).toBe(SyncCheckReason.RESIDUAL_CRITICAL_DRIFT);
     expect(verdict.detail).toContain("1 critical");
+  });
+
+  it("a refusal NAMES the residual diffs, so the log alone is triageable", () => {
+    const r = report([1]);
+    r.entries[0].diffs[0].id = "openai-realtime:no-ga-family";
+    const verdict = evaluateSyncCheck(deps({ recollect: () => r }));
+    expect(verdict.reason).toBe(SyncCheckReason.RESIDUAL_CRITICAL_DRIFT);
+    expect(verdict.detail).toContain("provider-0/scenario: openai-realtime:no-ga-family");
+  });
+
+  it("a SKIPPED gate-3 says in the verdict what it could not observe", () => {
+    const recollectFn = vi.fn(() => report([0]));
+    const verdict = evaluateSyncCheck(deps({ recollect: recollectFn }), {
+      skipRecollect: true,
+      skipRecollectReason: "no live drift surface reads deprecatedFamilies",
+    });
+    expect(verdict.ok).toBe(true);
+    expect(recollectFn).not.toHaveBeenCalled();
+    expect(verdict.detail).toContain("live re-collect NOT RUN");
+    expect(verdict.detail).toContain("no live drift surface reads deprecatedFamilies");
+    // …and never claims the thing it did not do.
+    expect(verdict.detail).not.toContain("clean re-collect");
+  });
+
+  it("an UNTRUSTWORTHY zero passes but is reported UNCONFIRMED, never as a clean re-collect", () => {
+    const quarantined = report([0]);
+    quarantined.conclusion = "quarantine";
+    quarantined.quarantine = [
+      { provider: "unknown", testName: "Gemini Live WS drift", rawLocation: "", message: "timeout" },
+    ];
+    const verdict = evaluateSyncCheck(deps({ recollect: () => quarantined }));
+    expect(verdict.ok).toBe(true);
+    expect(verdict.reason).toBe(SyncCheckReason.OK);
+    expect(verdict.detail).toContain("could NOT CONFIRM");
+    expect(verdict.detail).not.toContain("clean re-collect");
+  });
+
+  it("a positively-clean re-collect DOES claim a clean re-collect", () => {
+    const clean = report([0]);
+    clean.conclusion = "clean";
+    const verdict = evaluateSyncCheck(deps({ recollect: () => clean }));
+    expect(verdict.ok).toBe(true);
+    expect(verdict.detail).toContain("clean re-collect");
   });
 });
 
