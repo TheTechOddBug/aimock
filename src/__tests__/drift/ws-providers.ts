@@ -206,13 +206,36 @@ function buildMaskedPongFrame(pingPayload: Buffer): Buffer {
 // TLS WebSocket client (RFC 6455 over TLS)
 // ---------------------------------------------------------------------------
 
+/**
+ * Transport-level overrides for {@link connectTLSWebSocket}.
+ *
+ * Exists purely so a test can point this REAL client path at a local
+ * self-signed TLS server instead of a live provider. The live drift legs pass
+ * nothing and therefore keep the previous behaviour exactly: port 443 and the
+ * default system trust store.
+ */
+export interface TLSWSConnectOptions {
+  /** TLS port. Defaults to 443 — the only value the live legs use. */
+  port?: number;
+  /** Extra trust anchors, so a local self-signed server can be verified. */
+  ca?: string | Buffer | Array<string | Buffer>;
+}
+
 export function connectTLSWebSocket(
   host: string,
   path: string,
   headers?: Record<string, string>,
+  options?: TLSWSConnectOptions,
 ): Promise<TLSWSClient> {
   return new Promise((resolve, reject) => {
-    const socket = tls.connect({ host, port: 443, servername: host }, () => {
+    const connectOptions: tls.ConnectionOptions = {
+      host,
+      port: options?.port ?? 443,
+      servername: host,
+    };
+    if (options?.ca) connectOptions.ca = options.ca;
+
+    const socket = tls.connect(connectOptions, () => {
       const key = randomBytes(16).toString("base64");
       const extraHeaders = headers
         ? Object.entries(headers)
