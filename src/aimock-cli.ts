@@ -106,7 +106,6 @@ export function runAimockCli(deps: AimockCliDeps = {}): void {
 
   async function main() {
     const { llmock, url } = await startFromConfigFn(config!, { port, host });
-    log(`aimock server listening on ${url}`);
 
     function shutdown() {
       log("Shutting down...");
@@ -120,8 +119,12 @@ export function runAimockCli(deps: AimockCliDeps = {}): void {
         },
       );
     }
+    // Register BEFORE announcing readiness — see the note in src/cli.ts. A supervisor
+    // that reacts to the readiness line must never win a race against this listener.
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
+
+    log(`aimock server listening on ${url}`);
 
     if (deps.onReady) {
       deps.onReady({ shutdown });

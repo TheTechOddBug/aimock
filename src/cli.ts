@@ -463,11 +463,30 @@ async function main() {
     mounts,
   );
 
+  // Only the first local source is watched — remote URL sources are fetched once
+  // at boot and are not monitored. Declared before the readiness announcement so
+  // shutdown can close it whenever the signal arrives.
+  let watcher: { close: () => void } | null = null;
+
+  function shutdown() {
+    logger.info("Shutting down...");
+    if (watcher) watcher.close();
+    instance.server.close(() => {
+      process.exit(0);
+    });
+  }
+
+  // Register BEFORE announcing readiness. Writes to a pipe are synchronous on Linux
+  // (and to a file on every POSIX platform), so a supervisor that reacts to the line
+  // below can deliver SIGTERM while this process is still mid-statement. Announcing
+  // first left a window in which SIGTERM hit Node's default disposition, which
+  // re-raises: the process died with a null exit code instead of shutting down.
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
   logger.info(`aimock server listening on ${instance.url}`);
 
-  // Start file watcher if requested. Only the first local source is watched —
-  // remote URL sources are fetched once at boot and are not monitored.
-  let watcher: { close: () => void } | null = null;
+  // Start file watcher if requested.
   if (watchMode) {
     const primary = sources[0];
     if (!primary) {
@@ -482,17 +501,6 @@ async function main() {
       logger.info(`Watching ${primary.path} for changes`);
     }
   }
-
-  function shutdown() {
-    logger.info("Shutting down...");
-    if (watcher) watcher.close();
-    instance.server.close(() => {
-      process.exit(0);
-    });
-  }
-
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
 }
 
 main().catch((err) => {
