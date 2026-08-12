@@ -371,3 +371,260 @@ describe("test-drift.yml — the drift job unpacks no bytes it has not pinned", 
     ]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// A silent live surface must not read as a broken collector.
+//
+// The failure this guards (CopilotKit/aimock run 31571018005, PR #370): the
+// Gemini Live WS legs observed nothing for 30s, the collector called that
+// "unparseable output" and exited 5, and exit 5 hard-fails the base leg — so
+// every bot-opened drift PR was blocked behind a manual-triage stop for a
+// condition no human could triage in this repo.
+//
+// The collector side is fixed in scripts/drift-report-collector.ts (exit 6). What
+// is asserted HERE is the half that decides whether a PR merges: the workflow's
+// own routing of that exit code. Each case EXECUTES the step's real `run:` body
+// with the collector stubbed to a chosen exit code, so the answer is the step's
+// observed exit status, not a reading of its YAML.
+//
+// Both directions are pinned. Exit 6 must not fail a leg (the fix), and exit 5
+// must STILL fail it (the thing the fix must not trade away) — a routing that
+// tolerates everything would turn the loud stop into a silent pass, which is the
+// worse defect.
+// ---------------------------------------------------------------------------
+
+interface LegRun {
+  stepExit: number;
+  stdio: string;
+  /** Whatever the step appended to GITHUB_OUTPUT. */
+  output: string;
+}
+
+/**
+ * EXECUTE one collector-running step's `run:` body with the collector stubbed.
+ *
+ * Only `npx` is stubbed: it writes the report the step's own `jq` then reads and
+ * exits with `collectorExit`. Every branch, comparison and exit in between is the
+ * workflow's code run as written.
+ */
+const observeCollectorLeg = (
+  stepName: string,
+  job: string,
+  reportPath: string,
+  collectorExit: number,
+  timeouts: { testName: string; timeoutMs: number }[] = [],
+): LegRun => {
+  const dir = mkdtempSync(join(tmpdir(), "test-drift-leg-"));
+  try {
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const report = JSON.stringify({
+      timestamp: "2026-08-12T06:42:00.000Z",
+      entries: [],
+      ...(timeouts.length > 0
+        ? { timeouts: timeouts.map((t) => ({ ...t, rawLocation: "", message: "" })) }
+        : {}),
+    });
+    writeFileSync(
+      join(bin, "npx"),
+      [
+        "#!/bin/sh",
+        `cat > ${JSON.stringify(join(dir, reportPath))} <<'REPORT'`,
+        report,
+        "REPORT",
+        `exit ${collectorExit}`,
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const step = stepByName(stepName, job);
+    const script = join(dir, "step.sh");
+    writeFileSync(script, step.run);
+    const outFile = join(dir, "gh-output");
+    writeFileSync(outFile, "");
+    const res = spawnSync("/bin/bash", [script], {
+      cwd: dir,
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        GITHUB_WORKSPACE: dir,
+        GITHUB_OUTPUT: outFile,
+        LIVE_LEGS_RAN: "true",
+      },
+    });
+    return {
+      stepExit: res.status ?? -1,
+      stdio: `${res.stdout ?? ""}${res.stderr ?? ""}`,
+      output: readFileSync(outFile, "utf-8"),
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+};
+
+const HEAD_STEP = "Head drift report — run live on PR ref";
+const SCHEDULED_STEP = "Run drift tests";
+
+describe("test-drift.yml — a silent live surface does not block a PR, and is still said out loud", () => {
+  it("EXECUTED: collector exit 6 does NOT fail the head leg", () => {
+    const run = observeCollectorLeg(HEAD_STEP, "drift-live-pr", "drift-report-head.json", 6, [
+      {
+        testName: "Gemini Live WS drift > WS text event sequence and shapes match",
+        timeoutMs: 30000,
+      },
+    ]);
+    expect(run.stepExit, `head leg failed on exit 6:\n${run.stdio}`).toBe(0);
+  });
+
+  it("EXECUTED: exit 6 names the surface that went silent, as a warning", () => {
+    const run = observeCollectorLeg(HEAD_STEP, "drift-live-pr", "drift-report-head.json", 6, [
+      { testName: "Gemini Live WS drift > WS tool call event sequence matches", timeoutMs: 30000 },
+    ]);
+    // Non-blocking is only acceptable if it is also not silent: the reader must
+    // learn WHICH surface stopped being graded, without opening the artifact.
+    expect(run.stdio).toContain("::warning title=live-timeout (head)::");
+    expect(run.stdio).toContain("Gemini Live WS drift > WS tool call event sequence matches");
+    expect(run.stdio).toContain("30000ms");
+  });
+
+  it("EXECUTED NEGATIVE CONTROL: exit 5 STILL fails the head leg with the triage error", () => {
+    const run = observeCollectorLeg(HEAD_STEP, "drift-live-pr", "drift-report-head.json", 5);
+    expect(run.stepExit).toBe(5);
+    expect(run.stdio).toContain("quarantined unparseable output");
+  });
+
+  it("EXECUTED NEGATIVE CONTROL: an unrecognized collector exit STILL fails the head leg", () => {
+    const run = observeCollectorLeg(HEAD_STEP, "drift-live-pr", "drift-report-head.json", 1);
+    expect(run.stepExit).toBe(1);
+    expect(run.stdio).toContain("Head collector faulted");
+  });
+
+  it("EXECUTED POSITIVE CONTROL: exits 0 and 2 remain non-fatal (the routing is not 'always pass')", () => {
+    expect(
+      observeCollectorLeg(HEAD_STEP, "drift-live-pr", "drift-report-head.json", 0).stepExit,
+    ).toBe(0);
+    expect(
+      observeCollectorLeg(HEAD_STEP, "drift-live-pr", "drift-report-head.json", 2).stepExit,
+    ).toBe(0);
+  });
+
+  it("EXECUTED: the daily job survives exit 6, records it, and warns", () => {
+    const run = observeCollectorLeg(SCHEDULED_STEP, DRIFT_JOB, "drift-report.json", 6, [
+      {
+        testName: "Gemini Live WS drift > WS text event sequence and shapes match",
+        timeoutMs: 30000,
+      },
+    ]);
+    expect(run.stepExit, `daily drift step failed on exit 6:\n${run.stdio}`).toBe(0);
+    expect(run.stdio).toContain("::warning title=live-timeout::");
+    // The exit code has to reach `notify` as job-output DATA, or the Slack branch
+    // that makes this loud can never fire.
+    expect(run.output).toContain("exit_code=6");
+  });
+
+  it("EXECUTED NEGATIVE CONTROL: the daily job still fails on exit 5", () => {
+    const run = observeCollectorLeg(SCHEDULED_STEP, DRIFT_JOB, "drift-report.json", 5);
+    expect(run.stepExit).toBe(5);
+    expect(run.stdio).toContain("manual triage required");
+  });
+});
+
+/**
+ * EXECUTE the `Notify Slack` step with `curl` stubbed, and return the Slack text
+ * it would have posted (empty string when it posts nothing).
+ *
+ * This is the only place that answers "does a human find out". A silent surface
+ * that neither fails CI nor alerts is the fail-silent outcome this whole change
+ * has to avoid, and the exit-6 branch is the thing that prevents it — so it is
+ * asserted by observing the payload, not by reading the branch.
+ */
+const observeNotify = (env: Record<string, string>): { posted: string; stepExit: number } => {
+  const dir = mkdtempSync(join(tmpdir(), "test-drift-notify-"));
+  try {
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const postFile = join(dir, "posted");
+    writeFileSync(
+      join(bin, "curl"),
+      [
+        "#!/bin/sh",
+        'body=""',
+        'while [ $# -gt 0 ]; do case "$1" in -d) body="$2"; shift;; esac; shift; done',
+        `printf '%s' "$body" > ${JSON.stringify(postFile)}`,
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const step = stepByName("Notify Slack", "notify");
+    const script = join(dir, "step.sh");
+    writeFileSync(script, step.run);
+    const res = spawnSync("/bin/bash", [script], {
+      cwd: dir,
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        SLACK_WEBHOOK: "https://example.invalid/hook",
+        AGUI_RESULT: "success",
+        DRIFT_SUMMARY: "",
+        DRIFT_RUNS: "",
+        REPO: "CopilotKit/aimock",
+        RUN_ID: "31571018005",
+        ...env,
+      },
+    });
+    return {
+      posted: existsSync(postFile) ? readFileSync(postFile, "utf-8") : "",
+      stepExit: res.status ?? -1,
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+};
+
+describe("test-drift.yml — a surface that stopped being graded reaches a human", () => {
+  it("EXECUTED: exit 6 on a green drift job still posts to Slack", () => {
+    // The job PASSES on exit 6, which is precisely why the alert matters: without
+    // its own branch this run is good→good and the step exits without posting.
+    const { posted } = observeNotify({
+      DRIFT_EXIT_CODE: "6",
+      DRIFT_RESULT: "success",
+      PREV: "success",
+    });
+    expect(posted, "a silent live surface produced NO Slack message").not.toBe("");
+    expect(posted).toContain("Live drift surface went silent");
+    // Never as drift — nobody should go looking for a provider format change.
+    expect(posted).not.toContain("HTTP API drift detected");
+    expect(posted).not.toContain("quarantined");
+  });
+
+  it("EXECUTED NEGATIVE CONTROL: a genuinely quiet day still posts nothing", () => {
+    // If this posted, the branch above would be indistinguishable from "always
+    // alert", and the exit-6 assertion would prove nothing.
+    const { posted } = observeNotify({
+      DRIFT_EXIT_CODE: "0",
+      DRIFT_RESULT: "success",
+      PREV: "success",
+    });
+    expect(posted).toBe("");
+  });
+
+  it("EXECUTED NEGATIVE CONTROL: exit 5 still alerts as a quarantine, not as a timeout", () => {
+    const { posted } = observeNotify({
+      DRIFT_EXIT_CODE: "5",
+      DRIFT_RESULT: "failure",
+      PREV: "success",
+    });
+    expect(posted).toContain("quarantined unparseable output");
+    expect(posted).not.toContain("went silent");
+  });
+
+  it("EXECUTED NEGATIVE CONTROL: real drift still alerts as real drift", () => {
+    const { posted } = observeNotify({
+      DRIFT_EXIT_CODE: "2",
+      DRIFT_RESULT: "failure",
+      PREV: "success",
+    });
+    expect(posted).toContain("HTTP API drift detected");
+    expect(posted).not.toContain("went silent");
+  });
+});

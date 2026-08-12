@@ -51,6 +51,15 @@ import { fileURLToPath } from "node:url";
 export const EXIT_CLEAN = 0;
 export const EXIT_CRITICAL_DRIFT = 2;
 export const EXIT_QUARANTINE = 5;
+/**
+ * A live leg observed ZERO messages before its wait expired — the surface went
+ * silent, so nothing was graded there. Propagated unchanged (like every non-0/2
+ * code) rather than retried: the wait already burned its full budget, and a
+ * surface that answered nothing for 30s is not going to be distinguished from a
+ * blip by spending another two waits on it. The caller decides what to do with
+ * it; `test-drift.yml` treats it as non-fatal and alerts on it distinctly.
+ */
+export const EXIT_LIVE_TIMEOUT = 6;
 
 // Defaults: keep the fleet of real-API calls small. 3 total attempts with a
 // ~45s backoff mirrors the observed transient window (the Fix Drift workflow
