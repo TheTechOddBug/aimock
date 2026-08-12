@@ -1,14 +1,43 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { execFile, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createServer as createHttpServer, type Server } from "node:http";
-import { existsSync, mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import {
+  existsSync,
+  statSync,
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  openSync,
+  closeSync,
+  rmSync,
+  mkdirSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { AddressInfo } from "node:net";
 import { createHash } from "node:crypto";
 
 const CLI_PATH = resolve(__dirname, "../../dist/cli.js");
+const CLI_SOURCE = resolve(__dirname, "../cli.ts");
 const CLI_AVAILABLE = existsSync(CLI_PATH);
+
+/**
+ * These tests exercise the BUILT CLI, and `pnpm test` does not build. A dist older than
+ * the source is a different program: a test of behaviour that only exists in the source
+ * then reports the very bug it was written to detect, and the report is about the build,
+ * not the code. Say so instead, for any test whose verdict depends on that distinction.
+ */
+function assertBuiltCliIsCurrent(): void {
+  const builtAt = statSync(CLI_PATH).mtimeMs;
+  const editedAt = statSync(CLI_SOURCE).mtimeMs;
+  if (builtAt < editedAt) {
+    throw new Error(
+      `dist/cli.js was built before src/cli.ts was last edited — run \`pnpm build\`. ` +
+        `This test exercises the built artifact, so its result would describe the stale ` +
+        `build rather than the current source.`,
+    );
+  }
+}
 
 // CLI integration tests use child processes and file watchers. Give healthy
 // children time to be scheduled while the full parallel suite is busy.
@@ -38,6 +67,7 @@ function spawnCli(args: string[]): {
   stderr: () => string;
   kill: (signal?: NodeJS.Signals) => void;
   waitForOutput: (match: RegExp, timeoutMs?: number) => Promise<void>;
+  waitForExit: () => Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 } {
   let out = "";
   let err = "";
@@ -48,6 +78,19 @@ function spawnCli(args: string[]): {
   cp.stderr?.on("data", (d) => {
     err += d;
   });
+
+  // Record the exit eagerly, at spawn time. A caller that attaches its own "close"
+  // listener after kill() can miss the event and then wait out the whole test timeout,
+  // which reports as a timeout rather than as the exit that actually happened.
+  let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+  const exitWaiters: ((r: { code: number | null; signal: NodeJS.Signals | null }) => void)[] = [];
+  cp.on("close", (code, signal) => {
+    exited = { code, signal };
+    for (const w of exitWaiters) w(exited);
+    exitWaiters.length = 0;
+  });
+  const waitForExit = (): Promise<{ code: number | null; signal: NodeJS.Signals | null }> =>
+    exited ? Promise.resolve(exited) : new Promise((resolve) => exitWaiters.push(resolve));
 
   const waitForOutput = (match: RegExp, timeoutMs = 10_000): Promise<void> =>
     new Promise((resolve, reject) => {
@@ -72,6 +115,7 @@ function spawnCli(args: string[]): {
     stderr: () => err,
     kill: (signal: NodeJS.Signals = "SIGTERM") => cp.kill(signal),
     waitForOutput,
+    waitForExit,
   };
 }
 
@@ -180,13 +224,81 @@ describe.skipIf(!CLI_AVAILABLE)("CLI: fixture loading", () => {
 
     child.kill("SIGTERM");
 
-    await new Promise<void>((resolve) => {
-      child.cp.on("close", (code) => {
-        expect(code).toBe(0);
-        resolve();
-      });
-    });
+    // Assert on the exit OUTSIDE the event callback, and on the signal as well as the
+    // code. A bare `expect(code).toBe(0)` inside the callback reports the useless
+    // "expected null to be +0" and then also hangs the test until the suite timeout,
+    // because the throw prevents the promise from ever resolving. `signal` is the
+    // datum that names the cause: SIGTERM means the CLI never ran its own handler.
+    await expect(child.waitForExit()).resolves.toEqual({ code: 0, signal: null });
   });
+
+  /*
+   * The CLI must not advertise readiness before it can act on the signal that
+   * advertisement invites.  Writes to a file are synchronous on POSIX (as are writes to
+   * a pipe on Linux, which is what CI uses), so a supervisor polling for the readiness
+   * line can deliver SIGTERM while the CLI is still mid-statement.  If the SIGTERM
+   * listener is not installed yet, the signal reaches Node's default disposition, which
+   * re-raises it: the process dies with code === null / signal === "SIGTERM" and never
+   * runs its own shutdown.
+   *
+   * SIGSTOP pins the child at exactly the instant it announced readiness, which is the
+   * same state a preempted process is in on a loaded CI runner — it makes the window
+   * observable instead of leaving it to a race.  With the listener registered after the
+   * announcement, one attempt catches the bug a little under half the time when measured
+   * from inside the running suite (10 of 23 attempts over ten runs), so twelve attempts
+   * miss it about once in a thousand runs; with the listener registered first, no attempt
+   * can fail, because the write of the line polled for below happens after the
+   * registration and stdout is synchronous.
+   *
+   * Scope: from the announcement onward, which is the only moment a supervisor can act
+   * on.  A SIGTERM delivered BEFORE readiness — while the server is still binding — is
+   * still fatal (code null / signal SIGTERM, no "Shutting down..."), and nothing here
+   * claims otherwise.
+   */
+  it.skipIf(process.platform === "win32")(
+    "handles a SIGTERM delivered at or after the instant readiness is announced",
+    async () => {
+      assertBuiltCliIsCurrent();
+      const fixturePath = writeFixture(tmpDir, "test.json");
+
+      for (let attempt = 0; attempt < 12; attempt++) {
+        const outFile = join(tmpDir, `announce-${attempt}.log`);
+        writeFileSync(outFile, "");
+        const fd = openSync(outFile, "a");
+        const cp = spawn("node", [CLI_PATH, "--fixtures", fixturePath, "--port", "0"], {
+          stdio: ["ignore", fd, fd],
+        });
+        closeSync(fd);
+
+        const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+          (resolve) => cp.on("exit", (code, signal) => resolve({ code, signal })),
+        );
+
+        try {
+          const deadline = Date.now() + 10_000;
+          while (!/listening on/i.test(readFileSync(outFile, "utf-8"))) {
+            if (Date.now() > deadline) {
+              throw new Error(`CLI never announced readiness: ${readFileSync(outFile, "utf-8")}`);
+            }
+            await new Promise((r) => setImmediate(r));
+          }
+          cp.kill("SIGSTOP");
+          cp.kill("SIGTERM");
+          cp.kill("SIGCONT");
+        } catch (e) {
+          // Never leave a frozen child behind for the suite to trip over.
+          cp.kill("SIGCONT");
+          cp.kill("SIGKILL");
+          throw e;
+        }
+
+        const { code, signal } = await exited;
+        const output = readFileSync(outFile, "utf-8");
+        expect({ attempt, code, signal }).toEqual({ attempt, code: 0, signal: null });
+        expect(output).toContain("Shutting down...");
+      }
+    },
+  );
 
   it("fails with error when --fixtures points to a non-existent path", async () => {
     const { stderr, code } = await runCli(["--fixtures", "/nonexistent/path/to/fixtures"]);
@@ -360,8 +472,10 @@ describe.skipIf(!CLI_AVAILABLE)("CLI: --watch", () => {
     const fixturePath = writeFixture(tmpDir, "test.json");
     const child = spawnCli(["--fixtures", fixturePath, "--port", "0", "--watch"]);
 
-    await child.waitForOutput(/listening on/i, 5000);
-    expect(child.stdout()).toContain("Watching");
+    // The watcher is started AFTER the readiness line is logged, so waiting for
+    // "listening on" and then asserting "Watching" is already present races the child.
+    // Wait for the line that actually marks the watcher as up.
+    await child.waitForOutput(/Watching/i, 5000);
 
     // Modify the fixture file
     writeFileSync(

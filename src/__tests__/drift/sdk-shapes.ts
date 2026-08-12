@@ -1220,13 +1220,29 @@ export function geminiLiveSetupCompleteShape(): SSEEventShape {
   };
 }
 
-export function geminiLiveTextEventShapes(): SSEEventShape[] {
+/**
+ * Expected `serverContent` shape for an AUDIO-modality Live turn.
+ *
+ * AUDIO — not TEXT — because every model exposing `bidiGenerateContent` is a
+ * native-audio model that supports only the `AUDIO` response modality; a TEXT
+ * session is refused with a 1007 CLOSE frame (see `GEMINI_LIVE_RESPONSE_MODALITIES`
+ * in ws-providers.ts). Audio arrives as `inlineData` parts on `modelTurn`, with
+ * `turnComplete` ending the turn.
+ *
+ * Only fields present in BOTH this shape and the real API grade as critical
+ * drift when the mock omits them (see `triangulateAt`), so this deliberately
+ * lists exactly the AUDIO-turn fields aimock is contractually required to
+ * reproduce — not every field the provider happens to send.
+ */
+export function geminiLiveAudioEventShapes(): SSEEventShape[] {
   return [
     {
       type: "serverContent",
       dataShape: extractShape({
         serverContent: {
-          modelTurn: { parts: [{ text: "Hello!" }] },
+          modelTurn: {
+            parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: "AAAAAA==" } }],
+          },
           turnComplete: true,
         },
       }),
