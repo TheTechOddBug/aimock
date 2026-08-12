@@ -1078,6 +1078,128 @@ describe("collectDriftEntries", () => {
 });
 
 // ---------------------------------------------------------------------------
+// An empty field value must not eat the next entry
+//
+// `compareShapes` sets `mock: ""` on every diff it produces, and the entry regex
+// used `Mock:\s*(.+)`. `\s` matches newlines, so on an empty value the greedy
+// `\s*` ran past the end of its own line and `(.+)` matched the NEXT ENTRY'S
+// header, consuming it whole. When the swallowed entry was the critical one,
+// `criticalCount` fell to 0 and the collector reported `conclusion: "clean"` —
+// the failure state and the working state were observationally identical, which
+// is the worst shape a defect can have here.
+//
+// SCOPE, measured rather than assumed: the trigger is ONE empty-`mock` entry that
+// has a successor. It is NOT limited to consecutive empty values (a block whose
+// only empty value sits in the middle loses its THIRD entry), and a trailing
+// empty-`mock` entry survives (the capture falls back to the value's own trailing
+// spaces). Two live surfaces emit compareShapes-derived blocks —
+// `fal-queue.drift.ts` and `video.drift.ts` — where the value is empty on 100% of
+// diffs, so a block of N entries lost floor(N/2) of them.
+//
+// The round-trip property below is the non-recurring part: it asserts through the
+// REAL emitter and the REAL parser that what a block PRINTS is what the collector
+// COLLECTS, across every empty/filled permutation. Any future separator that can
+// cross a newline fails it without anyone having to think of this case again.
+// ---------------------------------------------------------------------------
+
+describe("what a drift block prints is what the collector collects", () => {
+  const diff = (
+    n: number,
+    mock: string,
+    severity: ShapeDiff["severity"] = "warning",
+  ): ShapeDiff => ({
+    path: `field${n}`,
+    severity,
+    issue: `issue ${n}`,
+    expected: "e",
+    real: "r",
+    mock,
+  });
+  const EMPTY = "";
+  const FILLED = "<absent>";
+
+  // Every permutation of empty/filled `mock` up to 3 entries, plus the 4-entry
+  // all-empty case that shows the loss compounding.
+  const permutations: string[][] = [
+    [EMPTY],
+    [FILLED],
+    [EMPTY, EMPTY],
+    [EMPTY, FILLED],
+    [FILLED, EMPTY],
+    [FILLED, FILLED],
+    [EMPTY, EMPTY, EMPTY],
+    [FILLED, EMPTY, FILLED],
+    [EMPTY, FILLED, EMPTY],
+    [EMPTY, EMPTY, EMPTY, EMPTY],
+  ];
+
+  it.each(permutations.map((m) => [m.map((x) => (x === EMPTY ? "empty" : "filled")).join("+"), m]))(
+    "round-trips every entry when the mock values are %s",
+    (_label, mocks) => {
+      const diffs = (mocks as string[]).map((m, i) => diff(i + 1, m));
+      const parsed = parseDriftBlock(formatDriftReport("Round-trip probe", diffs));
+      expect(parsed).not.toBeNull();
+      // Path is the identity here, so a swallowed entry shows up as a missing path
+      // rather than as a count that happens to match for the wrong reason.
+      expect(parsed!.diffs.map((d) => d.path)).toEqual(diffs.map((d) => d.path));
+      expect(parsed!.diffs.map((d) => d.mock)).toEqual(diffs.map((d) => d.mock));
+    },
+  );
+
+  it("a critical diff behind an empty-mock entry survives to the exit code", () => {
+    // The exact loss shape: two entries, both empty `mock` (what compareShapes
+    // emits), critical SECOND. Before the fix the critical was consumed by its
+    // predecessor and the collector exited 0 "clean".
+    const diffs = [diff(1, EMPTY, "warning"), diff(2, EMPTY, "critical")];
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["OpenAI Chat Completions drift"],
+        title: "non-streaming text matches real API",
+        failureMessages: [formatDriftReport("OpenAI Chat (non-streaming text)", diffs)],
+      }),
+    ]);
+    const entries = entriesOf(result);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].diffs.map((d) => d.severity)).toEqual(["warning", "critical"]);
+    // The whole point: a printed critical reaches the exit code.
+    expect(exitCodeOf(result)).toBe(2);
+  });
+
+  it("an empty value is captured as empty, never as the next entry's text", () => {
+    const diffs = [diff(1, EMPTY), diff(2, FILLED)];
+    const parsed = parseDriftBlock(formatDriftReport("probe", diffs))!;
+    expect(parsed.diffs[0].mock).toBe("");
+    expect(parsed.diffs[0].mock).not.toContain("issue 2");
+  });
+
+  it("every labelled field tolerates an empty value, not just Mock", () => {
+    // The sibling separators had the identical hazard; an empty `real`/`expected`
+    // would have crossed a newline the same way.
+    const diffs: ShapeDiff[] = [
+      { path: "p1", severity: "warning", issue: "i1", expected: "", real: "", mock: "" },
+      { path: "p2", severity: "critical", issue: "i2", expected: "e", real: "r", mock: "m" },
+    ];
+    const parsed = parseDriftBlock(formatDriftReport("probe", diffs))!;
+    expect(parsed.diffs.map((d) => d.path)).toEqual(["p1", "p2"]);
+    expect(parsed.diffs[1].severity).toBe("critical");
+  });
+
+  it("NEGATIVE CONTROL: a numbered list in prose is still not an entry", () => {
+    // `^` anchoring is what keeps the looser value captures from inventing entries
+    // out of ordinary text that happens to contain a numbered line mid-sentence.
+    const text =
+      "API DRIFT DETECTED: Prose probe\n" +
+      "  the provider docs say 1. [critical] do not do this\n" +
+      "     Path:    nope\n" +
+      "     SDK:     nope\n" +
+      "     Real:    nope\n" +
+      "     Mock:    nope\n";
+    expect(parseDriftBlock(text)!.diffs).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Zero-observation live timeouts (exit 6)
 //
 // The failure that blocked every bot-opened drift PR: the Gemini Live WS legs

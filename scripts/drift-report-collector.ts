@@ -135,8 +135,27 @@ export function parseDriftBlock(text: string): { context: string; diffs: ParsedD
   const diffs: ParsedDiff[] = [];
 
   // Match numbered entries: "  1. [severity] issue text\n     Path:...\n     SDK:...\n     Real:...\n     Mock:..."
+  //
+  // EVERY separator here is `[ \t]*` and every value is `(.*)`, NOT `\s*` and
+  // `(.+)`. `\s` matches newlines, and `compareShapes` sets `mock: ""` on every
+  // diff it produces, so `Mock:\s*(.+)` on an empty value used to run past the end
+  // of its own line: greedy `\s*` swallowed the trailing spaces, the newline and
+  // the blank separator line, and `(.+)` then matched the NEXT ENTRY'S header.
+  // That consumed the successor whole — `lastIndex` advanced past its `N. [sev]`
+  // line, so nothing could match it — and if that successor was the critical diff,
+  // `criticalCount` fell to 0 and the run reported `conclusion: "clean"`.
+  //
+  // The trigger is a single empty-`mock` entry that HAS a successor; it is not
+  // limited to consecutive empty values, and it does not need the block to be
+  // malformed. `fal-queue.drift.ts` and `video.drift.ts` both emit
+  // compareShapes-derived blocks, where the value is empty on 100% of diffs.
+  //
+  // A newline can no longer be crossed inside an entry, and an empty value is
+  // captured as empty instead of forcing the match to look for content elsewhere.
+  // `^` (with `m`) additionally requires the entry number to START a line, so a
+  // numbered list inside prose cannot be read as an entry.
   const entryPattern =
-    /\d+\.\s*\[(\w+)\]\s*(.+)\n\s*Path:\s*(.+)\n\s*SDK:\s*(.+)\n\s*Real:\s*(.+)\n\s*Mock:\s*(.+)/g;
+    /^[ \t]*\d+\.[ \t]*\[(\w+)\][ \t]*(.*)\n[ \t]*Path:[ \t]*(.*)\n[ \t]*SDK:[ \t]*(.*)\n[ \t]*Real:[ \t]*(.*)\n[ \t]*Mock:[ \t]*(.*)/gm;
 
   let match: RegExpExecArray | null;
   while ((match = entryPattern.exec(text)) !== null) {
