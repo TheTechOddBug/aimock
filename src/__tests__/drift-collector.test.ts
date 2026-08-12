@@ -36,6 +36,7 @@ import {
   infraIndicatorSample,
   NO_GA_DELTA_ID,
   TRUNCATED_DELTA_ID,
+  WS_PROBE_LABELS,
 } from "../../scripts/drift-report-collector.js";
 import type {
   DriftEntry,
@@ -1448,6 +1449,228 @@ describe("a provider that closes the session states its own cause", () => {
     const result = resultFor(wsServerClose(1008, GEMINI_REASON, 3));
     expect(entriesOf(result)).toHaveLength(1);
     expect(exitCodeOf(result)).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Attribution when the stack carries NO probe frame
+//
+// The refusal above is attributed by the probe's stack frame, and every fixture
+// in that block HAS one (`… at …/ws-gemini-live.drift.ts:88:11`). Real CI output
+// does not. The client that raises a WS failure is SHARED (`ws-providers.ts`) and
+// raises from a socket callback, so the probe's frame does not survive the async
+// boundary: run 31571018005 quarantined two Gemini Live legs as "could not be
+// mapped to a provider" (exit 5, the manual-triage stop) on a message whose every
+// frame is the shared client or a node internal.
+//
+// That is the hand-authored-fixture trap in its exact form — the fixtures sat in
+// the passing class because someone typed a frame the runtime never produces. So
+// the fixture below is VERBATIM from that run's own drift-report-base artifact,
+// and the first assertion is a STRUCTURAL guard that it contains no probe frame
+// at all, so it cannot quietly drift back into the passing class.
+// ---------------------------------------------------------------------------
+
+/**
+ * VERBATIM failure message from CopilotKit/aimock run 31571018005 (PR #370),
+ * lifted from that run's `drift-report-base` artifact quarantine entry. Google
+ * refused the session with RFC 6455 code 1007 and said exactly why.
+ */
+const CI_REFUSED_NO_PROBE_FRAME =
+  "WSClosedError: WebSocket closed by server during waitUntil: code=1007 " +
+  'reason="The requested combination of response modalities (TEXT) is not supported by the ' +
+  'model. models/gemini-3.1-flash-live-preview". Collected 0 messages: [] bodies=[]\n' +
+  "    at rejectClosed (/home/runner/work/aimock/base-main/src/__tests__/drift/ws-providers.ts:377:21)\n" +
+  "    at check (/home/runner/work/aimock/base-main/src/__tests__/drift/ws-providers.ts:467:21)\n" +
+  "    at TLSSocket.<anonymous> (/home/runner/work/aimock/base-main/src/__tests__/drift/ws-providers.ts:525:47)\n" +
+  "    at TLSSocket.emit (node:events:509:28)\n" +
+  "    at addChunk (node:internal/streams/readable:563:12)\n" +
+  "    at readableAddChunkPushByteMode (node:internal/streams/readable:514:3)\n" +
+  "    at TLSSocket.Readable.push (node:internal/streams/readable:394:5)\n" +
+  "    at TLSWrap.onStreamRead (node:internal/stream_base_commons:189:23)";
+
+/** A server CLOSE reported with the REAL stack: shared client + node internals only. */
+function wsServerCloseNoProbeFrame(code: number, reason: string): string {
+  return (
+    `WSClosedError: WebSocket closed by server during waitUntil: code=${code} ` +
+    `reason=${JSON.stringify(reason)}. Collected 0 messages: [] bodies=[]\n` +
+    "    at rejectClosed (/repo/src/__tests__/drift/ws-providers.ts:377:21)\n" +
+    "    at check (/repo/src/__tests__/drift/ws-providers.ts:467:21)\n" +
+    "    at TLSSocket.<anonymous> (/repo/src/__tests__/drift/ws-providers.ts:525:47)\n" +
+    "    at TLSSocket.emit (node:events:509:28)"
+  );
+}
+
+/** A handshake timeout WITH a provider error body, reported without a probe frame. */
+function wsErrorTimeoutNoProbeFrame(): string {
+  return (
+    "Error: waitUntil timeout after 30000ms. Collected 1 messages: [error] " +
+    'bodies=[{"type":"error","error":{"type":"invalid_request_error",' +
+    '"code":"bad_setup","message":"nope"}}]\n' +
+    "    at Timeout._onTimeout (/repo/src/__tests__/drift/ws-providers.ts:412:23)\n" +
+    "    at listOnTimeout (node:internal/timers:605:17)"
+  );
+}
+
+function failureIn(ancestor: string, message: string): VitestJsonResult {
+  return makeResult([
+    makeAssertion({
+      status: "failed",
+      ancestorTitles: [ancestor],
+      title: "WS text event sequence and shapes match",
+      failureMessages: [message],
+    }),
+  ]);
+}
+
+/** The three registered WS probes: live suite title, file, and owning surface. */
+const WS_SUITES: readonly [suite: string, probeFile: string, provider: string, builder: string][] =
+  [
+    ["Gemini Live WS drift", "ws-gemini-live.drift.ts", "Gemini Live", "src/ws-gemini-live.ts"],
+    ["OpenAI Realtime API drift", "ws-realtime.drift.ts", "OpenAI Realtime", "src/ws-realtime.ts"],
+    [
+      "OpenAI Responses WS drift",
+      "ws-responses.drift.ts",
+      "OpenAI Responses WS",
+      "src/ws-responses.ts",
+    ],
+  ];
+
+describe("a WS failure with no probe frame is attributed by the failing test's name", () => {
+  it("the CI fixture really has NO probe frame — the frame key cannot answer", () => {
+    // Load-bearing: if this fixture ever grows a `*.drift.ts` frame it stops
+    // exercising the production shape and the tests below prove nothing.
+    expect(CI_REFUSED_NO_PROBE_FRAME).not.toMatch(/\.drift\.ts/);
+    expect(CI_REFUSED_NO_PROBE_FRAME).toContain("ws-providers.ts");
+  });
+
+  it("the REAL quarantined CI failure becomes attributed critical drift", () => {
+    const result = failureIn("Gemini Live WS drift", CI_REFUSED_NO_PROBE_FRAME);
+    expect(quarantineOf(result)).toEqual([]);
+    expect(timeoutsOf(result)).toEqual([]);
+    const entries = entriesOf(result);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].provider).toBe("Gemini Live");
+    expect(entries[0].builderFile).toBe("src/ws-gemini-live.ts");
+    expect(entries[0].builderFunctions).toEqual(["handleWebSocketGeminiLive"]);
+    expect(entries[0].scenario).toBe("WS session refused");
+    expect(entries[0].diffs[0].severity).toBe("critical");
+    expect(entries[0].diffs[0].id).toBe("ws-close:1007");
+    // The reason Google gave IS the finding, so it must reach the report.
+    expect(entries[0].diffs[0].issue).toContain("response modalities (TEXT) is not supported");
+    // 1007 is a refusal code, so the exit is the drift lane. NOT 6: nothing about
+    // this failure is silence — the provider stated a cause.
+    expect(exitCodeOf(result)).toBe(2);
+  });
+
+  it.each(WS_SUITES)(
+    "%s attributes a frameless refusal to %s → %s",
+    (suite, _file, provider, builder) => {
+      // All THREE probes, not just the one that failed in prod: a table that
+      // works for one provider is how the hardcoded openai-realtime bug survived.
+      const result = failureIn(suite, wsServerCloseNoProbeFrame(1008, "refused"));
+      expect(quarantineOf(result)).toEqual([]);
+      const entries = entriesOf(result);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].provider).toBe(provider);
+      expect(entries[0].builderFile).toBe(builder);
+      expect(exitCodeOf(result)).toBe(2);
+    },
+  );
+
+  it.each(WS_SUITES)(
+    "%s attributes a frameless handshake error to %s → %s",
+    (suite, _file, provider, builder) => {
+      // The handshake lane keys off the same resolver, and its throw is also
+      // raised from the shared client (a setTimeout callback), so it has the same
+      // missing-frame problem.
+      const result = failureIn(suite, wsErrorTimeoutNoProbeFrame());
+      expect(quarantineOf(result)).toEqual([]);
+      const entries = entriesOf(result);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].provider).toBe(provider);
+      expect(entries[0].builderFile).toBe(builder);
+      expect(entries[0].scenario).toBe("WS handshake");
+      expect(exitCodeOf(result)).toBe(2);
+    },
+  );
+
+  it.each(WS_SUITES)(
+    "%s is the REAL describe title of %s, so the label key is not invented here",
+    (suite, probeFile, provider) => {
+      // The name key is only as good as the titles it matches. Bind the two: the
+      // probe's own live-drift describe title must lead with its registry provider
+      // label. Renaming that describe fails HERE rather than silently in CI.
+      const src = readFileSync(resolve(__dirname, "drift", probeFile), "utf8");
+      const titles = [...src.matchAll(/describe(?:\.\w+\([^)]*\))?\(\s*"([^"]+)"/g)].map(
+        (m) => m[1],
+      );
+      const driftTitles = titles.filter((t) => /drift/i.test(t));
+      expect(driftTitles).toContain(suite);
+      for (const t of driftTitles) expect(t.startsWith(provider)).toBe(true);
+    },
+  );
+
+  it("no registered WS probe label is a prefix of another, so match order cannot matter", () => {
+    // This invariant is what licenses the unordered `find` in the name resolver.
+    // The registry DOES contain prefix pairs ("OpenAI Responses" ⊂ "OpenAI
+    // Responses WS"), so registering `openai-responses` as a WS probe would make
+    // two labels anchor the same title and the winner would be table order. That
+    // must be an author's decision, surfaced here, not a silent pick.
+    for (const a of WS_PROBE_LABELS) {
+      for (const b of WS_PROBE_LABELS) {
+        if (a.surface === b.surface) continue;
+        expect(b.label.startsWith(a.label)).toBe(false);
+      }
+    }
+  });
+
+  it("NEGATIVE CONTROL: an unregistered suite with no frame STILL quarantines (exit 5)", () => {
+    // The whole point of refusing to guess. A confidently wrong owner routes
+    // remediation at the wrong file and fails OPEN, which is worse than the stop.
+    const result = failureIn("Some future WS drift", wsServerCloseNoProbeFrame(1008, "refused"));
+    expect(entriesOf(result)).toEqual([]);
+    const q = quarantineOf(result);
+    expect(q).toHaveLength(1);
+    expect(q[0].provider).toBe("unknown");
+    expect(q[0].message).toContain("REFUSED");
+    expect(q[0].message).toContain("WS_HANDSHAKE_PROBES");
+    // The message must name BOTH keys that failed, so the reader knows a suite
+    // title is a fix and not only a stack frame.
+    expect(q[0].message).toContain("Some future WS drift");
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("NEGATIVE CONTROL: a registered label mid-title does NOT attribute", () => {
+    // Anchored at the start, for the same reason extractProviderName is: a label
+    // later in a title is a qualifier, not the owner.
+    const result = failureIn(
+      "Some future WS drift compared against Gemini Live",
+      wsServerCloseNoProbeFrame(1008, "refused"),
+    );
+    expect(entriesOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("NEGATIVE CONTROL: a frameless NON-refusal close is still a hang-up (exit 6)", () => {
+    // Attribution must not promote the peer's own hiccup into a finding about us.
+    const result = failureIn("Gemini Live WS drift", wsServerCloseNoProbeFrame(1011, "peer left"));
+    expect(entriesOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toEqual([]);
+    expect(timeoutsOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(6);
+  });
+
+  it("NEGATIVE CONTROL: a registered title does not make garbage parseable", () => {
+    // The name key only decides an OWNER; it is not a recognizer. Output that no
+    // lane recognizes still quarantines even under a perfectly known suite.
+    const result = failureIn(
+      "Gemini Live WS drift",
+      "AssertionError: expected 'x' to be one of\n    at /repo/src/a.ts:1:1",
+    );
+    expect(entriesOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
   });
 });
 

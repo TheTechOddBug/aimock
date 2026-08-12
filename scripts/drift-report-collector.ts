@@ -406,10 +406,11 @@ export function parseKnownModelsCanary(text: string): CanaryParseResult | null {
  * surface and fell through to the exit-5 quarantine, i.e. straight back into the
  * hard human-triage stop this whole lane exists to avoid.
  *
- * Attribution is by the probe's own stack frame, and it is a CLOSED table on
- * purpose. A frame that names no registered probe yields null and the failure
- * stays quarantined — an unknown WS surface must not be guessed at, because a
- * confident wrong owner routes remediation at the wrong file and fails OPEN.
+ * Attribution is by the probe's own stack frame OR by the failing test's name,
+ * and BOTH keys read the same CLOSED table on purpose. A failure that matches
+ * neither key yields null and stays quarantined — an unknown WS surface must not
+ * be guessed at, because a confident wrong owner routes remediation at the wrong
+ * file and fails OPEN.
  */
 const WS_HANDSHAKE_PROBES: readonly {
   /** The drift probe's filename as it appears in a stack frame. */
@@ -425,6 +426,70 @@ const WS_HANDSHAKE_PROBES: readonly {
 /** The registered surface a WS failure's stack frames attribute it to, or null. */
 function resolveWSProbeSurface(text: string): keyof typeof SURFACE_REGISTRY | null {
   return WS_HANDSHAKE_PROBES.find((p) => text.includes(p.file))?.surface ?? null;
+}
+
+/**
+ * The SAME closed set of WS probes, indexed by the registry provider LABEL that
+ * opens their describe-block titles ("Gemini Live WS drift", "OpenAI Realtime API
+ * drift", "OpenAI Responses WS drift").
+ *
+ * NO longest-label-first ordering: match order cannot matter, because no
+ * registered WS label is a prefix of another, so at most one can anchor a title.
+ * That property is asserted by a test (drift-collector.test.ts, "no registered WS
+ * probe label is a prefix of another") rather than papered over here — an
+ * ordering rule that no input can distinguish is coverage that does not exist,
+ * whereas registering a prefix-colliding probe (say `openai-responses`, "OpenAI
+ * Responses", alongside "OpenAI Responses WS") turns that test RED and makes the
+ * ambiguity the author's decision instead of a silent pick.
+ */
+export const WS_PROBE_LABELS: readonly {
+  label: string;
+  surface: keyof typeof SURFACE_REGISTRY;
+}[] = WS_HANDSHAKE_PROBES.map((p) => ({
+  label: SURFACE_REGISTRY[p.surface].provider,
+  surface: p.surface,
+}));
+
+/**
+ * The registered surface the failing TEST'S NAME attributes a WS failure to.
+ *
+ * This key exists because the stack frame key cannot answer for the failures that
+ * actually happen. The client that raises a WS failure is SHARED
+ * (`ws-providers.ts`), and it raises from a socket callback — an async boundary
+ * the probe's own frame does not survive. Verbatim from the run this fixed
+ * (CopilotKit/aimock 31571018005): every frame is the shared client or a node
+ * internal, and `ws-gemini-live.drift.ts` appears NOWHERE in the stack:
+ *
+ *     at rejectClosed (…/src/__tests__/drift/ws-providers.ts:377:21)
+ *     at check (…/src/__tests__/drift/ws-providers.ts:467:21)
+ *     at TLSSocket.<anonymous> (…/src/__tests__/drift/ws-providers.ts:525:47)
+ *     at TLSSocket.emit (node:events:509:28)
+ *     …
+ *
+ * So the probe frame is not merely DEEPER in the stack — it is absent, and no
+ * frame-scanning pattern can recover it. The vitest reporter still knows which
+ * suite failed, and the ancestor title leads with the surface's registry provider
+ * label, so the test name carries the answer the stack lost.
+ *
+ * ANCHORED AT THE START, for the same reason `extractProviderName` is: a label
+ * mentioned later in a title is a qualifier, not the owner, and attributing on an
+ * unanchored occurrence is how a confidently-wrong owner gets invented. A title
+ * that does not START with a registered WS label is unattributable → null → the
+ * caller quarantines it.
+ */
+function resolveWSProbeSurfaceByName(testName: string): keyof typeof SURFACE_REGISTRY | null {
+  return WS_PROBE_LABELS.find((p) => testName.startsWith(p.label))?.surface ?? null;
+}
+
+/**
+ * The registered surface a WS failure is attributed to, from both keys that can
+ * carry the answer: the stack frame FIRST (a probe frame is unambiguous
+ * provenance when it survives), then the failing test's name. Both consult the
+ * same closed WS_HANDSHAKE_PROBES table, so an unregistered surface is still
+ * refused by both.
+ */
+function resolveWSSurface(text: string, testName: string): keyof typeof SURFACE_REGISTRY | null {
+  return resolveWSProbeSurface(text) ?? resolveWSProbeSurfaceByName(testName);
 }
 
 /**
@@ -450,17 +515,26 @@ export interface WSHandshakeFailure {
   errorMessage: string;
 }
 
-export function parseWSHandshakeFailure(text: string): WSHandshakeFailure | null {
+export function parseWSHandshakeFailure(
+  text: string,
+  /**
+   * The failing test's `<ancestors> > <title>` name. REQUIRED, not defaulted: the
+   * stack frame alone cannot attribute a failure raised from the shared client's
+   * socket callback, and a caller that silently omitted the name would reproduce
+   * exactly the unattributable quarantine this parameter exists to prevent.
+   */
+  testName: string,
+): WSHandshakeFailure | null {
   // Gate 1: the probe timed out waiting for a lifecycle event (handshake never
   // completed). Gate 2: the failure came from a KNOWN WS drift probe, which also
-  // resolves WHICH surface owns it (its stack frame is always present on a real
-  // failure; the surfaced `error` body comes from the ws-providers helper).
+  // resolves WHICH surface owns it (by its stack frame, else by the failing
+  // test's name; the surfaced `error` body comes from the ws-providers helper).
   // Gate 3: an `error` event body was surfaced — this is the "connect succeeded
   // but handshake didn't complete WITH a protocol error" case. A pure network
   // flake or a silent surface carries no error body, fails Gate 3, and is left to
   // the timeout/quarantine lanes.
   if (!/waitUntil timeout/.test(text)) return null;
-  const surface = resolveWSProbeSurface(text);
+  const surface = resolveWSSurface(text, testName);
   if (surface === null) return null;
   if (!/"type"\s*:\s*"error"/.test(text)) return null;
 
@@ -954,6 +1028,10 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
       if (assertion.failureMessages.length === 0) continue;
 
       const fullMessage = assertion.failureMessages.join("\n");
+      // Hoisted above every lane: the WS lanes attribute by the failing test's
+      // name when the shared client's stack has no probe frame to key off.
+      const ancestorText = assertion.ancestorTitles.join(" ");
+      const testName = `${ancestorText} > ${assertion.title}`;
       const parsed = parseDriftBlock(fullMessage);
       if (!parsed || parsed.diffs.length === 0) {
         // Check for the ws-realtime canary assertion shapes BEFORE classifying
@@ -1073,7 +1151,7 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
         // provider `error` event, is a parseable critical drift (exit 2) — not
         // an opaque exit-5 quarantine. Recognized narrowly so a bare network
         // timeout (no error body) still falls through to the quarantine lane.
-        const wsFailure = parseWSHandshakeFailure(fullMessage);
+        const wsFailure = parseWSHandshakeFailure(fullMessage, testName);
         if (wsFailure !== null) {
           // Attribution follows the probe that reported the failure, resolved in
           // parseWSHandshakeFailure. Hardcoding openai-realtime here is what made
@@ -1119,9 +1197,8 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
         // the failure that blocked every drift PR in the first place.
         const closed = parseWSServerClose(fullMessage);
         if (closed !== null) {
-          const testName = `${assertion.ancestorTitles.join(" ")} > ${assertion.title}`;
           const rawLocation = extractRawLocation(fullMessage);
-          const surface = resolveWSProbeSurface(fullMessage);
+          const surface = resolveWSSurface(fullMessage, testName);
           if (isRefusalCloseCode(closed.code)) {
             if (surface === null) {
               // A refusal we cannot attribute. Held for review rather than guessed
@@ -1133,9 +1210,11 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
                 rawLocation,
                 message:
                   `Provider REFUSED the WS session (close code ${closed.code}` +
-                  `${closed.reason ? `: ${closed.reason}` : ""}) but the reporting probe is not ` +
-                  `registered in WS_HANDSHAKE_PROBES, so the owning surface is unknown. ` +
-                  `Add the probe to attribute this automatically.\n${fullMessage}`,
+                  `${closed.reason ? `: ${closed.reason}` : ""}) but neither the stack frame nor ` +
+                  `the test name "${testName}" names a probe registered in WS_HANDSHAKE_PROBES, ` +
+                  `so the owning surface is unknown. Register the probe (its file, and a suite ` +
+                  `title that leads with its registry provider label) to attribute this ` +
+                  `automatically.\n${fullMessage}`,
               });
               continue;
             }
@@ -1195,9 +1274,6 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
         unparseable++;
         continue;
       }
-
-      const ancestorText = assertion.ancestorTitles.join(" ");
-      const testName = `${ancestorText} > ${assertion.title}`;
 
       // Resolution order (see WS-5 spec §3c):
       //
@@ -1284,12 +1360,19 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
       for (const assertion of file.assertionResults) {
         if (assertion.status !== "failed" || assertion.failureMessages.length === 0) continue;
         const fullMessage = assertion.failureMessages.join("\n");
+        const testName = `${assertion.ancestorTitles.join(" ")} > ${assertion.title}`;
         const parsed = parseDriftBlock(fullMessage);
         if (!parsed || parsed.diffs.length === 0) {
           // Canary and WS-handshake shapes are handled above (they became
-          // entries) — only truly unparseable messages reach here.
+          // entries) — only truly unparseable messages reach here. The handshake
+          // check is given the SAME `testName` the first pass used so the two
+          // passes cannot reach different verdicts on the same input. (This pass
+          // only runs when there are zero entries, which already implies the
+          // handshake recognizer claimed nothing, so no input distinguishes the
+          // two arguments today; passing the real name keeps that a property of
+          // the precondition rather than of a value chosen here.)
           if (parseKnownModelsCanary(fullMessage) !== null) continue;
-          if (parseWSHandshakeFailure(fullMessage) !== null) continue;
+          if (parseWSHandshakeFailure(fullMessage, testName) !== null) continue;
           // Recognized zero-observation live timeouts were claimed by the
           // timeout lane in the pass above; they are not unparseable.
           if (parseLiveTimeout(fullMessage) !== null) continue;
@@ -1298,7 +1381,7 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
           if (parseWSServerClose(fullMessage) !== null) continue;
           unparseableFailures.push({
             message: fullMessage,
-            testName: `${assertion.ancestorTitles.join(" ")} > ${assertion.title}`,
+            testName,
             rawLocation: extractRawLocation(fullMessage),
           });
         }
