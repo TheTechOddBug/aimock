@@ -156,13 +156,15 @@ Uses `describe.skipIf(!GOOGLE_API_KEY)` like other Gemini tests. The Interaction
 
 **How it works**: A TLS WebSocket client (`ws-providers.ts`) connects to real provider endpoints using `node:tls` with RFC 6455 framing. Each protocol function handles the setup sequence (e.g., Realtime session negotiation, Gemini Live setup/setupComplete) and collects messages until a terminal event. The mock side uses the existing `ws-test-client.ts` plaintext client against the local aimock server.
 
-### Gemini Live: unverified
+### Gemini Live: graded on the AUDIO modality
 
-aimock's Gemini Live handler implements the text-based `BidiGenerateContent` protocol as documented in Google's [Live API reference](https://ai.google.dev/api/live) — `setup`/`setupComplete` handshake, `clientContent` with turns, `serverContent` with `modelTurn.parts[].text`, and `toolCall` responses. The protocol format is correct per the docs.
+aimock's Gemini Live handler implements the `BidiGenerateContent` protocol as documented in Google's [Live API reference](https://ai.google.dev/api/live) — `setup`/`setupComplete` handshake, `clientContent` with turns, `serverContent` with `modelTurn.parts[]`, and `toolCall` responses.
 
-However, as of March 2026, the only models that support `bidiGenerateContent` are native-audio models (`gemini-2.5-flash-native-audio-*`), which reject text-only requests. No text-capable model exists for this endpoint yet, so we cannot triangulate aimock's output against a real API response.
+A Live session carries exactly ONE response modality, and every model exposing `bidiGenerateContent` is a native-audio model that supports only `AUDIO` — Google's [capabilities guide](https://ai.google.dev/gemini-api/docs/live-api/capabilities) states the native audio models "only support `AUDIO` response modality". A session requesting `TEXT` is refused with an RFC 6455 CLOSE frame (`code=1007`, "The requested combination of response modalities (TEXT) is not supported by the model"), so `ws-gemini-live.drift.ts` drives `responseModalities: ["AUDIO"]` and grades the audio event sequence — `inlineData` parts plus `turnComplete` — along with the modality-independent `toolCall`. The mock side is driven by an audio fixture so both sides of the comparison see the same modality.
 
-A canary test (`ws-gemini-live.drift.ts`) queries the Gemini model listing API on each drift run and checks for a non-audio model that supports `bidiGenerateContent`. When Google ships one, the canary will flag it and the full drift tests can be enabled.
+Model selection keys ONLY on the listing's declared `bidiGenerateContent` support. It must never re-derive a capability from the model name: a `"native-audio"` name-substring filter previously mis-classified `gemini-3.1-flash-live-preview` — a native-audio model that omits that substring from its name — as text-capable, which is how the leg came to request an unsupported modality.
+
+aimock's TEXT `serverContent` path is exercised mock-only by `ws-gemini-live.test.ts`; it cannot be triangulated against a live endpoint while no Live model serves text. `ws-gemini-live-modality.test.ts` runs the whole three-way comparison locally against a fake provider that enforces Google's modality rule, so the mock side is verified without live credentials.
 
 ## CI Schedule
 
@@ -207,4 +209,4 @@ family does not, by itself, fail the drift tests):
 
 ## Cost
 
-~31 API calls per run (20 HTTP response-shape + 3 model listing + 8 WS including canaries) using the cheapest available models (`gpt-4o-mini`, `gpt-realtime-2`, `claude-haiku-4-5-20251001`, `gemini-2.5-flash`) with 10-100 max tokens each. Under $0.25/week at daily cadence. The GA protocol probe adds a second Realtime WS connection (one GA, one Beta) per run. When Gemini Live text-capable models become available, the 2 canary tests will become full drift tests, increasing real WS connections from 6 to 8.
+~31 API calls per run (20 HTTP response-shape + 3 model listing + 8 WS) using the cheapest available models (`gpt-4o-mini`, `gpt-realtime-2`, `claude-haiku-4-5-20251001`, `gemini-2.5-flash`) with 10-100 max tokens each. Under $0.25/week at daily cadence. The GA protocol probe adds a second Realtime WS connection (one GA, one Beta) per run. The 2 Gemini Live legs each open a real WS session and generate a short audio turn.
