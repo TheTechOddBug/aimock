@@ -1280,6 +1280,49 @@ describe("zero-observation live timeouts are reported AS timeouts (exit 6)", () 
     expect(exitCodeOf(result)).toBe(5);
   });
 
+  // The three-way split, pinned. A live WS leg can fail in three ways and they do
+  // NOT collapse, because the EVIDENCE differs: an error body is the provider
+  // stating why it rejected the session (drift, attributable, auto-fixable);
+  // silence is evidence of nothing (timeout); anything else is unreadable
+  // (quarantine). Pinned explicitly so the taxonomy is a measured fact rather
+  // than something a reader has to reconstruct from three recognizers.
+  //
+  // The middle row also records a real GAP, deliberately asserted as it behaves
+  // today rather than left unknown: the error-body recognizer is gated on the
+  // `ws-realtime.drift.ts` frame and hardcodes the openai-realtime surface, so an
+  // error-carrying timeout on ANY OTHER WS surface — including gemini-live, the
+  // one actually going quiet — is not attributed and still exits 5. Closing that
+  // means resolving the handshake lane's surface from the frame (both slugs are
+  // already in SURFACE_REGISTRY) instead of hardcoding one; it is NOT closed here
+  // because that variant has never been observed in a real run and the fix would
+  // move display strings that drift-remediation-strings.test.ts pins.
+  it.each([
+    ["ws-realtime.drift.ts", 1, 0, 0, 2],
+    ["ws-gemini-live.drift.ts", 0, 1, 0, 5],
+  ])(
+    "a timeout carrying an error body from %s → entries=%i quarantine=%i timeouts=%i exit=%i",
+    (frame, wantEntries, wantQuarantine, wantTimeouts, wantExit) => {
+      const msg =
+        "Error: waitUntil timeout after 30000ms. Collected 1 messages: [error] " +
+        'bodies=[{"type":"error","error":{"type":"invalid_request_error",' +
+        '"code":"bad_setup","message":"nope"}}]\n' +
+        "    at Timeout._onTimeout (/repo/src/__tests__/drift/ws-providers.ts:319:23)\n" +
+        `    at /repo/src/__tests__/drift/${frame}:88:11`;
+      const result = makeResult([
+        makeAssertion({
+          status: "failed",
+          ancestorTitles: ["Gemini Live WS drift"],
+          title: "WS text event sequence and shapes match",
+          failureMessages: [msg],
+        }),
+      ]);
+      expect(entriesOf(result)).toHaveLength(wantEntries);
+      expect(quarantineOf(result)).toHaveLength(wantQuarantine);
+      expect(timeoutsOf(result)).toHaveLength(wantTimeouts);
+      expect(exitCodeOf(result)).toBe(wantExit);
+    },
+  );
+
   it("a WS handshake failure WITH an error body is still critical drift, not a timeout", () => {
     // parseWSHandshakeFailure runs first and must keep its claim.
     const handshake =
