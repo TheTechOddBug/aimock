@@ -357,6 +357,8 @@ export const deprecatedFamilies: Record<Provider, Set<string>> = {
   ]),
   gemini: familySet("gemini", [
     // drift-sync appends recorded deprecations here.
+    "gemini-2.0-flash", // DEPRECATED 2026-08-12 (drift-sync): absent from live /models; still referenced in aimock source — mock retained
+    "gemini-2.0-flash-lite", // DEPRECATED 2026-08-12 (drift-sync): absent from live /models; no remaining aimock reference — droppable from includeFamilies in a reviewed re-pin
   ]),
 };
 
