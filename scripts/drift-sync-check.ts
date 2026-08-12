@@ -30,6 +30,23 @@
  * above is a plain data check. A sync that fails any of them is NOT resolved
  * and no PR opens (mirrors the predicate's fail-closed contract, spec §3).
  *
+ * WHAT GATE-3 IS AND IS NOT (run 31465219443, 2026-08-11). The re-collect runs
+ * in the same workspace as the fix, so it can FILTER a cheat but cannot PROVE
+ * correctness — that has always been its contract. What it also cannot do is
+ * answer a question about an edit it has no surface for: two consecutive runs of
+ * the identical changeset `74f6efa43753f7d0` (two gemini deprecations) got
+ * `gate-failed` and then `ok-applied`, because gate-3's input is a fresh LIVE
+ * observation of EVERY drift surface aimock has, and nothing about that is a
+ * function of the changeset. So gate-3 now:
+ *
+ *   * is SKIPPED, with the reason recorded in the verdict, when the caller knows
+ *     a re-collect cannot observe this run's edit (`skipRecollect`);
+ *   * REFUSES on a positive critical finding and NAMES the diffs, so the next
+ *     refusal is triageable from the log instead of being a bare count;
+ *   * stops claiming "clean re-collect" for a zero it cannot believe — a
+ *     quarantined or AG-UI-skipped report is reported as UNCONFIRMED, carried by
+ *     gates 1 and 2 (see `reportTrustNote`).
+ *
  * C5 only ADDS this script + its test. Wiring it into `fix-drift.yml` in place
  * of the "Assert drift truly resolved" step, and deleting
  * `drift-success-predicate.ts`, is C3's job.
@@ -145,12 +162,83 @@ export function runPinCheck(
 
 const DEFAULT_RECOLLECT_OUT = "drift-report.sync-check.json";
 
+/** One residual critical diff, identified well enough to triage without re-running anything. */
+export interface CriticalDiffRef {
+  provider: string;
+  scenario: string;
+  path: string;
+  id?: string;
+}
+
+/**
+ * Every `severity === "critical"` diff in a report, IDENTIFIED.
+ *
+ * The gate used to carry only a COUNT into its verdict, and the re-collect report
+ * itself (`drift-report.sync-check.json`) is never uploaded by the workflow. So
+ * `gate-failed … still reports 1 critical diff(s)` was the entire record of run
+ * 31465219443 — which diff fired that morning is NOT recoverable from it. Naming
+ * the diffs is what makes the next one diagnosable from the log alone.
+ */
+export function listCriticalDiffs(report: DriftReport): CriticalDiffRef[] {
+  return report.entries.flatMap((entry) =>
+    entry.diffs
+      .filter((d) => d.severity === "critical")
+      .map((d) => ({
+        provider: entry.provider,
+        scenario: entry.scenario,
+        path: d.path,
+        ...(d.id !== undefined ? { id: d.id } : {}),
+      })),
+  );
+}
+
 /** Count `severity === "critical"` diffs across every entry of a report. */
 export function countCriticalDiffs(report: DriftReport): number {
-  return report.entries.reduce(
-    (sum, entry) => sum + entry.diffs.filter((d) => d.severity === "critical").length,
-    0,
-  );
+  return listCriticalDiffs(report).length;
+}
+
+/** Render `listCriticalDiffs` output for a verdict detail line. */
+export function formatCriticalDiffs(diffs: readonly CriticalDiffRef[]): string {
+  return diffs.map((d) => `${d.provider}/${d.scenario}: ${d.id ?? d.path}`).join("; ");
+}
+
+/**
+ * Can a ZERO critical count in this report be believed as "the live suite is
+ * clean", or did the collector fail to make a trustworthy, complete observation?
+ *
+ * The collector writes `conclusion` from its own exit code
+ * (`conclusionForExitCode`): "clean" (0), "critical" (2), "quarantine" (5 — a
+ * failure it could not parse into a trustworthy finding) or "skipped" (1 — the
+ * AG-UI drift leg could not run, so `entries` is missing that whole surface).
+ * Only "clean" and "critical" are positive determinations.
+ *
+ * This gate used to read `entries` alone, so a quarantined or AG-UI-skipped
+ * re-collect counted zero criticals and was reported as a "clean re-collect" —
+ * an UNKNOWN collapsing into the answer that passes. Both mornings of the
+ * 74f6efa43753f7d0 pair quarantined on the same live Gemini WS timeout, and the
+ * 08-12 log claims a clean re-collect for it.
+ *
+ * A zero that cannot be believed does not become a REFUSAL — a refusal would red
+ * an unattended cron on someone else's flaky live surface. It stops being a CLAIM:
+ * the verdict says the re-collect could not confirm the edit, and gate-1 and
+ * gate-2 carry it. A positive critical finding is still a refusal (see
+ * `evaluateSyncCheck`) — an UNKNOWN must not veto, but a POSITIVE finding must.
+ */
+export function reportTrustNote(report: DriftReport): string | null {
+  const quarantined = report.quarantine?.length ?? 0;
+  if (quarantined > 0) {
+    return `the collector quarantined ${quarantined} failure(s) it could not parse into a trustworthy finding`;
+  }
+  if (report.conclusion === undefined) {
+    return "the report carries no `conclusion`, so the collector's own verdict on it is unknown";
+  }
+  if (report.conclusion === "skipped") {
+    return "the collector's AG-UI drift leg could not run, so the report is missing that surface entirely";
+  }
+  if (report.conclusion !== "clean" && report.conclusion !== "critical") {
+    return `the collector reported conclusion="${report.conclusion}", which is not a positive determination`;
+  }
+  return null;
 }
 
 /**
@@ -200,15 +288,19 @@ export interface SyncCheckDeps {
 export interface EvaluateSyncCheckOptions {
   /**
    * Run gate-1 (allowlist) + gate-2 (pin) but SKIP gate-3 (the live
-   * re-collect). Used by the sync core for a run that applied a mechanical
-   * registry edit but ALSO deferred a family to a human: a fresh collector run
-   * would still (correctly) report that deferred family as residual critical
-   * drift, so gate-3 is not a meaningful full-resolution check for such a run
-   * and — left on — would wrongly revert the valid mechanical edit. Gate-1 and
-   * gate-2 remain in force: the edit is still proven data-only with the frozen
-   * classification logic intact.
+   * re-collect), because for THIS run's edit a fresh collector run cannot
+   * answer the question gate-3 asks. Two such runs exist — see
+   * `gate3SkipReason` in drift-sync.ts for both, with their evidence. Gate-1
+   * and gate-2 remain in force: the edit is still proven data-only with the
+   * frozen classification logic intact.
    */
   skipRecollect?: boolean;
+  /**
+   * WHY gate-3 was skipped, quoted into the verdict detail. Required whenever
+   * `skipRecollect` is set: a skipped gate that does not say what it could not
+   * observe reads in the log exactly like a gate that ran and passed.
+   */
+  skipRecollectReason?: string;
 }
 
 export interface SyncCheckVerdict {
@@ -249,26 +341,55 @@ export function evaluateSyncCheck(
     };
   }
 
-  // gate-3 (live re-collect) is skipped for a run that ALSO deferred a family
-  // to a human — see EvaluateSyncCheckOptions.skipRecollect.
+  // gate-3 (live re-collect) is skipped when it cannot observe THIS run's edit —
+  // see EvaluateSyncCheckOptions.skipRecollect.
   if (opts.skipRecollect) {
+    // A skip with no stated reason reads in the log exactly like a gate that ran
+    // and passed, so it is a CONFIG ERROR rather than a silent default: the
+    // caller that turns gate-3 off must say what it could not observe.
+    if (!opts.skipRecollectReason) {
+      throw new SyncCheckConfigError(
+        "skipRecollect was set with no skipRecollectReason — a gate that is turned off " +
+          "must record why, or its verdict is indistinguishable from a gate that ran",
+      );
+    }
     return {
       ok: true,
       reason: SyncCheckReason.OK,
       detail:
         "drift-sync-check passed: changed files are data-only, classification pins intact " +
-        "(live re-collect skipped — this run also deferred a family to a human)",
+        `(live re-collect NOT RUN — ${opts.skipRecollectReason}; ` +
+        "this edit is carried by gate-1 + gate-2, not by a re-collect)",
       offendingFiles: [],
     };
   }
 
   const report = deps.recollect();
-  const criticalCount = countCriticalDiffs(report);
-  if (criticalCount > 0) {
+  const criticalDiffs = listCriticalDiffs(report);
+  if (criticalDiffs.length > 0) {
+    // A POSITIVE finding, so it refuses — and it names the diffs, because a bare
+    // count is not triageable after the fact (see `listCriticalDiffs`).
     return {
       ok: false,
       reason: SyncCheckReason.RESIDUAL_CRITICAL_DRIFT,
-      detail: `Clean re-collect after sync still reports ${criticalCount} critical diff(s) — sync did not resolve the drift`,
+      detail:
+        `Clean re-collect after sync still reports ${criticalDiffs.length} critical diff(s) — ` +
+        `sync did not resolve the drift: ${formatCriticalDiffs(criticalDiffs)}`,
+      offendingFiles: [],
+    };
+  }
+
+  // Zero criticals. Whether that zero is BELIEVABLE is a separate question — a
+  // quarantined or incomplete re-collect must not be reported as a clean one.
+  const trustNote = reportTrustNote(report);
+  if (trustNote !== null) {
+    return {
+      ok: true,
+      reason: SyncCheckReason.OK,
+      detail:
+        "drift-sync-check passed: changed files are data-only, classification pins intact " +
+        `(re-collect found no critical drift but could NOT CONFIRM the edit — ${trustNote}; ` +
+        "this edit is carried by gate-1 + gate-2)",
       offendingFiles: [],
     };
   }

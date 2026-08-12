@@ -285,6 +285,17 @@ jobs:
           elif [ "$EXIT_CODE" -eq 5 ]; then
             echo "::error::Drift collector quarantined unparseable output (exit 5) — manual triage required"
             exit "$EXIT_CODE"
+          elif [ "$EXIT_CODE" -eq 6 ]; then
+            # A live surface accepted the connection and then sent nothing, so its
+            # legs graded nothing. There is no collector fault to triage and no
+            # drift to attribute — failing the job here would say "the providers
+            # changed formats", which is not what happened. It is NOT swallowed
+            # either: each silent leg gets a named ::warning::, the report keeps
+            # its `timeouts[]`, and the `notify` job below alerts on exit 6 with
+            # its own wording. A day that graded nothing is never a clean day.
+            jq -r '.timeouts[]? | "::warning title=live-timeout::\(.testName) — \(if .serverClose then "session closed by the server (code \(.serverClose.code))" else "no messages in \(.timeoutMs)ms" end); nothing graded on this surface"' \
+              drift-report.json || true
+            echo "::warning::Drift collector: $(jq -r '.timeouts | length' drift-report.json) live leg(s) observed nothing (exit 6) — the surface is silent, not drifting. Nothing was graded there."
           elif [ "$EXIT_CODE" -ne 0 ]; then
             echo "::error::Collector script crashed with exit code $EXIT_CODE"
             exit "$EXIT_CODE"
@@ -348,6 +359,7 @@ jobs:
           AGUI_DRIFT=false
           INFRA_ERROR=false
           QUARANTINE=false
+          LIVE_TIMEOUT=false
 
           # Determine what happened in each job. An exit_code of 5 means the
           # collector QUARANTINED unparseable output — the drift job concludes
@@ -355,8 +367,18 @@ jobs:
           # triage, not a "providers changed formats" alert. Classify it as
           # quarantine FIRST, before the generic failure→HTTP_DRIFT fallback,
           # so an exit-5 quarantine is never misreported as real drift.
+          #
+          # An exit_code of 6 means a live surface went SILENT — its legs observed
+          # nothing, so nothing was graded there. The drift job stays green (this
+          # is not a format change and not a collector fault), which is exactly why
+          # it must be alerted explicitly: without this branch a silent surface
+          # would fall through to the good→good "stay quiet" path and nobody would
+          # learn that a surface stopped being checked. Classified before the
+          # generic fallbacks so it is never reported as real drift.
           if [ "$DRIFT_EXIT_CODE" = "5" ]; then
             QUARANTINE=true
+          elif [ "$DRIFT_EXIT_CODE" = "6" ]; then
+            LIVE_TIMEOUT=true
           elif [ "$DRIFT_RESULT" = "failure" ]; then
             HTTP_DRIFT=true
           elif [ "$DRIFT_RESULT" != "success" ] && [ "$DRIFT_RESULT" != "skipped" ]; then
@@ -400,6 +422,13 @@ jobs:
           if [ "$QUARANTINE" = "true" ]; then
             EMOJI="🔬"
             MSG="*Drift collector quarantined unparseable output* in aimock — manual triage required (not confirmed API drift).${DETAIL}${NL}${RUN_URL}"
+          # Live surface silent (collector exit 6): a live leg observed nothing at
+          # all, so that surface was NOT checked this run. Not drift, not a
+          # collector fault — but a surface that has stopped answering is worth
+          # knowing about, especially if it repeats day over day.
+          elif [ "$LIVE_TIMEOUT" = "true" ]; then
+            EMOJI="⏱️"
+            MSG="*Live drift surface went silent* in aimock — a live leg observed zero messages, so nothing was graded on that surface (not API drift, no collector triage needed). Repeats day over day mean the surface is rejecting or has retired the session, not a flake.${DETAIL}${NL}${RUN_URL}"
           # Both types of drift
           elif [ "$HTTP_DRIFT" = "true" ] && [ "$AGUI_DRIFT" = "true" ]; then
             EMOJI="🚨"
@@ -668,8 +697,15 @@ jobs:
             # the step's `set -euo pipefail`:
             #   exit 0 → clean, continue.
             #   exit 2 → drift present, NON-FATAL (report feeds the delta gate).
+            #   exit 6 → a live surface observed nothing on main — NON-FATAL. This
+            #            is a property of the world, not of the PR's diff, and it
+            #            is what used to block every drift PR: a silent surface was
+            #            reported as unparseable output and hard-failed the base
+            #            leg. The delta gate handles it correctly on its own — a
+            #            surface that graded nothing contributes no keys to either
+            #            side, so nothing is blamed on the diff.
             #   exit 5 → quarantine (unparseable output) — genuine fault, FAIL.
-            #   any other non-{0,2} → genuine collector fault, FAIL.
+            #   any other non-{0,2,6} → genuine collector fault, FAIL.
             set +e
             npx tsx scripts/drift-report-collector.ts \
               --out "$GITHUB_WORKSPACE/drift-report-base.json"
@@ -680,7 +716,11 @@ jobs:
               echo "::error::Base collector quarantined unparseable output (exit 5) — manual triage required"
               exit "$BASE_EXIT"
             fi
-            if [ "$BASE_EXIT" -ne 0 ] && [ "$BASE_EXIT" -ne 2 ]; then
+            if [ "$BASE_EXIT" -eq 6 ]; then
+              jq -r '.timeouts[]? | "::warning title=live-timeout (base)::\(.testName) — \(if .serverClose then "session closed by the server (code \(.serverClose.code))" else "no messages in \(.timeoutMs)ms" end); this surface was not graded on main"' \
+                drift-report-base.json || true
+            fi
+            if [ "$BASE_EXIT" -ne 0 ] && [ "$BASE_EXIT" -ne 2 ] && [ "$BASE_EXIT" -ne 6 ]; then
               echo "::error::Base collector faulted (exit $BASE_EXIT) — not a drift signal"
               exit "$BASE_EXIT"
             fi
@@ -726,8 +766,12 @@ jobs:
           # with `set +e`/`set -e` and treat it as DATA:
           #   exit 0 → clean, continue.
           #   exit 2 → drift present, NON-FATAL (report feeds the delta gate).
+          #   exit 6 → a live surface observed nothing — NON-FATAL, same rationale
+          #            as the base leg: a silent provider is not something this
+          #            diff did, and a surface that graded nothing contributes no
+          #            delta keys, so the gate cannot blame the PR for it.
           #   exit 5 → quarantine (unparseable output) — genuine fault, FAIL.
-          #   any other non-{0,2} → genuine collector fault, FAIL.
+          #   any other non-{0,2,6} → genuine collector fault, FAIL.
           set +e
           npx tsx scripts/drift-report-collector.ts --out drift-report-head.json
           HEAD_EXIT=$?
@@ -736,11 +780,15 @@ jobs:
             echo "::error::Head collector quarantined unparseable output (exit 5) — manual triage required"
             exit "$HEAD_EXIT"
           fi
-          if [ "$HEAD_EXIT" -ne 0 ] && [ "$HEAD_EXIT" -ne 2 ]; then
+          if [ "$HEAD_EXIT" -eq 6 ]; then
+            jq -r '.timeouts[]? | "::warning title=live-timeout (head)::\(.testName) — \(if .serverClose then "session closed by the server (code \(.serverClose.code))" else "no messages in \(.timeoutMs)ms" end); this surface was not graded on the PR ref"' \
+              drift-report-head.json || true
+          fi
+          if [ "$HEAD_EXIT" -ne 0 ] && [ "$HEAD_EXIT" -ne 2 ] && [ "$HEAD_EXIT" -ne 6 ]; then
             echo "::error::Head collector faulted (exit $HEAD_EXIT) — not a drift signal"
             exit "$HEAD_EXIT"
           fi
-          echo "head: collector exit $HEAD_EXIT (0 clean / 2 drift-present — both non-fatal here)"
+          echo "head: collector exit $HEAD_EXIT (0 clean / 2 drift-present / 6 live surface silent — all non-fatal here)"
 
       - name: Upload base drift report
         if: always()

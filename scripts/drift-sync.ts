@@ -705,12 +705,15 @@ export interface SyncCoreDeps {
   writeProposalNote: (relPath: string, text: string) => void;
   /**
    * Run C5's drift-sync-check gate. `opts.skipRecollect` runs gate-1
-   * (allowlist) + gate-2 (pin) but SKIPS gate-3 (the live re-collect) — used
-   * when this run applied a mechanical edit AND also deferred a family to a
-   * human, so a fresh collector run would still (correctly) see that deferred
-   * family as residual critical drift.
+   * (allowlist) + gate-2 (pin) but SKIPS gate-3 (the live re-collect), for the
+   * runs where a fresh collector pass cannot answer gate-3's question — see
+   * {@link gate3SkipReason} for the two cases and their evidence.
+   * `opts.skipRecollectReason` carries WHY into the verdict detail.
    */
-  runSyncCheck: (opts?: { skipRecollect?: boolean }) => SyncCheckResultLike;
+  runSyncCheck: (opts?: {
+    skipRecollect?: boolean;
+    skipRecollectReason?: string;
+  }) => SyncCheckResultLike;
   /** Revert every file in `relPaths` (e.g. `git checkout -- <paths>`) after a failed gate. */
   revertFiles: (relPaths: string[]) => void;
   now?: () => Date;
@@ -736,6 +739,54 @@ export interface SyncCoreOutcome {
   detail: string;
   outcomes: FamilyOutcome[];
   skipped: { provider: Provider; reason: string }[];
+}
+
+/**
+ * WHY gate-3 (the live re-collect) cannot answer this run's question, or `null`
+ * when it can. The returned string is quoted verbatim into the gate's verdict.
+ *
+ * Gate-3 re-runs the WHOLE live drift suite and vetoes on its GLOBAL critical
+ * count. That is only a meaningful verdict on THIS run's edit when the suite has
+ * a surface that observes the edit. Two runs where it does not:
+ *
+ *  1. A MIXED RUN (a mechanical edit PLUS a family deferred to a human). A fresh
+ *     collector pass still (correctly) reports the deferred family as residual
+ *     critical drift, so gate-3 would revert the valid edit alongside it. This is
+ *     the long-standing D-M1 case.
+ *
+ *  2. A DEPRECATION-ONLY RUN. The edit appends a family literal to
+ *     `deprecatedFamilies`, and NOTHING in the collector's suite glob
+ *     (`src/__tests__/drift/**\/*.drift.ts`, per vitest.config.drift.ts) reads
+ *     `deprecatedFamilies`: the only LIVE model-family canary is the
+ *     UNCLASSIFIED direction (`unclassifiedFamilies` — live minus classified),
+ *     while the deprecation direction (`detectDeprecatedFamilies` — classified
+ *     minus live) is exercised only OFFLINE against injected payloads. A recorded
+ *     deprecation therefore cannot change a single collector output, so gate-3
+ *     can neither confirm nor refute it — it can only veto it on whatever
+ *     unrelated drift the live suite happened to see that morning. It did exactly
+ *     that: the identical changeset `74f6efa43753f7d0` was refused as
+ *     `gate-failed` on 2026-08-11 (run 31465219443, "still reports 1 critical
+ *     diff(s)") and applied as `ok-applied` on 2026-08-12 (run 31570802134, PR
+ *     #370) — a daily cron reddening at random on a correct edit, and reporting
+ *     it as "the mechanical edit was wrong".
+ *
+ *     That premise is PINNED by `drift-sync-gate-determinism.test.ts`: if a live
+ *     deprecation canary is ever added to a `*.drift.ts`, that test reds and
+ *     sends whoever added it here.
+ *
+ * An `added` run is NOT on this list, and must not be: appending to
+ * `includeFamilies` makes the unclassified canary stop reporting the family, so
+ * gate-3 genuinely observes that edit — including an approved addition that
+ * landed in the wrong provider's array, which the canary still reports.
+ */
+export function gate3SkipReason(outcomes: readonly FamilyOutcome[]): string | null {
+  if (outcomes.some((o) => o.action.startsWith("needs-human-"))) {
+    return "this run also deferred a family to a human, which a fresh collector pass would still report as residual critical drift";
+  }
+  if (!outcomes.some((o) => o.action === "added")) {
+    return "this run only RECORDED deprecations, and no live drift surface reads deprecatedFamilies — a re-collect cannot observe this edit";
+  }
+  return null;
 }
 
 /** Read-or-create a dedup note (write only on first sighting — re-fire never spams a duplicate). */
@@ -1006,14 +1057,16 @@ export function runDriftSyncCore(
   // A mechanical registry edit WAS applied — persist it and gate it. Gate-1
   // (allowlist) and gate-2 (pin) always apply: they cheaply prove the edit
   // stayed on the data-only surface and left the frozen classification logic
-  // intact. Gate-3 (the live re-collect) only makes sense when this run CLAIMS
-  // to have fully resolved the drift — i.e. no family was simultaneously
-  // deferred to a human. In a mixed run (a valid registry edit PLUS a family
-  // routed to a human), the re-collect would (correctly) still see that deferred
-  // family as residual drift and would wrongly revert the valid edit (D-M1,
-  // mixed-run leg), so skip gate-3 and report NEEDS_HUMAN with the edit kept.
+  // intact. Gate-3 (the live re-collect) runs only when the live suite has a
+  // surface that can actually observe THIS run's edit — `gate3SkipReason` names
+  // the two runs where it does not, with the evidence.
   deps.writeRegistrySource(registrySource);
-  const verdict = deps.runSyncCheck({ skipRecollect: anyNeedsHuman });
+  const skipReason = gate3SkipReason(outcomes);
+  const verdict = deps.runSyncCheck(
+    skipReason !== null
+      ? { skipRecollect: true, skipRecollectReason: skipReason }
+      : { skipRecollect: false },
+  );
   if (!verdict.ok) {
     deps.revertFiles([...touchedFiles]);
     return {
@@ -1246,7 +1299,10 @@ const REAL_SYNC_CORE_DEPS: SyncCoreDeps = {
         runPinCheck: () => runPinCheck(),
         recollect: () => recollect(),
       },
-      { skipRecollect: opts?.skipRecollect },
+      {
+        skipRecollect: opts?.skipRecollect,
+        skipRecollectReason: opts?.skipRecollectReason,
+      },
     );
     return { ok: verdict.ok, reason: verdict.reason, detail: verdict.detail };
   },

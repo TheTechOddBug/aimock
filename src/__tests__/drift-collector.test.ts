@@ -29,12 +29,20 @@ import {
   computeExitCode,
   conclusionForExitCode,
   classifyUnparseableAsInfra,
+  parseLiveTimeout,
+  parseWSServerClose,
+  isRefusalCloseCode,
   INFRA_INDICATOR_SOURCES,
   infraIndicatorSample,
   NO_GA_DELTA_ID,
   TRUNCATED_DELTA_ID,
 } from "../../scripts/drift-report-collector.js";
-import type { DriftEntry, QuarantineEntry, ParsedDiff } from "../../scripts/drift-types.js";
+import type {
+  DriftEntry,
+  QuarantineEntry,
+  TimeoutEntry,
+  ParsedDiff,
+} from "../../scripts/drift-types.js";
 import { SURFACE_REGISTRY, KNOWN_SURFACE_SLUGS, isKnownSurface } from "./drift/surface-registry.js";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
@@ -55,14 +63,24 @@ function quarantineOf(result: VitestJsonResult): QuarantineEntry[] {
   return collectDriftEntries(result).quarantine;
 }
 
-/** The exit code main() would emit for a given collect result (agUiSkipped=false). */
-function exitCodeOf(result: VitestJsonResult): 0 | 1 | 2 | 5 {
-  const { entries, quarantine } = collectDriftEntries(result);
+function timeoutsOf(result: VitestJsonResult): TimeoutEntry[] {
+  return collectDriftEntries(result).timeouts;
+}
+
+/**
+ * The exit code main() would emit for a given collect result (agUiSkipped=false).
+ *
+ * Forwards EVERY lane main() forwards, timeouts included. A helper that dropped
+ * a lane would report an exit code the collector never emits, and every taxonomy
+ * assertion routed through it would be measuring the helper.
+ */
+function exitCodeOf(result: VitestJsonResult): 0 | 1 | 2 | 5 | 6 {
+  const { entries, quarantine, timeouts } = collectDriftEntries(result);
   const criticalCount = entries.reduce(
     (sum, e) => sum + e.diffs.filter((d) => d.severity === "critical").length,
     0,
   );
-  return computeExitCode(criticalCount, quarantine.length, false);
+  return computeExitCode(criticalCount, quarantine.length, false, timeouts.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -482,10 +500,11 @@ describe("collectDriftEntries", () => {
     expect(exitCodeOf(result)).toBe(2);
   });
 
-  it("does NOT recognize a bare WS network timeout (zero messages, no error body) as handshake drift → stays quarantined (exit 5)", () => {
-    // A genuine transient network flake times out having collected ZERO
-    // messages and carries no provider `error` body. It must NOT be reclassified
-    // as protocol drift — it stays in the quarantine lane for human review.
+  it("does NOT recognize a bare WS timeout (zero messages, no error body) as handshake drift → live-timeout lane (exit 6), NOT drift and NOT quarantine", () => {
+    // A zero-observation timeout carries no provider `error` body, so it must NOT
+    // be reclassified as protocol drift. Nor is it unparseable: the message states
+    // the wait budget and that zero messages arrived. It lands in the live-timeout
+    // lane (exit 6) — see parseLiveTimeout.
     const bareTimeout =
       "Error: waitUntil timeout after 30000ms. Collected 0 messages: []\n" +
       "    at openaiRealtimeWS (/repo/src/__tests__/drift/ws-providers.ts:372:20)\n" +
@@ -499,8 +518,9 @@ describe("collectDriftEntries", () => {
       }),
     ]);
     expect(entriesOf(result)).toEqual([]);
-    expect(quarantineOf(result)).toHaveLength(1);
-    expect(exitCodeOf(result)).toBe(5);
+    expect(quarantineOf(result)).toEqual([]);
+    expect(timeoutsOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(6);
   });
 
   it("returns valid entries and tolerates unparseable failures mixed in", () => {
@@ -1056,6 +1076,699 @@ describe("collectDriftEntries", () => {
       // Critical dominates: exit 2, not 5.
       expect(exitCodeOf(result)).toBe(2);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// An empty field value must not eat the next entry
+//
+// `compareShapes` sets `mock: ""` on every diff it produces, and the entry regex
+// used `Mock:\s*(.+)`. `\s` matches newlines, so on an empty value the greedy
+// `\s*` ran past the end of its own line and `(.+)` matched the NEXT ENTRY'S
+// header, consuming it whole. When the swallowed entry was the critical one,
+// `criticalCount` fell to 0 and the collector reported `conclusion: "clean"` —
+// the failure state and the working state were observationally identical, which
+// is the worst shape a defect can have here.
+//
+// SCOPE, measured rather than assumed: the trigger is ONE empty-`mock` entry that
+// has a successor. It is NOT limited to consecutive empty values (a block whose
+// only empty value sits in the middle loses its THIRD entry), and a trailing
+// empty-`mock` entry survives (the capture falls back to the value's own trailing
+// spaces). Two live surfaces emit compareShapes-derived blocks —
+// `fal-queue.drift.ts` and `video.drift.ts` — where the value is empty on 100% of
+// diffs, so a block of N entries lost floor(N/2) of them.
+//
+// The round-trip property below is the non-recurring part: it asserts through the
+// REAL emitter and the REAL parser that what a block PRINTS is what the collector
+// COLLECTS, across every empty/filled permutation. Any future separator that can
+// cross a newline fails it without anyone having to think of this case again.
+// ---------------------------------------------------------------------------
+
+describe("what a drift block prints is what the collector collects", () => {
+  const diff = (
+    n: number,
+    mock: string,
+    severity: ShapeDiff["severity"] = "warning",
+  ): ShapeDiff => ({
+    path: `field${n}`,
+    severity,
+    issue: `issue ${n}`,
+    expected: "e",
+    real: "r",
+    mock,
+  });
+  const EMPTY = "";
+  const FILLED = "<absent>";
+
+  // Every permutation of empty/filled `mock` up to 3 entries, plus the 4-entry
+  // all-empty case that shows the loss compounding.
+  const permutations: string[][] = [
+    [EMPTY],
+    [FILLED],
+    [EMPTY, EMPTY],
+    [EMPTY, FILLED],
+    [FILLED, EMPTY],
+    [FILLED, FILLED],
+    [EMPTY, EMPTY, EMPTY],
+    [FILLED, EMPTY, FILLED],
+    [EMPTY, FILLED, EMPTY],
+    [EMPTY, EMPTY, EMPTY, EMPTY],
+  ];
+
+  it.each(permutations.map((m) => [m.map((x) => (x === EMPTY ? "empty" : "filled")).join("+"), m]))(
+    "round-trips every entry when the mock values are %s",
+    (_label, mocks) => {
+      const diffs = (mocks as string[]).map((m, i) => diff(i + 1, m));
+      const parsed = parseDriftBlock(formatDriftReport("Round-trip probe", diffs));
+      expect(parsed).not.toBeNull();
+      // Path is the identity here, so a swallowed entry shows up as a missing path
+      // rather than as a count that happens to match for the wrong reason.
+      expect(parsed!.diffs.map((d) => d.path)).toEqual(diffs.map((d) => d.path));
+      expect(parsed!.diffs.map((d) => d.mock)).toEqual(diffs.map((d) => d.mock));
+    },
+  );
+
+  it("a critical diff behind an empty-mock entry survives to the exit code", () => {
+    // The exact loss shape: two entries, both empty `mock` (what compareShapes
+    // emits), critical SECOND. Before the fix the critical was consumed by its
+    // predecessor and the collector exited 0 "clean".
+    const diffs = [diff(1, EMPTY, "warning"), diff(2, EMPTY, "critical")];
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["OpenAI Chat Completions drift"],
+        title: "non-streaming text matches real API",
+        failureMessages: [formatDriftReport("OpenAI Chat (non-streaming text)", diffs)],
+      }),
+    ]);
+    const entries = entriesOf(result);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].diffs.map((d) => d.severity)).toEqual(["warning", "critical"]);
+    // The whole point: a printed critical reaches the exit code.
+    expect(exitCodeOf(result)).toBe(2);
+  });
+
+  it("an empty value is captured as empty, never as the next entry's text", () => {
+    const diffs = [diff(1, EMPTY), diff(2, FILLED)];
+    const parsed = parseDriftBlock(formatDriftReport("probe", diffs))!;
+    expect(parsed.diffs[0].mock).toBe("");
+    expect(parsed.diffs[0].mock).not.toContain("issue 2");
+  });
+
+  it("every labelled field tolerates an empty value, not just Mock", () => {
+    // The sibling separators had the identical hazard; an empty `real`/`expected`
+    // would have crossed a newline the same way.
+    const diffs: ShapeDiff[] = [
+      { path: "p1", severity: "warning", issue: "i1", expected: "", real: "", mock: "" },
+      { path: "p2", severity: "critical", issue: "i2", expected: "e", real: "r", mock: "m" },
+    ];
+    const parsed = parseDriftBlock(formatDriftReport("probe", diffs))!;
+    expect(parsed.diffs.map((d) => d.path)).toEqual(["p1", "p2"]);
+    expect(parsed.diffs[1].severity).toBe("critical");
+  });
+
+  it("NEGATIVE CONTROL: a numbered list in prose is still not an entry", () => {
+    // `^` anchoring is what keeps the looser value captures from inventing entries
+    // out of ordinary text that happens to contain a numbered line mid-sentence.
+    const text =
+      "API DRIFT DETECTED: Prose probe\n" +
+      "  the provider docs say 1. [critical] do not do this\n" +
+      "     Path:    nope\n" +
+      "     SDK:     nope\n" +
+      "     Real:    nope\n" +
+      "     Mock:    nope\n";
+    expect(parseDriftBlock(text)!.diffs).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Server-initiated CLOSE: refusal vs hang-up vs silence
+//
+// `fix/ws-preserve-close-code` taught the drift probe to preserve an RFC 6455
+// CLOSE frame instead of discarding it, which introduces a failure string no
+// parser here had seen:
+//
+//   WSClosedError: WebSocket closed by server during waitUntil: code=1008
+//   reason="Requested model is not supported for BidiGenerateContent.".
+//   Collected 0 messages: [] bodies=[]
+//
+// Measured against this collector before the refusal lane existed, that string
+// matched no infra indicator, no handshake recognizer and no timeout recognizer,
+// and landed on `exit 5 — manual triage`. That is the same daily hard stop the
+// timeout lane was built to remove, re-entering through a new input.
+//
+// So there are now THREE lanes and they must stay distinguishable, because
+// telling them apart is the whole point:
+//   - REFUSAL — the frame names something WE sent as unacceptable → attributed
+//     critical drift (exit 2), with the code and reason carried into the report.
+//   - HANG-UP — the peer left for its own reasons (1011 internal error, 1012
+//     restarting, 1000 normal) → nothing graded, exit 6. NOT a finding: calling a
+//     provider's own hiccup "drift" pages the team and hands it to the auto-fixer.
+//   - SILENCE / GARBAGE — unchanged: exit 6 and exit 5 respectively.
+// ---------------------------------------------------------------------------
+
+/** The exact shape `fix/ws-preserve-close-code` emits, per its own source template. */
+function wsServerClose(code: number, reason: string, collected = 0): string {
+  return (
+    `WSClosedError: WebSocket closed by server during waitUntil: code=${code} ` +
+    `reason=${JSON.stringify(reason)}. Collected ${collected} messages: [] bodies=[]\n` +
+    "    at Timeout._onTimeout (/repo/src/__tests__/drift/ws-providers.ts:319:23)\n" +
+    "    at /repo/src/__tests__/drift/ws-gemini-live.drift.ts:88:11"
+  );
+}
+
+function resultFor(message: string, ancestor = "Gemini Live WS drift"): VitestJsonResult {
+  return makeResult([
+    makeAssertion({
+      status: "failed",
+      ancestorTitles: [ancestor],
+      title: "WS text event sequence and shapes match",
+      failureMessages: [message],
+    }),
+  ]);
+}
+
+describe("a provider that closes the session states its own cause", () => {
+  const GEMINI_REASON = "Requested model is not supported for BidiGenerateContent.";
+
+  it("the production refusal (code 1008) becomes attributed critical drift, not triage", () => {
+    const result = resultFor(wsServerClose(1008, GEMINI_REASON));
+    expect(quarantineOf(result)).toEqual([]);
+    expect(timeoutsOf(result)).toEqual([]);
+    const entries = entriesOf(result);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].provider).toBe("Gemini Live");
+    expect(entries[0].builderFile).toBe("src/ws-gemini-live.ts");
+    expect(entries[0].scenario).toBe("WS session refused");
+    expect(exitCodeOf(result)).toBe(2);
+  });
+
+  it("the close code AND the stated reason survive into the report", () => {
+    // The reason is the entire diagnosis; an entry that dropped it would be
+    // actionable in name only.
+    const diff = entriesOf(resultFor(wsServerClose(1008, GEMINI_REASON)))[0].diffs[0];
+    expect(diff.severity).toBe("critical");
+    expect(diff.issue).toContain("1008");
+    expect(diff.issue).toContain(GEMINI_REASON);
+    expect(diff.real).toContain(GEMINI_REASON);
+    expect(diff.id).toBe("ws-close:1008");
+  });
+
+  it("the delta key is the close CODE, so rewording the reason does not move it", () => {
+    // Providers reword reason prose freely. A key derived from it would re-report
+    // the same standing refusal as new-in-head on every PR.
+    const a = entriesOf(resultFor(wsServerClose(1008, "Requested model is not supported.")))[0];
+    const b = entriesOf(resultFor(wsServerClose(1008, "totally different wording")))[0];
+    expect(a.diffs[0].id).toBe(b.diffs[0].id);
+  });
+
+  it("a reason containing quotes, backslashes and newlines is decoded, not mangled", () => {
+    // The probe emits the reason JSON-quoted, so it is decoded with JSON.parse
+    // rather than by hand — provider text is not under our control.
+    const nasty = 'model "x\\y" is bad\nsecond line';
+    const diff = entriesOf(resultFor(wsServerClose(1008, nasty)))[0].diffs[0];
+    expect(diff.real).toContain(nasty);
+  });
+
+  it.each([
+    [1002, "protocol error"],
+    [1003, "unsupported data"],
+    [1007, "invalid payload"],
+    [1008, "policy violation"],
+    [1009, "message too big"],
+    [1010, "mandatory extension missing"],
+    [4000, "provider-defined"],
+    [4999, "provider-defined upper bound"],
+  ])("close code %i (%s) is a refusal → exit 2", (code) => {
+    expect(isRefusalCloseCode(code as number)).toBe(true);
+    expect(exitCodeOf(resultFor(wsServerClose(code as number, "why")))).toBe(2);
+  });
+
+  it.each([
+    [1000, "normal closure"],
+    [1001, "going away"],
+    [1004, "reserved, never assigned"],
+    [1005, "no status received — never sent on the wire"],
+    [1006, "abnormal closure — never sent on the wire"],
+    [1011, "server internal error"],
+    [1012, "service restarting"],
+    [1013, "try again later"],
+    [1015, "TLS handshake failure"],
+    [3999, "below the application range"],
+    [5000, "above the application range"],
+  ])("NEGATIVE CONTROL: close code %i (%s) is a hang-up, NOT drift → exit 6", (code) => {
+    // Treating a provider's own hiccup as drift pages the team and feeds the
+    // auto-fixer a phantom finding. It is surfaced, not swallowed and not blamed.
+    expect(isRefusalCloseCode(code as number)).toBe(false);
+    const result = resultFor(wsServerClose(code as number, "peer left"));
+    expect(entriesOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toEqual([]);
+    const timeouts = timeoutsOf(result);
+    expect(timeouts).toHaveLength(1);
+    expect(timeouts[0].serverClose).toEqual({ code: code as number, reason: "peer left" });
+    expect(exitCodeOf(result)).toBe(6);
+  });
+
+  it("a hang-up is distinguishable from silence in the record, not just in the exit code", () => {
+    // Both are exit 6, so the report is the only place a reader can tell "the peer
+    // hung up on us" from "nobody said anything". It has to carry that.
+    const hangUp = timeoutsOf(resultFor(wsServerClose(1011, "internal error")))[0];
+    expect(hangUp.serverClose).toEqual({ code: 1011, reason: "internal error" });
+    expect(hangUp.timeoutMs).toBeUndefined();
+
+    const silence = timeoutsOf(resultFor(CI_ZERO_OBSERVATION_TIMEOUT))[0];
+    expect(silence.serverClose).toBeUndefined();
+    expect(silence.timeoutMs).toBe(30000);
+  });
+
+  it("NEGATIVE CONTROL: silence is STILL exit 6 and garbage is STILL exit 5", () => {
+    // The two pre-existing lanes must be untouched by the third.
+    expect(exitCodeOf(resultFor(CI_ZERO_OBSERVATION_TIMEOUT))).toBe(6);
+    const garbage = resultFor(
+      "AssertionError: expected 'gpt-4o-realtime' to be one of\n    at /repo/src/a.ts:1:1",
+      "Some unmapped suite",
+    );
+    expect(quarantineOf(garbage)).toHaveLength(1);
+    expect(exitCodeOf(garbage)).toBe(5);
+  });
+
+  it("NEGATIVE CONTROL: a refusal from an UNREGISTERED probe quarantines, and says why", () => {
+    // An unattributable refusal must not be guessed at — but the quarantine
+    // message must name the refusal and the missing registration, not read as
+    // "unparseable".
+    const msg = wsServerClose(1008, GEMINI_REASON).replace(
+      "ws-gemini-live.drift.ts",
+      "ws-something-new.drift.ts",
+    );
+    const result = resultFor(msg, "Some future WS drift");
+    expect(entriesOf(result)).toEqual([]);
+    const q = quarantineOf(result);
+    expect(q).toHaveLength(1);
+    expect(q[0].message).toContain("REFUSED");
+    expect(q[0].message).toContain("1008");
+    expect(q[0].message).toContain("WS_HANDSHAKE_PROBES");
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  // An undecodable reason must never become a confident cause. Three inputs,
+  // because they fail at DIFFERENT points and an earlier one masks the later:
+  // an unquoted reason never matches the pattern at all, whereas an invalid JSON
+  // escape and a raw control character DO match it and then throw in the decoder.
+  // Testing only the unquoted form left the decoder's failure path unexercised —
+  // a mutation that swallowed the decode error and reported `reason: ""` survived
+  // until these two were added.
+  it.each([
+    ["an unquoted reason (never matches the pattern)", "not-quoted"],
+    ["an invalid JSON escape (matches, then throws)", '"bad \\q escape"'],
+    ["a raw newline inside the quotes (matches, then throws)", '"line1\nline2"'],
+  ])("NEGATIVE CONTROL: %s is not a diagnosis → quarantine", (_label, rawReason) => {
+    const broken =
+      `WSClosedError: WebSocket closed by server during waitUntil: code=1008 reason=${rawReason}. ` +
+      "Collected 0 messages: []\n    at /repo/src/__tests__/drift/ws-gemini-live.drift.ts:88:11";
+    expect(parseWSServerClose(broken)).toBeNull();
+    // Not drift, not the exit-6 lane — an unreadable cause is unreadable output.
+    expect(entriesOf(resultFor(broken))).toEqual([]);
+    expect(timeoutsOf(resultFor(broken))).toEqual([]);
+    expect(exitCodeOf(resultFor(broken))).toBe(5);
+  });
+
+  // The second classification pass re-scans every failed assertion, and it only
+  // runs when there is at least one unparseable failure AND no entries. So a
+  // recognized close is only at risk of being counted TWICE in a run that ALSO
+  // contains garbage — which is exactly the mixed run below. Without the skip in
+  // that pass, the hang-up is quarantined on top of being recorded, and the run
+  // reports two failures needing triage when only one does.
+  it("a hang-up alongside garbage is recorded ONCE, not also quarantined", () => {
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some unmapped suite"],
+        title: "something broke",
+        failureMessages: ["AssertionError: expected 'x' to be one of\n    at /repo/src/a.ts:1:1"],
+      }),
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [wsServerClose(1011, "internal error")],
+      }),
+    ]);
+    // Exactly the garbage is quarantined; the hang-up stays in its own lane.
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(quarantineOf(result)[0].testName).toContain("something broke");
+    expect(timeoutsOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("an unattributable refusal alongside garbage is quarantined ONCE", () => {
+    const unowned = wsServerClose(1008, "nope").replace(
+      "ws-gemini-live.drift.ts",
+      "ws-something-new.drift.ts",
+    );
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some unmapped suite"],
+        title: "something broke",
+        failureMessages: ["AssertionError: expected 'x' to be one of\n    at /repo/src/a.ts:1:1"],
+      }),
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some future WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [unowned],
+      }),
+    ]);
+    expect(quarantineOf(result)).toHaveLength(2);
+    expect(quarantineOf(result).filter((q) => q.message.includes("REFUSED"))).toHaveLength(1);
+  });
+
+  it("a refusal that also carried messages is still a refusal", () => {
+    // The close frame is the terminal fact regardless of what arrived first.
+    const result = resultFor(wsServerClose(1008, GEMINI_REASON, 3));
+    expect(entriesOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Zero-observation live timeouts (exit 6)
+//
+// The failure that blocked every bot-opened drift PR: the Gemini Live WS legs
+// reached their 30s wait having observed nothing, and the collector reported that
+// as "unparseable output — manual triage required" (exit 5), which hard-fails the
+// base leg of drift-live-pr. A timeout is the single most common failure a live
+// harness will ever see; a collector that cannot name it is not classifying.
+//
+// The message below is VERBATIM from the run that failed (CopilotKit/aimock run
+// 31571018005, PR #370) — lifted from that run's own `drift-report-base` artifact,
+// not hand-authored to the recognizer.
+//
+// The negative controls are the load-bearing half. The trap on this fix is
+// widening the lane until real output slips through quietly, so: unparseable
+// output still quarantines, a timeout that OBSERVED something still quarantines,
+// and a drift marker always wins.
+// ---------------------------------------------------------------------------
+
+/**
+ * A timeout that DID surface a provider `error` body, reported from a given WS
+ * drift probe. The frame is the only thing that varies, because the frame is what
+ * attribution is supposed to key off.
+ */
+function wsErrorTimeoutFrom(driftFile: string): string {
+  return (
+    "Error: waitUntil timeout after 30000ms. Collected 1 messages: [error] " +
+    'bodies=[{"type":"error","error":{"type":"invalid_request_error",' +
+    '"code":"bad_setup","message":"nope"}}]\n' +
+    "    at Timeout._onTimeout (/repo/src/__tests__/drift/ws-providers.ts:319:23)\n" +
+    `    at /repo/src/__tests__/drift/${driftFile}:88:11`
+  );
+}
+
+/** Verbatim CI failure message, run 31571018005 (PR #370), Gemini Live WS legs. */
+const CI_ZERO_OBSERVATION_TIMEOUT =
+  "Error: waitUntil timeout after 30000ms. Collected 0 messages: [] bodies=[]\n" +
+  "    at Timeout._onTimeout (/home/runner/work/aimock/base-main/src/__tests__/drift/ws-providers.ts:319:23)\n" +
+  "    at listOnTimeout (node:internal/timers:605:17)\n" +
+  "    at processTimers (node:internal/timers:541:7)";
+
+describe("zero-observation live timeouts are reported AS timeouts (exit 6)", () => {
+  function ciResult(): VitestJsonResult {
+    return makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [CI_ZERO_OBSERVATION_TIMEOUT],
+      }),
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS tool call event sequence matches",
+        failureMessages: [CI_ZERO_OBSERVATION_TIMEOUT],
+      }),
+    ]);
+  }
+
+  it("routes the REAL CI failure to the timeout lane, not quarantine", () => {
+    const result = ciResult();
+    expect(quarantineOf(result)).toEqual([]);
+    expect(entriesOf(result)).toEqual([]);
+    const timeouts = timeoutsOf(result);
+    expect(timeouts).toHaveLength(2);
+    expect(exitCodeOf(result)).toBe(6);
+  });
+
+  it("carries the wait budget, the test name and a jumpable location", () => {
+    const [first] = timeoutsOf(ciResult());
+    // The budget the probe reported, as a number the reader can act on.
+    expect(first.timeoutMs).toBe(30000);
+    expect(first.testName).toBe("Gemini Live WS drift > WS text event sequence and shapes match");
+    // Captured BEFORE stack stripping, so it points at the probe's own frame.
+    expect(first.rawLocation).toBe(
+      "/home/runner/work/aimock/base-main/src/__tests__/drift/ws-providers.ts:319:23",
+    );
+    expect(first.message).toBe(CI_ZERO_OBSERVATION_TIMEOUT);
+  });
+
+  it('reports the run as "live-timeout", which is NOT a reusable clean baseline', () => {
+    expect(conclusionForExitCode(6)).toBe("live-timeout");
+    // The legs that timed out graded nothing, so the run must never be reused as
+    // a base that certifies those surfaces drift-free.
+    const report: DriftReport = {
+      timestamp: "2026-08-12T06:42:00.000Z",
+      generatedAt: "2026-08-12T06:42:00.000Z",
+      conclusion: conclusionForExitCode(6),
+      entries: [
+        {
+          provider: "OpenAI",
+          scenario: "chat",
+          builderFile: "src/responses.ts",
+          builderFunctions: ["buildChat"],
+          typesFile: null,
+          sdkShapesFile: "src/__tests__/drift/sdk-shapes.ts",
+          diffs: [SAMPLE_DIFF],
+        },
+      ],
+    };
+    expect(isBaseReportReusable(report, "live-timeout", true)).toBe(false);
+  });
+
+  // ---- NEGATIVE CONTROLS --------------------------------------------------
+
+  it("NEGATIVE CONTROL: genuinely unparseable output STILL quarantines (exit 5)", () => {
+    // Truncated garbage with no drift block, no infra reason, and no timeout tail.
+    // If this stops quarantining, the lane has been widened into a silent pass.
+    const garbage =
+      "AssertionError: expected 'gpt-4o-realtime' to be one of\n" +
+      "    at /repo/src/__tests__/drift/ws-realtime.drift.ts:64:11";
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some unmapped suite"],
+        title: "something broke",
+        failureMessages: [garbage],
+      }),
+    ]);
+    expect(timeoutsOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("NEGATIVE CONTROL: a timeout that OBSERVED messages is not a silent surface → still quarantines", () => {
+    // Non-zero collected count. The probe saw output; that output is evidence and
+    // must not be written off as "the surface sent nothing". (With a provider
+    // `error` body it would be handshake drift — asserted separately above.)
+    const observedTimeout =
+      "Error: waitUntil timeout after 30000ms. Collected 3 messages: [setup, chunk, chunk] " +
+      'bodies=[{"type":"setup"}]\n' +
+      "    at Timeout._onTimeout (/repo/src/__tests__/drift/ws-providers.ts:319:23)";
+    expect(parseLiveTimeout(observedTimeout)).toBeNull();
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [observedTimeout],
+      }),
+    ]);
+    expect(timeoutsOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("NEGATIVE CONTROL: a drift marker beats the timeout tail", () => {
+    // A message that carries a drift report is drift, whatever else it says.
+    const withMarker =
+      "Error: waitUntil timeout after 30000ms. Collected 0 messages: [] bodies=[]\n" +
+      "API DRIFT DETECTED: Gemini Live (WS text)\n";
+    expect(parseLiveTimeout(withMarker)).toBeNull();
+  });
+
+  it("NEGATIVE CONTROL: a bare timeout with no collected-message count still quarantines", () => {
+    // No structured count means the probe never stated what it observed, so
+    // "observed nothing" is an inference, not a reading.
+    const noCount =
+      "Error: waitUntil timeout after 30000ms\n" +
+      "    at /repo/src/__tests__/drift/ws-providers.ts:319:23";
+    expect(parseLiveTimeout(noCount)).toBeNull();
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [noCount],
+      }),
+    ]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("real drift on another leg still wins: exit 2, with the timeout recorded alongside", () => {
+    // A timed-out leg must not mask, or be masked by, a genuine finding — both
+    // are recorded and the actionable one drives the exit code.
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["OpenAI Chat Completions drift"],
+        title: "non-streaming text matches real API",
+        failureMessages: [formatDriftReport("OpenAI Chat (non-streaming text)", [SAMPLE_DIFF])],
+      }),
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [CI_ZERO_OBSERVATION_TIMEOUT],
+      }),
+    ]);
+    expect(entriesOf(result)).toHaveLength(1);
+    expect(timeoutsOf(result)).toHaveLength(1);
+    expect(quarantineOf(result)).toEqual([]);
+    expect(exitCodeOf(result)).toBe(2);
+  });
+
+  it("a quarantined sibling still wins over a timeout: exit 5", () => {
+    // Quarantine outranks live-timeout — a collector fault needs a human even
+    // when another leg also went quiet.
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some unmapped suite"],
+        title: "something broke",
+        failureMessages: ["AssertionError: expected 'x' to be one of\n    at /repo/src/a.ts:1:1"],
+      }),
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [CI_ZERO_OBSERVATION_TIMEOUT],
+      }),
+    ]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(timeoutsOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  // The three-way split, pinned. A live WS leg can fail in three ways and they do
+  // NOT collapse, because the EVIDENCE differs: an error body is the provider
+  // stating why it rejected the session (drift, attributable, auto-fixable);
+  // silence is evidence of nothing (timeout); anything else is unreadable
+  // (quarantine). Pinned explicitly so the taxonomy is a measured fact rather
+  // than something a reader has to reconstruct from three recognizers.
+  //
+  // Attribution now follows the PROBE, for every registered WS surface. It used to
+  // test for a `ws-realtime.drift.ts` frame and hardcode openai-realtime, so a
+  // rejected `gemini-live` handshake — the surface that actually goes quiet in
+  // production — resolved to nothing and quarantined at exit 5, back into the hard
+  // stop this lane exists to avoid. Each row below asserts the surface the failure
+  // is routed to, not merely that it was routed somewhere: a lane that attributed
+  // every provider to OpenAI Realtime would satisfy a count-only assertion.
+  it.each([
+    ["ws-realtime.drift.ts", "OpenAI Realtime", "src/ws-realtime.ts"],
+    ["ws-gemini-live.drift.ts", "Gemini Live", "src/ws-gemini-live.ts"],
+    ["ws-responses.drift.ts", "OpenAI Responses WS", "src/ws-responses.ts"],
+  ])(
+    "an error-carrying timeout from %s is critical drift owned by %s",
+    (frame, wantProvider, wantBuilderFile) => {
+      const result = makeResult([
+        makeAssertion({
+          status: "failed",
+          // The ancestor title deliberately says Gemini Live for every row: it must
+          // not be what decides the owner, or the frame-based attribution would be
+          // untested for the two rows whose title disagrees with their probe.
+          ancestorTitles: ["Gemini Live WS drift"],
+          title: "WS text event sequence and shapes match",
+          failureMessages: [wsErrorTimeoutFrom(frame)],
+        }),
+      ]);
+      expect(quarantineOf(result)).toEqual([]);
+      expect(timeoutsOf(result)).toEqual([]);
+      const entries = entriesOf(result);
+      expect(entries).toHaveLength(1);
+      expect(entries[0].provider).toBe(wantProvider);
+      expect(entries[0].builderFile).toBe(wantBuilderFile);
+      expect(entries[0].diffs[0].severity).toBe("critical");
+      expect(entries[0].diffs[0].id).toBe("ws-handshake:bad_setup");
+      expect(exitCodeOf(result)).toBe(2);
+    },
+  );
+
+  it("NEGATIVE CONTROL: an error-carrying timeout from an UNREGISTERED probe still quarantines", () => {
+    // An unknown WS surface must not be guessed at. A confident wrong owner routes
+    // remediation at the wrong file and fails OPEN, which is worse than the stop.
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some future WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [wsErrorTimeoutFrom("ws-something-new.drift.ts")],
+      }),
+    ]);
+    expect(entriesOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("NEGATIVE CONTROL: a registered probe with NO error body is a timeout, not drift", () => {
+    // Gate 3 still separates the lanes: silence from a known probe is exit 6, so
+    // widening attribution did not let the timeout lane be swallowed by the drift
+    // lane.
+    const silent =
+      "Error: waitUntil timeout after 30000ms. Collected 0 messages: [] bodies=[]\n" +
+      "    at Timeout._onTimeout (/repo/src/__tests__/drift/ws-providers.ts:319:23)\n" +
+      "    at /repo/src/__tests__/drift/ws-gemini-live.drift.ts:88:11";
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [silent],
+      }),
+    ]);
+    expect(entriesOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toEqual([]);
+    expect(timeoutsOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(6);
+  });
+
+  it("a WS handshake failure WITH an error body is still critical drift, not a timeout", () => {
+    // parseWSHandshakeFailure runs first and must keep its claim.
+    const handshake =
+      "Error: waitUntil timeout after 30000ms. Collected 1 messages: [error] " +
+      'bodies=[{"type":"error","error":{"type":"invalid_request_error",' +
+      '"code":"missing_required_parameter","message":"Missing required parameter."}}]\n' +
+      "    at /repo/src/__tests__/drift/ws-realtime.drift.ts:138:26";
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["OpenAI Realtime API drift"],
+        title: "WS text event sequence and shapes match (GA)",
+        failureMessages: [handshake],
+      }),
+    ]);
+    expect(timeoutsOf(result)).toEqual([]);
+    expect(entriesOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(2);
   });
 });
 
