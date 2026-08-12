@@ -1,7 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { execFile, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createServer as createHttpServer, type Server } from "node:http";
-import { existsSync, mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  openSync,
+  closeSync,
+  rmSync,
+  mkdirSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { AddressInfo } from "node:net";
@@ -38,6 +47,7 @@ function spawnCli(args: string[]): {
   stderr: () => string;
   kill: (signal?: NodeJS.Signals) => void;
   waitForOutput: (match: RegExp, timeoutMs?: number) => Promise<void>;
+  waitForExit: () => Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 } {
   let out = "";
   let err = "";
@@ -48,6 +58,19 @@ function spawnCli(args: string[]): {
   cp.stderr?.on("data", (d) => {
     err += d;
   });
+
+  // Record the exit eagerly, at spawn time. A caller that attaches its own "close"
+  // listener after kill() can miss the event and then wait out the whole test timeout,
+  // which reports as a timeout rather than as the exit that actually happened.
+  let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+  const exitWaiters: ((r: { code: number | null; signal: NodeJS.Signals | null }) => void)[] = [];
+  cp.on("close", (code, signal) => {
+    exited = { code, signal };
+    for (const w of exitWaiters) w(exited);
+    exitWaiters.length = 0;
+  });
+  const waitForExit = (): Promise<{ code: number | null; signal: NodeJS.Signals | null }> =>
+    exited ? Promise.resolve(exited) : new Promise((resolve) => exitWaiters.push(resolve));
 
   const waitForOutput = (match: RegExp, timeoutMs = 10_000): Promise<void> =>
     new Promise((resolve, reject) => {
@@ -72,6 +95,7 @@ function spawnCli(args: string[]): {
     stderr: () => err,
     kill: (signal: NodeJS.Signals = "SIGTERM") => cp.kill(signal),
     waitForOutput,
+    waitForExit,
   };
 }
 
@@ -180,13 +204,72 @@ describe.skipIf(!CLI_AVAILABLE)("CLI: fixture loading", () => {
 
     child.kill("SIGTERM");
 
-    await new Promise<void>((resolve) => {
-      child.cp.on("close", (code) => {
-        expect(code).toBe(0);
-        resolve();
-      });
-    });
+    // Assert on the exit OUTSIDE the event callback, and on the signal as well as the
+    // code. A bare `expect(code).toBe(0)` inside the callback reports the useless
+    // "expected null to be +0" and then also hangs the test until the suite timeout,
+    // because the throw prevents the promise from ever resolving. `signal` is the
+    // datum that names the cause: SIGTERM means the CLI never ran its own handler.
+    await expect(child.waitForExit()).resolves.toEqual({ code: 0, signal: null });
   });
+
+  /*
+   * The CLI must not advertise readiness before it can act on the signal that
+   * advertisement invites.  Writes to a file are synchronous on POSIX (as are writes to
+   * a pipe on Linux, which is what CI uses), so a supervisor polling for the readiness
+   * line can deliver SIGTERM while the CLI is still mid-statement.  If the SIGTERM
+   * listener is not installed yet, the signal reaches Node's default disposition, which
+   * re-raises it: the process dies with code === null / signal === "SIGTERM" and never
+   * runs its own shutdown.
+   *
+   * SIGSTOP pins the child at exactly the instant it announced readiness, which is the
+   * same state a preempted process is in on a loaded CI runner — it makes the window
+   * observable instead of leaving it to a race.  Repeat a few times because the failure
+   * mode is probabilistic in the RED direction; once the listener is registered before
+   * the announcement it cannot fail at all.
+   */
+  it.skipIf(process.platform === "win32")(
+    "handles a SIGTERM delivered the instant readiness is announced",
+    async () => {
+      const fixturePath = writeFixture(tmpDir, "test.json");
+
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const outFile = join(tmpDir, `announce-${attempt}.log`);
+        writeFileSync(outFile, "");
+        const fd = openSync(outFile, "a");
+        const cp = spawn("node", [CLI_PATH, "--fixtures", fixturePath, "--port", "0"], {
+          stdio: ["ignore", fd, fd],
+        });
+        closeSync(fd);
+
+        const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+          (resolve) => cp.on("exit", (code, signal) => resolve({ code, signal })),
+        );
+
+        try {
+          const deadline = Date.now() + 10_000;
+          while (!/listening on/i.test(readFileSync(outFile, "utf-8"))) {
+            if (Date.now() > deadline) {
+              throw new Error(`CLI never announced readiness: ${readFileSync(outFile, "utf-8")}`);
+            }
+            await new Promise((r) => setImmediate(r));
+          }
+          cp.kill("SIGSTOP");
+          cp.kill("SIGTERM");
+          cp.kill("SIGCONT");
+        } catch (e) {
+          // Never leave a frozen child behind for the suite to trip over.
+          cp.kill("SIGCONT");
+          cp.kill("SIGKILL");
+          throw e;
+        }
+
+        const { code, signal } = await exited;
+        const output = readFileSync(outFile, "utf-8");
+        expect({ attempt, code, signal }).toEqual({ attempt, code: 0, signal: null });
+        expect(output).toContain("Shutting down...");
+      }
+    },
+  );
 
   it("fails with error when --fixtures points to a non-existent path", async () => {
     const { stderr, code } = await runCli(["--fixtures", "/nonexistent/path/to/fixtures"]);
