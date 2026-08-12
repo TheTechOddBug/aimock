@@ -11,6 +11,9 @@
  *   0 — no critical diffs found (or no drift at all)
  *   2 — at least one critical diff exists
  *   5 — at least one failure was quarantined (unparseable/untrusted — needs review)
+ *   6 — at least one live leg timed out having observed ZERO messages: the
+ *       surface went silent, so nothing was graded there. Not drift, not a
+ *       collector fault, and NOT a clean baseline.
  *   1 — AG-UI drift detection was skipped (infra), or an unhandled script error
  *
  * Usage:
@@ -31,6 +34,7 @@ import type {
   DriftSeverity,
   ParsedDiff,
   QuarantineEntry,
+  TimeoutEntry,
 } from "./drift-types.js";
 
 // ---------------------------------------------------------------------------
@@ -411,6 +415,61 @@ export function parseWSHandshakeFailure(text: string): WSHandshakeFailure | null
 }
 
 // ---------------------------------------------------------------------------
+// Zero-observation live-timeout recognizer
+// ---------------------------------------------------------------------------
+
+/**
+ * A live leg that hit its wait budget having observed NOTHING.
+ *
+ * This is the single most common way a live drift leg fails, and it has its own
+ * meaning, distinct from both lanes around it:
+ *
+ *   - It is NOT a drift finding. Zero messages were observed, so there is no
+ *     shape to compare and nothing to attribute to a builder file. (A timeout
+ *     that DID observe messages including a provider `error` body is protocol
+ *     drift, and `parseWSHandshakeFailure` — which runs first — claims it.)
+ *   - It is NOT unparseable output. The message states exactly what happened:
+ *     the wait budget, and that zero messages arrived. Routing it to the
+ *     quarantine lane reported an unreachable live surface as "unparseable —
+ *     manual triage required" (exit 5), which is both wrong and, because exit 5
+ *     hard-fails the base leg, a human-gated stop on every drift PR for as long
+ *     as the surface stays silent.
+ *
+ * So it gets its own lane: recorded as a `TimeoutEntry`, reported as exit 6 /
+ * conclusion "live-timeout".
+ *
+ * DELIBERATELY NARROW. The recognizer requires the probe's own structured
+ * "Collected <n> messages" tail with n === 0, and refuses any message carrying a
+ * drift marker. Anything else — a timeout with messages but no error body, a
+ * bare `AssertionError` with no timeout tail, truncated garbage — is unchanged
+ * and still quarantines. The failure mode to avoid here is the opposite of the
+ * one being fixed: a recognizer loose enough to swallow real output would trade
+ * a loud stop for a silent pass.
+ */
+export interface LiveTimeout {
+  /** The wait budget that expired, in milliseconds. */
+  timeoutMs: number;
+}
+
+/** A drift marker anywhere in the text disqualifies the timeout lane. */
+const DRIFT_MARKERS = [/API DRIFT DETECTED/i, /LLMOCK DRIFT/i];
+
+export function parseLiveTimeout(text: string): LiveTimeout | null {
+  // Gate 1: the probe's own timeout tail, WITH its collected-message count. The
+  // count is what makes this classifiable rather than a guess — `Collected 0`
+  // is the probe stating, structurally, that it observed nothing.
+  const match = text.match(/waitUntil timeout after (\d+)ms\.\s*Collected (\d+) messages\s*:/);
+  if (!match) return null;
+  // Gate 2: ZERO observations. A timeout that collected messages saw SOMETHING;
+  // that output is evidence and must not be discarded as "surface was silent".
+  if (Number(match[2]) !== 0) return null;
+  // Gate 3: no drift marker. A message that carries a drift report is drift,
+  // whatever else it also says.
+  if (DRIFT_MARKERS.some((re) => re.test(text))) return null;
+  return { timeoutMs: Number(match[1]) };
+}
+
+// ---------------------------------------------------------------------------
 // Run drift tests and collect results
 // ---------------------------------------------------------------------------
 
@@ -701,6 +760,12 @@ export function classifyUnparseableAsInfra(unparseableMessages: string[]): boole
 export interface CollectResult {
   entries: DriftEntry[];
   quarantine: QuarantineEntry[];
+  /**
+   * Live legs that timed out having observed nothing (see `parseLiveTimeout`).
+   * A recognized outcome in its own right — neither a drift finding nor
+   * unparseable output.
+   */
+  timeouts: TimeoutEntry[];
 }
 
 /**
@@ -729,6 +794,7 @@ export const TRUNCATED_DELTA_ID = "openai-realtime:unknown-models-truncated";
 export function collectDriftEntries(results: VitestJsonResult): CollectResult {
   const entries: DriftEntry[] = [];
   const quarantine: QuarantineEntry[] = [];
+  const timeouts: TimeoutEntry[] = [];
   let unparseable = 0;
 
   for (const file of results.testResults) {
@@ -884,6 +950,23 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
           });
           continue;
         }
+
+        // A live leg that reached its wait budget having observed NOTHING. A
+        // recognized outcome with its own lane (exit 6) — see parseLiveTimeout
+        // for why it is neither drift nor unparseable. Checked AFTER the two
+        // recognizers above so a timeout that DID surface a provider error body
+        // stays the critical drift they classify it as.
+        const liveTimeout = parseLiveTimeout(fullMessage);
+        if (liveTimeout !== null) {
+          timeouts.push({
+            testName: `${assertion.ancestorTitles.join(" ")} > ${assertion.title}`,
+            rawLocation: extractRawLocation(fullMessage),
+            timeoutMs: liveTimeout.timeoutMs,
+            message: fullMessage,
+          });
+          continue;
+        }
+
         unparseable++;
         continue;
       }
@@ -982,6 +1065,9 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
           // entries) — only truly unparseable messages reach here.
           if (parseKnownModelsCanary(fullMessage) !== null) continue;
           if (parseWSHandshakeFailure(fullMessage) !== null) continue;
+          // Recognized zero-observation live timeouts were claimed by the
+          // timeout lane in the pass above; they are not unparseable.
+          if (parseLiveTimeout(fullMessage) !== null) continue;
           unparseableFailures.push({
             message: fullMessage,
             testName: `${assertion.ancestorTitles.join(" ")} > ${assertion.title}`,
@@ -1037,7 +1123,29 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
     );
   }
 
-  return { entries, quarantine };
+  if (timeouts.length > 0) {
+    // Reported as what it is, with the one thing a reader needs to act on: the
+    // surface that went quiet. Explicitly NOT the quarantine wording — nothing
+    // here needs collector triage, so nobody should be sent looking for it.
+    console.warn(
+      `WARNING: ${timeouts.length} live drift leg(s) timed out having observed ZERO messages — ` +
+        `the live surface accepted the connection and then sent nothing. This is neither drift ` +
+        `nor unparseable output (exit 6, conclusion "live-timeout"): there is no collector fault ` +
+        `to triage. Check the surface below for an outage, a retired model, or a rejected session.`,
+    );
+    for (const t of timeouts) {
+      console.warn(
+        `  - ${t.testName} — no messages in ${t.timeoutMs}ms @ ${t.rawLocation || "<no frame>"}`,
+      );
+    }
+    console.warn(
+      `  If this persists across runs it is not a flake. Note that src/__tests__/drift/ws-providers.ts ` +
+        `discards a server CLOSE frame without recording its code/reason, so a session the provider ` +
+        `REJECTED presents here as silence — that close code is the missing diagnosis.`,
+    );
+  }
+
+  return { entries, quarantine, timeouts };
 }
 
 // ---------------------------------------------------------------------------
@@ -1249,10 +1357,17 @@ export function computeExitCode(
   criticalCount: number,
   quarantineCount: number,
   agUiSkipped: boolean,
-): 0 | 1 | 2 | 5 {
+  timeoutCount: number = 0,
+): 0 | 1 | 2 | 5 | 6 {
   if (criticalCount > 0) return 2;
   if (quarantineCount > 0) return 5;
   if (agUiSkipped) return 1;
+  // 6 — every leg that failed did so by observing nothing at all. Distinct from
+  // 5 so a silent live surface is never reported as a collector fault needing
+  // manual triage, and distinct from 0 so it is never a clean baseline: the legs
+  // that timed out graded NOTHING, and a run that graded nothing must not be
+  // able to certify that surface as drift-free.
+  if (timeoutCount > 0) return 6;
   return 0;
 }
 
@@ -1262,7 +1377,7 @@ export function computeExitCode(
  * `report.conclusion` directly. Only exit 0 ("clean") is a reusable baseline;
  * "critical"/"quarantine" (and the exit-1 "skipped" case) are not.
  */
-export function conclusionForExitCode(exitCode: 0 | 1 | 2 | 5): string {
+export function conclusionForExitCode(exitCode: 0 | 1 | 2 | 5 | 6): string {
   switch (exitCode) {
     case 0:
       return "clean";
@@ -1270,6 +1385,11 @@ export function conclusionForExitCode(exitCode: 0 | 1 | 2 | 5): string {
       return "critical";
     case 5:
       return "quarantine";
+    case 6:
+      // NOT in drift-delta's REUSABLE_CONCLUSIONS, deliberately: a run whose
+      // legs observed nothing cannot serve as a baseline that says they were
+      // clean.
+      return "live-timeout";
     default:
       return "skipped";
   }
@@ -1307,16 +1427,18 @@ function main(): void {
 
   const entries = [...httpEntries, ...agUiEntries];
   const quarantine = httpResult.quarantine;
+  const timeouts = httpResult.timeouts;
 
   const criticalCount = entries.reduce(
     (sum, e) => sum + e.diffs.filter((d) => d.severity === "critical").length,
     0,
   );
   const quarantineCount = quarantine.length;
+  const timeoutCount = timeouts.length;
 
   // Compute the exit code BEFORE writing so the report can carry the coarse
   // `conclusion` derived from it (base-report reuse contract).
-  const exitCode = computeExitCode(criticalCount, quarantineCount, agUiSkipped);
+  const exitCode = computeExitCode(criticalCount, quarantineCount, agUiSkipped, timeoutCount);
 
   const timestamp = new Date().toISOString();
   const report: DriftReport = {
@@ -1327,6 +1449,7 @@ function main(): void {
     conclusion: conclusionForExitCode(exitCode),
     entries,
     ...(quarantine.length > 0 ? { quarantine } : {}),
+    ...(timeouts.length > 0 ? { timeouts } : {}),
   };
 
   try {
@@ -1346,6 +1469,7 @@ function main(): void {
   console.log(`  Total entries: ${entries.length}`);
   console.log(`  Critical diffs: ${criticalCount}`);
   console.log(`  Quarantined failures: ${quarantineCount}`);
+  console.log(`  Live timeouts (zero observations): ${timeoutCount}`);
 
   switch (exitCode) {
     case 2:
@@ -1355,6 +1479,13 @@ function main(): void {
     case 5:
       console.warn(`Exiting with code 5 (${quarantineCount} failure(s) quarantined for review).`);
       process.exit(5);
+    // eslint-disable-next-line no-fallthrough
+    case 6:
+      console.warn(
+        `Exiting with code 6 (${timeoutCount} live leg(s) timed out with zero observations — ` +
+          `no drift graded on those surfaces; NOT a collector fault).`,
+      );
+      process.exit(6);
     // eslint-disable-next-line no-fallthrough
     case 1:
       console.warn("Exiting with code 1 (AG-UI drift detection was skipped — infra failure).");

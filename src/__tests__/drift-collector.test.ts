@@ -29,12 +29,18 @@ import {
   computeExitCode,
   conclusionForExitCode,
   classifyUnparseableAsInfra,
+  parseLiveTimeout,
   INFRA_INDICATOR_SOURCES,
   infraIndicatorSample,
   NO_GA_DELTA_ID,
   TRUNCATED_DELTA_ID,
 } from "../../scripts/drift-report-collector.js";
-import type { DriftEntry, QuarantineEntry, ParsedDiff } from "../../scripts/drift-types.js";
+import type {
+  DriftEntry,
+  QuarantineEntry,
+  TimeoutEntry,
+  ParsedDiff,
+} from "../../scripts/drift-types.js";
 import { SURFACE_REGISTRY, KNOWN_SURFACE_SLUGS, isKnownSurface } from "./drift/surface-registry.js";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
@@ -55,14 +61,24 @@ function quarantineOf(result: VitestJsonResult): QuarantineEntry[] {
   return collectDriftEntries(result).quarantine;
 }
 
-/** The exit code main() would emit for a given collect result (agUiSkipped=false). */
-function exitCodeOf(result: VitestJsonResult): 0 | 1 | 2 | 5 {
-  const { entries, quarantine } = collectDriftEntries(result);
+function timeoutsOf(result: VitestJsonResult): TimeoutEntry[] {
+  return collectDriftEntries(result).timeouts;
+}
+
+/**
+ * The exit code main() would emit for a given collect result (agUiSkipped=false).
+ *
+ * Forwards EVERY lane main() forwards, timeouts included. A helper that dropped
+ * a lane would report an exit code the collector never emits, and every taxonomy
+ * assertion routed through it would be measuring the helper.
+ */
+function exitCodeOf(result: VitestJsonResult): 0 | 1 | 2 | 5 | 6 {
+  const { entries, quarantine, timeouts } = collectDriftEntries(result);
   const criticalCount = entries.reduce(
     (sum, e) => sum + e.diffs.filter((d) => d.severity === "critical").length,
     0,
   );
-  return computeExitCode(criticalCount, quarantine.length, false);
+  return computeExitCode(criticalCount, quarantine.length, false, timeouts.length);
 }
 
 // ---------------------------------------------------------------------------
@@ -482,10 +498,11 @@ describe("collectDriftEntries", () => {
     expect(exitCodeOf(result)).toBe(2);
   });
 
-  it("does NOT recognize a bare WS network timeout (zero messages, no error body) as handshake drift → stays quarantined (exit 5)", () => {
-    // A genuine transient network flake times out having collected ZERO
-    // messages and carries no provider `error` body. It must NOT be reclassified
-    // as protocol drift — it stays in the quarantine lane for human review.
+  it("does NOT recognize a bare WS timeout (zero messages, no error body) as handshake drift → live-timeout lane (exit 6), NOT drift and NOT quarantine", () => {
+    // A zero-observation timeout carries no provider `error` body, so it must NOT
+    // be reclassified as protocol drift. Nor is it unparseable: the message states
+    // the wait budget and that zero messages arrived. It lands in the live-timeout
+    // lane (exit 6) — see parseLiveTimeout.
     const bareTimeout =
       "Error: waitUntil timeout after 30000ms. Collected 0 messages: []\n" +
       "    at openaiRealtimeWS (/repo/src/__tests__/drift/ws-providers.ts:372:20)\n" +
@@ -499,8 +516,9 @@ describe("collectDriftEntries", () => {
       }),
     ]);
     expect(entriesOf(result)).toEqual([]);
-    expect(quarantineOf(result)).toHaveLength(1);
-    expect(exitCodeOf(result)).toBe(5);
+    expect(quarantineOf(result)).toEqual([]);
+    expect(timeoutsOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(6);
   });
 
   it("returns valid entries and tolerates unparseable failures mixed in", () => {
@@ -1056,6 +1074,230 @@ describe("collectDriftEntries", () => {
       // Critical dominates: exit 2, not 5.
       expect(exitCodeOf(result)).toBe(2);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Zero-observation live timeouts (exit 6)
+//
+// The failure that blocked every bot-opened drift PR: the Gemini Live WS legs
+// reached their 30s wait having observed nothing, and the collector reported that
+// as "unparseable output — manual triage required" (exit 5), which hard-fails the
+// base leg of drift-live-pr. A timeout is the single most common failure a live
+// harness will ever see; a collector that cannot name it is not classifying.
+//
+// The message below is VERBATIM from the run that failed (CopilotKit/aimock run
+// 31571018005, PR #370) — lifted from that run's own `drift-report-base` artifact,
+// not hand-authored to the recognizer.
+//
+// The negative controls are the load-bearing half. The trap on this fix is
+// widening the lane until real output slips through quietly, so: unparseable
+// output still quarantines, a timeout that OBSERVED something still quarantines,
+// and a drift marker always wins.
+// ---------------------------------------------------------------------------
+
+/** Verbatim CI failure message, run 31571018005 (PR #370), Gemini Live WS legs. */
+const CI_ZERO_OBSERVATION_TIMEOUT =
+  "Error: waitUntil timeout after 30000ms. Collected 0 messages: [] bodies=[]\n" +
+  "    at Timeout._onTimeout (/home/runner/work/aimock/base-main/src/__tests__/drift/ws-providers.ts:319:23)\n" +
+  "    at listOnTimeout (node:internal/timers:605:17)\n" +
+  "    at processTimers (node:internal/timers:541:7)";
+
+describe("zero-observation live timeouts are reported AS timeouts (exit 6)", () => {
+  function ciResult(): VitestJsonResult {
+    return makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [CI_ZERO_OBSERVATION_TIMEOUT],
+      }),
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS tool call event sequence matches",
+        failureMessages: [CI_ZERO_OBSERVATION_TIMEOUT],
+      }),
+    ]);
+  }
+
+  it("routes the REAL CI failure to the timeout lane, not quarantine", () => {
+    const result = ciResult();
+    expect(quarantineOf(result)).toEqual([]);
+    expect(entriesOf(result)).toEqual([]);
+    const timeouts = timeoutsOf(result);
+    expect(timeouts).toHaveLength(2);
+    expect(exitCodeOf(result)).toBe(6);
+  });
+
+  it("carries the wait budget, the test name and a jumpable location", () => {
+    const [first] = timeoutsOf(ciResult());
+    // The budget the probe reported, as a number the reader can act on.
+    expect(first.timeoutMs).toBe(30000);
+    expect(first.testName).toBe("Gemini Live WS drift > WS text event sequence and shapes match");
+    // Captured BEFORE stack stripping, so it points at the probe's own frame.
+    expect(first.rawLocation).toBe(
+      "/home/runner/work/aimock/base-main/src/__tests__/drift/ws-providers.ts:319:23",
+    );
+    expect(first.message).toBe(CI_ZERO_OBSERVATION_TIMEOUT);
+  });
+
+  it('reports the run as "live-timeout", which is NOT a reusable clean baseline', () => {
+    expect(conclusionForExitCode(6)).toBe("live-timeout");
+    // The legs that timed out graded nothing, so the run must never be reused as
+    // a base that certifies those surfaces drift-free.
+    const report: DriftReport = {
+      timestamp: "2026-08-12T06:42:00.000Z",
+      generatedAt: "2026-08-12T06:42:00.000Z",
+      conclusion: conclusionForExitCode(6),
+      entries: [
+        {
+          provider: "OpenAI",
+          scenario: "chat",
+          builderFile: "src/responses.ts",
+          builderFunctions: ["buildChat"],
+          typesFile: null,
+          sdkShapesFile: "src/__tests__/drift/sdk-shapes.ts",
+          diffs: [SAMPLE_DIFF],
+        },
+      ],
+    };
+    expect(isBaseReportReusable(report, "live-timeout", true)).toBe(false);
+  });
+
+  // ---- NEGATIVE CONTROLS --------------------------------------------------
+
+  it("NEGATIVE CONTROL: genuinely unparseable output STILL quarantines (exit 5)", () => {
+    // Truncated garbage with no drift block, no infra reason, and no timeout tail.
+    // If this stops quarantining, the lane has been widened into a silent pass.
+    const garbage =
+      "AssertionError: expected 'gpt-4o-realtime' to be one of\n" +
+      "    at /repo/src/__tests__/drift/ws-realtime.drift.ts:64:11";
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some unmapped suite"],
+        title: "something broke",
+        failureMessages: [garbage],
+      }),
+    ]);
+    expect(timeoutsOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("NEGATIVE CONTROL: a timeout that OBSERVED messages is not a silent surface → still quarantines", () => {
+    // Non-zero collected count. The probe saw output; that output is evidence and
+    // must not be written off as "the surface sent nothing". (With a provider
+    // `error` body it would be handshake drift — asserted separately above.)
+    const observedTimeout =
+      "Error: waitUntil timeout after 30000ms. Collected 3 messages: [setup, chunk, chunk] " +
+      'bodies=[{"type":"setup"}]\n' +
+      "    at Timeout._onTimeout (/repo/src/__tests__/drift/ws-providers.ts:319:23)";
+    expect(parseLiveTimeout(observedTimeout)).toBeNull();
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [observedTimeout],
+      }),
+    ]);
+    expect(timeoutsOf(result)).toEqual([]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("NEGATIVE CONTROL: a drift marker beats the timeout tail", () => {
+    // A message that carries a drift report is drift, whatever else it says.
+    const withMarker =
+      "Error: waitUntil timeout after 30000ms. Collected 0 messages: [] bodies=[]\n" +
+      "API DRIFT DETECTED: Gemini Live (WS text)\n";
+    expect(parseLiveTimeout(withMarker)).toBeNull();
+  });
+
+  it("NEGATIVE CONTROL: a bare timeout with no collected-message count still quarantines", () => {
+    // No structured count means the probe never stated what it observed, so
+    // "observed nothing" is an inference, not a reading.
+    const noCount =
+      "Error: waitUntil timeout after 30000ms\n" +
+      "    at /repo/src/__tests__/drift/ws-providers.ts:319:23";
+    expect(parseLiveTimeout(noCount)).toBeNull();
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [noCount],
+      }),
+    ]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("real drift on another leg still wins: exit 2, with the timeout recorded alongside", () => {
+    // A timed-out leg must not mask, or be masked by, a genuine finding — both
+    // are recorded and the actionable one drives the exit code.
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["OpenAI Chat Completions drift"],
+        title: "non-streaming text matches real API",
+        failureMessages: [formatDriftReport("OpenAI Chat (non-streaming text)", [SAMPLE_DIFF])],
+      }),
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [CI_ZERO_OBSERVATION_TIMEOUT],
+      }),
+    ]);
+    expect(entriesOf(result)).toHaveLength(1);
+    expect(timeoutsOf(result)).toHaveLength(1);
+    expect(quarantineOf(result)).toEqual([]);
+    expect(exitCodeOf(result)).toBe(2);
+  });
+
+  it("a quarantined sibling still wins over a timeout: exit 5", () => {
+    // Quarantine outranks live-timeout — a collector fault needs a human even
+    // when another leg also went quiet.
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Some unmapped suite"],
+        title: "something broke",
+        failureMessages: ["AssertionError: expected 'x' to be one of\n    at /repo/src/a.ts:1:1"],
+      }),
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["Gemini Live WS drift"],
+        title: "WS text event sequence and shapes match",
+        failureMessages: [CI_ZERO_OBSERVATION_TIMEOUT],
+      }),
+    ]);
+    expect(quarantineOf(result)).toHaveLength(1);
+    expect(timeoutsOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(5);
+  });
+
+  it("a WS handshake failure WITH an error body is still critical drift, not a timeout", () => {
+    // parseWSHandshakeFailure runs first and must keep its claim.
+    const handshake =
+      "Error: waitUntil timeout after 30000ms. Collected 1 messages: [error] " +
+      'bodies=[{"type":"error","error":{"type":"invalid_request_error",' +
+      '"code":"missing_required_parameter","message":"Missing required parameter."}}]\n' +
+      "    at /repo/src/__tests__/drift/ws-realtime.drift.ts:138:26";
+    const result = makeResult([
+      makeAssertion({
+        status: "failed",
+        ancestorTitles: ["OpenAI Realtime API drift"],
+        title: "WS text event sequence and shapes match (GA)",
+        failureMessages: [handshake],
+      }),
+    ]);
+    expect(timeoutsOf(result)).toEqual([]);
+    expect(entriesOf(result)).toHaveLength(1);
+    expect(exitCodeOf(result)).toBe(2);
   });
 });
 

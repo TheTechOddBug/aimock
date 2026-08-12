@@ -76,6 +76,34 @@ export interface QuarantineEntry {
   message: string;
 }
 
+/**
+ * A live drift leg that reached its wait timeout having collected ZERO messages.
+ *
+ * This is a RECOGNIZED failure shape, not unparseable garbage: the probe opened
+ * the connection, sent its request, and the live surface then sent nothing back
+ * before the wait expired. There is no drift finding to attribute (nothing was
+ * observed to compare) and there is nothing about the collector to triage — so it
+ * belongs in neither the drift lane nor the quarantine lane.
+ *
+ * Recorded here so the outcome is REPORTED as what it is (exit 6, conclusion
+ * "live-timeout") instead of being funnelled into "unparseable output — manual
+ * triage required", which is what made an unreachable live surface a hard,
+ * human-gated stop on every drift PR.
+ */
+export interface TimeoutEntry {
+  /** The failing test's name (ancestor titles + title). */
+  testName: string;
+  /**
+   * Raw `file:line` captured from the original stack frame BEFORE stack-frame
+   * stripping. Empty string when no frame was available.
+   */
+  rawLocation: string;
+  /** The wait budget that expired, in milliseconds, as reported by the probe. */
+  timeoutMs: number;
+  /** The full failure message, retained verbatim for the reader. */
+  message: string;
+}
+
 export interface DriftEntry {
   provider: string;
   scenario: string;
@@ -97,9 +125,9 @@ export interface DriftReport {
   generatedAt?: string;
   /**
    * Coarse run outcome derived from the collector exit code
-   * (0→"clean", 2→"critical", 5→"quarantine"), written so the reuse guard can
-   * read `report.conclusion` instead of relying solely on the CI run
-   * conclusion. Absent on legacy reports.
+   * (0→"clean", 2→"critical", 5→"quarantine", 6→"live-timeout"), written so the
+   * reuse guard can read `report.conclusion` instead of relying solely on the CI
+   * run conclusion. Absent on legacy reports.
    */
   conclusion?: string;
   entries: DriftEntry[];
@@ -109,4 +137,10 @@ export interface DriftReport {
    * ignore this field are unaffected.
    */
   quarantine?: QuarantineEntry[];
+  /**
+   * Optional list of live legs that timed out having observed nothing (see
+   * TimeoutEntry). Absent/empty on a run where every leg produced output —
+   * legacy consumers that ignore this field are unaffected.
+   */
+  timeouts?: TimeoutEntry[];
 }
