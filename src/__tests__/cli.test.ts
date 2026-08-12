@@ -443,8 +443,10 @@ describe.skipIf(!CLI_AVAILABLE)("CLI: --watch", () => {
     const fixturePath = writeFixture(tmpDir, "test.json");
     const child = spawnCli(["--fixtures", fixturePath, "--port", "0", "--watch"]);
 
-    await child.waitForOutput(/listening on/i, 5000);
-    expect(child.stdout()).toContain("Watching");
+    // The watcher is started AFTER the readiness line is logged, so waiting for
+    // "listening on" and then asserting "Watching" is already present races the child.
+    // Wait for the line that actually marks the watcher as up.
+    await child.waitForOutput(/Watching/i, 5000);
 
     // Modify the fixture file
     writeFileSync(
