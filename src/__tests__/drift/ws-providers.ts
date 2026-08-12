@@ -652,15 +652,98 @@ export async function openaiRealtimeWS(
 // Gemini Live WebSocket
 // ---------------------------------------------------------------------------
 
+/**
+ * The ONE response modality every Live (`bidiGenerateContent`) model supports.
+ *
+ * Google's Live API permits exactly one modality per session, and every model
+ * currently exposing `bidiGenerateContent` is a native-audio model that accepts
+ * only `AUDIO`. Requesting `TEXT` is refused out-of-band with an RFC 6455 CLOSE
+ * frame — observed verbatim from the live endpoint as
+ *
+ *   code=1007 reason="The requested combination of response modalities (TEXT)
+ *   is not supported by the model. models/gemini-3.1-flash-live-preview"
+ *
+ * so this leg drives the AUDIO shape, which is the shape the model actually
+ * emits. See ws-gemini-live-modality.test.ts for the local reproduction of that
+ * refusal and the red/green pair over this function.
+ */
+export const GEMINI_LIVE_RESPONSE_MODALITIES = ["AUDIO"];
+
+/** The live Gemini endpoint host — the only host the drift leg itself uses. */
+export const GEMINI_LIVE_HOST = "generativelanguage.googleapis.com";
+
+/**
+ * Transport overrides for {@link geminiLiveWS}.
+ *
+ * Exists purely so a test can point this REAL probe path at a local
+ * fake-provider TLS server instead of Google. The live drift leg passes nothing
+ * and therefore keeps the previous behaviour exactly: the live host, port 443,
+ * and the default system trust store.
+ */
+export interface GeminiLiveTransportOptions extends TLSWSConnectOptions {
+  /** Host override. Defaults to {@link GEMINI_LIVE_HOST}. */
+  host?: string;
+}
+
+/**
+ * Classify an observed Live WS message sequence into the counts the AUDIO-turn
+ * assertions grade on.
+ *
+ * Separated from the drift leg so the observation logic is unit-testable
+ * WITHOUT live credentials (the live `describe` is gated on `GOOGLE_API_KEY`):
+ * a probe whose only check is "did any bytes arrive" cannot tell an audio turn
+ * from a refusal, and that is precisely how the TEXT refusal stayed
+ * undiagnosed. Counts — not booleans — so an assertion can require that audio
+ * actually streamed rather than merely that a key existed once.
+ */
+export function summarizeGeminiLiveTurn(messages: unknown[]): {
+  setupCompleteCount: number;
+  audioPartCount: number;
+  textPartCount: number;
+  turnCompleteCount: number;
+  toolCallCount: number;
+} {
+  let setupCompleteCount = 0;
+  let audioPartCount = 0;
+  let textPartCount = 0;
+  let turnCompleteCount = 0;
+  let toolCallCount = 0;
+
+  for (const raw of messages) {
+    if (!raw || typeof raw !== "object") continue;
+    const msg = raw as Record<string, any>;
+    if ("setupComplete" in msg) setupCompleteCount++;
+    if ("toolCall" in msg) toolCallCount++;
+    const sc = msg.serverContent;
+    if (sc && typeof sc === "object") {
+      if (sc.turnComplete === true) turnCompleteCount++;
+      const parts = sc.modelTurn?.parts;
+      if (Array.isArray(parts)) {
+        for (const part of parts) {
+          if (!part || typeof part !== "object") continue;
+          if (part.inlineData?.data !== undefined) audioPartCount++;
+          else if (typeof part.text === "string") textPartCount++;
+        }
+      }
+    }
+  }
+
+  return { setupCompleteCount, audioPartCount, textPartCount, turnCompleteCount, toolCallCount };
+}
+
 export async function geminiLiveWS(
   config: ProviderConfig,
   text: string,
   tools?: object[],
   model = "models/gemini-2.5-flash",
+  transport?: GeminiLiveTransportOptions,
 ): Promise<WSResult> {
   const path = `/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${config.apiKey}`;
 
-  const ws = await connectTLSWebSocket("generativelanguage.googleapis.com", path);
+  const ws = await connectTLSWebSocket(transport?.host ?? GEMINI_LIVE_HOST, path, undefined, {
+    port: transport?.port,
+    ca: transport?.ca,
+  });
 
   // Step 1: Send setup. `model` is a caller-supplied parameter (default
   // retained for back-compat) so the drift leg can thread a live-discovered
@@ -669,7 +752,7 @@ export async function geminiLiveWS(
   // `buildResponsesCreateMessage` model-as-parameter pattern above).
   const setup: Record<string, unknown> = {
     model,
-    generationConfig: { responseModalities: ["TEXT"] },
+    generationConfig: { responseModalities: GEMINI_LIVE_RESPONSE_MODALITIES },
   };
   if (tools) setup.tools = tools;
   ws.send(JSON.stringify({ setup }));

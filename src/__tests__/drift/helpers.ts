@@ -157,12 +157,32 @@ export const THINKING_FIXTURE: Fixture = {
   response: { content: "Hello!", reasoning: "I need to consider..." },
 };
 
+/**
+ * Audio-out fixture for the Gemini Live drift leg.
+ *
+ * The Live API only supports the `AUDIO` response modality, so the mock side of
+ * that leg's three-way comparison must be driven by an AUDIO fixture — a text
+ * fixture would compare the mock's TEXT shape against a real AUDIO turn.
+ *
+ * `userMessage` matching is SUBSTRING (see router.ts), so this prompt must not
+ * contain any other fixture's prompt: "Greet me aloud" shares no substring with
+ * "Say hello" / "Weather in Paris" / "Think about hello", so the drift server's
+ * other legs are unaffected.
+ */
+export const AUDIO_FIXTURE: Fixture = {
+  match: { userMessage: "Greet me aloud" },
+  response: { audio: { b64Json: "AAAAAA==", contentType: "audio/pcm;rate=24000" } },
+};
+
+/** The prompt that selects {@link AUDIO_FIXTURE} on both sides of a drift leg. */
+export const AUDIO_PROMPT = "Greet me aloud";
+
 // ---------------------------------------------------------------------------
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
 export async function startDriftServer(): Promise<ServerInstance> {
-  return createServer([TEXT_FIXTURE, TOOL_FIXTURE, THINKING_FIXTURE], {
+  return createServer([TEXT_FIXTURE, TOOL_FIXTURE, THINKING_FIXTURE, AUDIO_FIXTURE], {
     port: 0,
     chunkSize: 100,
   });
