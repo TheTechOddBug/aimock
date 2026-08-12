@@ -80,6 +80,61 @@ export class WSHandshakeError extends Error {
 }
 
 /**
+ * Raised by a pending {@link TLSWSClient.waitUntil} when the server closed the
+ * WebSocket before the awaited message arrived.
+ *
+ * This is the third failure channel, alongside the two above: the socket
+ * upgrades fine and the provider then REFUSES the session out-of-band, by
+ * sending an RFC 6455 CLOSE frame rather than an in-band error frame. The
+ * frame's status code and reason are the whole diagnosis — without them a
+ * refusal is byte-for-byte indistinguishable from a provider that accepted the
+ * socket and said nothing, since both end as a bare `waitUntil` timeout that
+ * collected zero messages.
+ */
+export class WSClosedError extends Error {
+  readonly code: number;
+  readonly reason: string;
+
+  constructor(message: string, code: number, reason: string) {
+    super(message);
+    this.name = "WSClosedError";
+    this.code = code;
+    this.reason = reason;
+  }
+}
+
+/**
+ * Parse an RFC 6455 CLOSE frame payload into its status code and reason.
+ *
+ * Per §5.5.1 the payload is optional, and a code is 2 bytes — so an absent or
+ * 1-byte payload carries no code, which §7.4.1 represents as 1005 ("no status
+ * received"). The reason is the UTF-8 remainder, and is where a provider
+ * usually names the cause (e.g. an unsupported model).
+ */
+export function parseCloseFrame(payload: Buffer): { code: number; reason: string } {
+  const code = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
+  const reason = payload.length > 2 ? payload.subarray(2).toString("utf-8") : "";
+  return { code, reason };
+}
+
+/**
+ * Render the messages a `waitUntil` had collected, for a failure message.
+ * Shared by the timeout and server-close paths so both report the same
+ * evidence: the bare type list plus (truncated) bodies, since an early `error`
+ * event's code/message is otherwise swallowed behind the type list.
+ */
+function describeCollected(collected: unknown[]): string {
+  const types = collected.map((m) => (m as { type?: string } | null)?.type ?? "unknown").join(", ");
+  let bodies = "";
+  try {
+    bodies = ` bodies=${JSON.stringify(collected).slice(0, 800)}`;
+  } catch {
+    /* non-serializable payload; type list is enough */
+  }
+  return `Collected ${collected.length} messages: [${types}]${bodies}`;
+}
+
+/**
  * Extract the numeric HTTP status code from a WS handshake's status line
  * (e.g. `"HTTP/1.1 401 Unauthorized"` -> `401`). Returns `null` when no
  * 3-digit code is present (a malformed/unexpected response).
@@ -206,13 +261,36 @@ function buildMaskedPongFrame(pingPayload: Buffer): Buffer {
 // TLS WebSocket client (RFC 6455 over TLS)
 // ---------------------------------------------------------------------------
 
+/**
+ * Transport-level overrides for {@link connectTLSWebSocket}.
+ *
+ * Exists purely so a test can point this REAL client path at a local
+ * self-signed TLS server instead of a live provider. The live drift legs pass
+ * nothing and therefore keep the previous behaviour exactly: port 443 and the
+ * default system trust store.
+ */
+export interface TLSWSConnectOptions {
+  /** TLS port. Defaults to 443 — the only value the live legs use. */
+  port?: number;
+  /** Extra trust anchors, so a local self-signed server can be verified. */
+  ca?: string | Buffer | Array<string | Buffer>;
+}
+
 export function connectTLSWebSocket(
   host: string,
   path: string,
   headers?: Record<string, string>,
+  options?: TLSWSConnectOptions,
 ): Promise<TLSWSClient> {
   return new Promise((resolve, reject) => {
-    const socket = tls.connect({ host, port: 443, servername: host }, () => {
+    const connectOptions: tls.ConnectionOptions = {
+      host,
+      port: options?.port ?? 443,
+      servername: host,
+    };
+    if (options?.ca) connectOptions.ca = options.ca;
+
+    const socket = tls.connect(connectOptions, () => {
       const key = randomBytes(16).toString("base64");
       const extraHeaders = headers
         ? Object.entries(headers)
@@ -236,6 +314,10 @@ export function connectTLSWebSocket(
       const messages: unknown[] = [];
       const messageResolvers: Array<() => void> = [];
       let socketError: Error | null = null;
+      // The CLOSE frame the server sent, if any. Recorded rather than discarded
+      // along with the socket, so a pending (or subsequent) waitUntil can
+      // report WHY the provider ended the session instead of timing out.
+      let closeInfo: { code: number; reason: string } | null = null;
       // Connection-scoped cursor so successive waitUntil calls resume where the last left off
       let checkedUpTo = 0;
 
@@ -290,9 +372,30 @@ export function connectTLSWebSocket(
                   return false;
                 };
 
+                const rejectClosed = (info: { code: number; reason: string }) => {
+                  reject(
+                    new WSClosedError(
+                      `WebSocket closed by server during waitUntil: code=${info.code} ` +
+                        `reason=${JSON.stringify(info.reason)}. ${describeCollected(collected)}`,
+                      info.code,
+                      info.reason,
+                    ),
+                  );
+                };
+
                 // Check messages that arrived before waitUntil was called
                 if (scanFromCursor()) {
                   resolve(collected);
+                  return;
+                }
+
+                // The server may already have closed before this waitUntil was
+                // called (e.g. a refusal that landed during the previous step).
+                // No further message can arrive, so report the stated reason
+                // now instead of waiting out the full timeout.
+                if (closeInfo) {
+                  settled = true;
+                  rejectClosed(closeInfo);
                   return;
                 }
 
@@ -305,20 +408,9 @@ export function connectTLSWebSocket(
                   if (!settled) {
                     settled = true;
                     removeResolver();
-                    const types = collected.map((m: any) => m?.type ?? "unknown").join(", ");
-                    // Surface collected message bodies (truncated) so an early
-                    // `error` event's code/message is visible in CI logs rather
-                    // than swallowed behind the bare type list.
-                    let bodies = "";
-                    try {
-                      bodies = ` bodies=${JSON.stringify(collected).slice(0, 800)}`;
-                    } catch {
-                      /* non-serializable payload; type list is enough */
-                    }
                     reject(
                       new Error(
-                        `waitUntil timeout after ${timeoutMs}ms. ` +
-                          `Collected ${collected.length} messages: [${types}]${bodies}`,
+                        `waitUntil timeout after ${timeoutMs}ms. ${describeCollected(collected)}`,
                       ),
                     );
                   }
@@ -339,12 +431,40 @@ export function connectTLSWebSocket(
                     );
                     return;
                   }
-                  // Scan all new messages since last check
+                  // Scan all new messages since last check.
+                  //
+                  // The ORDER of this block relative to the close check below is
+                  // inert here, not protective: the resolver wake sits inside the
+                  // per-frame parse loop and fires on each TEXT frame, so an
+                  // answer arriving in the same segment as a CLOSE has already
+                  // settled this promise before the CLOSE frame is parsed. No
+                  // reachable state in this function has BOTH an unscanned
+                  // satisfying message and `closeInfo` set, so swapping the two
+                  // blocks changes nothing observable — do not read this ordering
+                  // as a guard. It is kept only to match the pre-check above,
+                  // which is where the ordering IS load-bearing (a buffered
+                  // answer plus an already-recorded close) and is covered by the
+                  // "prefers a buffered satisfying message over an
+                  // already-recorded close" test.
+                  //
+                  // The close check itself is NOT dead: a server that sends only
+                  // a CLOSE frame leaves this scan empty, and deleting that
+                  // branch reds the refusal regression test.
                   if (scanFromCursor()) {
                     settled = true;
                     clearTimeout(timer);
                     removeResolver();
                     resolve(collected);
+                    return;
+                  }
+                  // A server-sent CLOSE ends the session, so the awaited message
+                  // can never arrive. Report the code/reason rather than spin
+                  // out the timeout and lose the diagnosis.
+                  if (closeInfo) {
+                    settled = true;
+                    clearTimeout(timer);
+                    removeResolver();
+                    rejectClosed(closeInfo);
                   }
                 };
 
@@ -397,8 +517,12 @@ export function connectTLSWebSocket(
             }
             for (const r of messageResolvers) r();
           } else if (opcode === 0x8) {
-            // close frame
+            // close frame — keep the code/reason before ending the socket, then
+            // wake any pending waitUntil so it can report the stated reason.
+            // Socket lifecycle is deliberately unchanged: still a plain end().
+            closeInfo = parseCloseFrame(framePayload);
             socket.end();
+            for (const r of messageResolvers) r();
           } else if (opcode === 0x9) {
             // ping — respond with pong per RFC 6455
             socket.write(buildMaskedPongFrame(framePayload));
