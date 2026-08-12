@@ -628,3 +628,110 @@ describe("test-drift.yml — a surface that stopped being graded reaches a human
     expect(posted).not.toContain("went silent");
   });
 });
+
+/**
+ * EXECUTE the BASE leg's own `run:` body on its fresh-live-base path.
+ *
+ * This is the step that actually failed (run 31571018005, step 7), so it gets its
+ * own execution rather than inheriting confidence from the head leg. Its reuse
+ * lookup, worktree checkout and install are stubbed; the exit-code routing is the
+ * workflow's code run as written.
+ *
+ * The reuse path is deliberately made to MISS, because that is the live
+ * situation: reuse requires a same-UTC-day `main` report with non-empty entries,
+ * and while main's own scheduled run is failing there is no such report — which is
+ * exactly why every PR ends up running a fresh live base and meeting this routing.
+ */
+const observeBaseLeg = (collectorExit: number, timeoutTestName?: string): LegRun => {
+  const parent = mkdtempSync(join(tmpdir(), "test-drift-base-"));
+  try {
+    const ws = join(parent, "workspace");
+    mkdirSync(ws);
+    const bin = join(parent, "bin");
+    mkdirSync(bin);
+    const report = JSON.stringify({
+      timestamp: "2026-08-12T06:42:00.000Z",
+      entries: [],
+      ...(timeoutTestName
+        ? {
+            timeouts: [
+              { testName: timeoutTestName, timeoutMs: 30000, rawLocation: "", message: "" },
+            ],
+          }
+        : {}),
+    });
+    // No same-UTC-day main report exists → empty run id → reuse is skipped.
+    writeFileSync(join(bin, "gh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(bin, "git"), '#!/bin/sh\nmkdir -p "$3"\nexit 0\n', { mode: 0o755 });
+    writeFileSync(join(bin, "pnpm"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(
+      join(bin, "npx"),
+      [
+        "#!/bin/sh",
+        `cat > ${JSON.stringify(join(ws, "drift-report-base.json"))} <<'REPORT'`,
+        report,
+        "REPORT",
+        `exit ${collectorExit}`,
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const step = stepByName(
+      "Base drift report — reuse same-UTC-day main run, else run live",
+      "drift-live-pr",
+    );
+    const script = join(parent, "step.sh");
+    writeFileSync(script, step.run);
+    const outFile = join(parent, "gh-output");
+    writeFileSync(outFile, "");
+    const res = spawnSync("/bin/bash", [script], {
+      cwd: ws,
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        GITHUB_WORKSPACE: ws,
+        GITHUB_OUTPUT: outFile,
+        LIVE_LEGS_RAN: "true",
+        REPO: "CopilotKit/aimock",
+        GH_TOKEN: "stub",
+      },
+    });
+    return {
+      stepExit: res.status ?? -1,
+      stdio: `${res.stdout ?? ""}${res.stderr ?? ""}`,
+      output: readFileSync(outFile, "utf-8"),
+    };
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+};
+
+describe("test-drift.yml — the base leg that blocked every drift PR", () => {
+  it("EXECUTED RED→GREEN: a silent live surface on main no longer fails the base leg", () => {
+    // Before the fix this exact condition arrived as exit 5 and the step died on
+    // "Base collector quarantined unparseable output — manual triage required".
+    const run = observeBaseLeg(6, "Gemini Live WS drift > WS text event sequence and shapes match");
+    expect(run.stepExit, `base leg failed on exit 6:\n${run.stdio}`).toBe(0);
+    expect(run.stdio).toContain("::warning title=live-timeout (base)::");
+    expect(run.stdio).toContain("Gemini Live WS drift > WS text event sequence and shapes match");
+    // The leg still reports how the base was obtained, so the delta step is wired.
+    expect(run.output).toContain("reused=false");
+  });
+
+  it("EXECUTED NEGATIVE CONTROL: genuinely unparseable base output STILL stops the leg", () => {
+    const run = observeBaseLeg(5);
+    expect(run.stepExit).toBe(5);
+    expect(run.stdio).toContain("manual triage required");
+  });
+
+  it("EXECUTED NEGATIVE CONTROL: an unrecognized base exit STILL stops the leg", () => {
+    const run = observeBaseLeg(1);
+    expect(run.stepExit).toBe(1);
+    expect(run.stdio).toContain("Base collector faulted");
+  });
+
+  it("EXECUTED POSITIVE CONTROL: base exits 0 and 2 stay non-fatal", () => {
+    expect(observeBaseLeg(0).stepExit).toBe(0);
+    expect(observeBaseLeg(2).stepExit).toBe(0);
+  });
+});
