@@ -36,6 +36,7 @@ import {
   infraIndicatorSample,
   NO_GA_DELTA_ID,
   TRUNCATED_DELTA_ID,
+  WS_PROBE_LABELS,
 } from "../../scripts/drift-report-collector.js";
 import type {
   DriftEntry,
@@ -1608,6 +1609,20 @@ describe("a WS failure with no probe frame is attributed by the failing test's n
       for (const t of driftTitles) expect(t.startsWith(provider)).toBe(true);
     },
   );
+
+  it("no registered WS probe label is a prefix of another, so match order cannot matter", () => {
+    // This invariant is what licenses the unordered `find` in the name resolver.
+    // The registry DOES contain prefix pairs ("OpenAI Responses" ⊂ "OpenAI
+    // Responses WS"), so registering `openai-responses` as a WS probe would make
+    // two labels anchor the same title and the winner would be table order. That
+    // must be an author's decision, surfaced here, not a silent pick.
+    for (const a of WS_PROBE_LABELS) {
+      for (const b of WS_PROBE_LABELS) {
+        if (a.surface === b.surface) continue;
+        expect(b.label.startsWith(a.label)).toBe(false);
+      }
+    }
+  });
 
   it("NEGATIVE CONTROL: an unregistered suite with no frame STILL quarantines (exit 5)", () => {
     // The whole point of refusing to guess. A confidently wrong owner routes

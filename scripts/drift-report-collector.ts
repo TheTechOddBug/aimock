@@ -431,17 +431,24 @@ function resolveWSProbeSurface(text: string): keyof typeof SURFACE_REGISTRY | nu
 /**
  * The SAME closed set of WS probes, indexed by the registry provider LABEL that
  * opens their describe-block titles ("Gemini Live WS drift", "OpenAI Realtime API
- * drift", "OpenAI Responses WS drift"). Longest label first so a nested label
- * resolves to the more specific surface ("OpenAI Responses WS" over "OpenAI
- * Responses"/"OpenAI Realtime").
+ * drift", "OpenAI Responses WS drift").
+ *
+ * NO longest-label-first ordering: match order cannot matter, because no
+ * registered WS label is a prefix of another, so at most one can anchor a title.
+ * That property is asserted by a test (drift-collector.test.ts, "no registered WS
+ * probe label is a prefix of another") rather than papered over here — an
+ * ordering rule that no input can distinguish is coverage that does not exist,
+ * whereas registering a prefix-colliding probe (say `openai-responses`, "OpenAI
+ * Responses", alongside "OpenAI Responses WS") turns that test RED and makes the
+ * ambiguity the author's decision instead of a silent pick.
  */
-const WS_PROBE_LABELS: readonly {
+export const WS_PROBE_LABELS: readonly {
   label: string;
   surface: keyof typeof SURFACE_REGISTRY;
 }[] = WS_HANDSHAKE_PROBES.map((p) => ({
   label: SURFACE_REGISTRY[p.surface].provider,
   surface: p.surface,
-})).sort((a, b) => b.label.length - a.label.length);
+}));
 
 /**
  * The registered surface the failing TEST'S NAME attributes a WS failure to.
@@ -1358,9 +1365,12 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
         if (!parsed || parsed.diffs.length === 0) {
           // Canary and WS-handshake shapes are handled above (they became
           // entries) — only truly unparseable messages reach here. The handshake
-          // check MUST be given the same `testName` the first pass used: attribution
-          // is part of that recognizer's verdict, so a pass that withheld the name
-          // would disagree with the pass above and re-quarantine a claimed failure.
+          // check is given the SAME `testName` the first pass used so the two
+          // passes cannot reach different verdicts on the same input. (This pass
+          // only runs when there are zero entries, which already implies the
+          // handshake recognizer claimed nothing, so no input distinguishes the
+          // two arguments today; passing the real name keeps that a property of
+          // the precondition rather than of a value chosen here.)
           if (parseKnownModelsCanary(fullMessage) !== null) continue;
           if (parseWSHandshakeFailure(fullMessage, testName) !== null) continue;
           // Recognized zero-observation live timeouts were claimed by the
