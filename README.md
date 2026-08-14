@@ -1,8 +1,29 @@
-# aimock [![Unit Tests](https://github.com/CopilotKit/aimock/actions/workflows/test-unit.yml/badge.svg)](https://github.com/CopilotKit/aimock/actions/workflows/test-unit.yml) [![Drift Tests](https://github.com/CopilotKit/aimock/actions/workflows/test-drift.yml/badge.svg)](https://github.com/CopilotKit/aimock/actions/workflows/test-drift.yml) [![npm version](https://img.shields.io/npm/v/@copilotkit/aimock)](https://www.npmjs.com/package/@copilotkit/aimock)
+<div align="center">
+
+# aimock
+
+**Mock infrastructure for AI application testing — point your SDK at one local port and every provider, protocol, and service answers deterministically.**
+
+[**Quick start**](#quick-start) · [**The suite**](#the-aimock-suite) · [**Record & replay**](https://aimock.copilotkit.dev/record-replay) · [**Docs**](https://aimock.copilotkit.dev/docs)
+
+[![npm](https://img.shields.io/npm/v/@copilotkit/aimock.svg?label=%40copilotkit%2Faimock)](https://www.npmjs.com/package/@copilotkit/aimock)
+[![Unit Tests](https://github.com/CopilotKit/aimock/actions/workflows/test-unit.yml/badge.svg)](https://github.com/CopilotKit/aimock/actions/workflows/test-unit.yml)
+[![Drift Tests](https://github.com/CopilotKit/aimock/actions/workflows/test-drift.yml/badge.svg)](https://github.com/CopilotKit/aimock/actions/workflows/test-drift.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
+</div>
 
 https://github.com/user-attachments/assets/76815122-574a-48e1-b275-edae0a014667
 
-Mock infrastructure for AI application testing — LLM APIs, image generation, image editing, text-to-speech, transcription, audio translation, audio generation, video generation, embeddings, MCP tools, A2A agents, AG-UI event streams, vector databases, search, rerank, and moderation. One package, one port, zero dependencies.
+<div align="center">
+
+One package, one port, zero dependencies. LLM APIs, image generation and
+editing, text-to-speech, transcription, audio translation and generation, video
+generation, embeddings, MCP tools, A2A agents, AG-UI event streams, vector
+databases, search, rerank, and moderation — no keys, no network, no surprise
+bills.
+
+</div>
 
 ## Quick Start
 
