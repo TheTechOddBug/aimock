@@ -48,6 +48,7 @@ import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { computeAcceptKey } from "../../ws-framing.js";
 import { connectTLSWebSocket, WSClosedError } from "./ws-providers.js";
+import { parseLiveTimeout } from "../../../scripts/drift-report-collector.js";
 
 // ---------------------------------------------------------------------------
 // Local TLS WebSocket server
@@ -353,6 +354,42 @@ describe("a zero-message timeout distinguishes a mute surface from an unreadable
     expect(err.message).toContain("Collected 2 messages:");
     expect(err.message).toContain("frames text=2");
     expect(err.message).toContain("step=turn");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The probe -> collector seam
+// ---------------------------------------------------------------------------
+//
+// The collector routes a silent live leg by REGEX over the probe's own failure
+// text (`parseLiveTimeout`). Appending the transport diagnostic to that text is
+// therefore a cross-module change: if it split the `waitUntil timeout after
+// <n>ms. Collected <n> messages:` prefix the recognizer needs, every silent leg
+// would stop being classified as exit 6 and become an exit-5 manual-triage hard
+// stop on the daily cron — trading a diagnosis for an outage. So the seam is
+// asserted against a message the REAL client produced, not a hand-written one.
+
+describe("the collector still classifies the probe's timeout text", () => {
+  it("routes a REAL zero-message timeout into the live-timeout lane", async () => {
+    const err = (await withClient(
+      () => {
+        /* mute provider */
+      },
+      (ws) => captureError(ws.waitUntil(isSetupComplete, 600, "setupComplete")),
+    )) as Error;
+
+    expect(parseLiveTimeout(err.message)).toEqual({ timeoutMs: 600 });
+  });
+
+  it("still refuses that lane when messages WERE collected", async () => {
+    // Gate 2 of the recognizer. A leg that observed something is not a silent
+    // surface, and the transport suffix must not accidentally satisfy the gate.
+    const err = (await withClient(
+      (socket) => socket.write(textFrame(JSON.stringify({ somethingElse: 1 }))),
+      (ws) => captureError(ws.waitUntil(isSetupComplete, 600, "setupComplete")),
+    )) as Error;
+
+    expect(parseLiveTimeout(err.message)).toBeNull();
   });
 });
 
