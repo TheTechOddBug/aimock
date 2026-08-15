@@ -808,6 +808,12 @@ export const GEMINI_LIVE_HOST = "generativelanguage.googleapis.com";
 export interface GeminiLiveTransportOptions extends TLSWSConnectOptions {
   /** Host override. Defaults to {@link GEMINI_LIVE_HOST}. */
   host?: string;
+  /**
+   * Per-step wait budget in ms. Defaults to the client's 30s, which is what the
+   * live leg uses. Exists so a test can drive the REAL probe against a provider
+   * that goes mute — the live failure mode — without waiting out 30 seconds.
+   */
+  waitMs?: number;
 }
 
 /**
@@ -885,11 +891,13 @@ export async function geminiLiveWS(
   // Step 2: Wait for setupComplete. The step LABEL is what makes a silent run
   // diagnosable: `step=setupComplete` means the session was never established,
   // `step=turn` below means it was and the turn produced nothing — two very
-  // different causes that previously failed with identical text.
+  // different causes that previously failed with identical text. The MODEL rides
+  // along because it is resolved dynamically from the live listing, so a failure
+  // that does not name it cannot be attributed to a model at all.
   const setupComplete = await ws.waitUntil(
     (msg: any) => msg && typeof msg === "object" && "setupComplete" in msg,
-    undefined,
-    "setupComplete",
+    transport?.waitMs,
+    `setupComplete model=${model}`,
   );
 
   // Step 3: Send client content
@@ -912,8 +920,8 @@ export async function geminiLiveWS(
       }
       return false;
     },
-    undefined,
-    "turn",
+    transport?.waitMs,
+    `turn model=${model}`,
   );
 
   ws.close();
