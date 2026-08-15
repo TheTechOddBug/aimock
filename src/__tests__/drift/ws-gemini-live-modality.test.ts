@@ -32,6 +32,14 @@
  * NOT PROVEN HERE: that the live endpoint accepts `["AUDIO"]` and emits this
  * exact sequence. That is established from Google's published capabilities guide
  * and can only be confirmed by a live run with a real GOOGLE_API_KEY.
+ *
+ * THE SAME MIS-DRIVE, ON THE OTHER SIDE. Once the real side was asking for a
+ * modality the model serves, the tool-call leg reported that the provider emits
+ * `serverContent` and the mock does not — because the MOCK side was still being
+ * driven by a text-shaped tool fixture into a bare `toolCall` with no model turn.
+ * The final section of this file holds that down end to end, with the fake
+ * provider emitting the tool turn in the order the live artifact proves it used
+ * (`serverContent` strictly before `toolCall`).
  */
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import * as tls from "node:tls";
@@ -50,9 +58,14 @@ import {
   WSClosedError,
 } from "./ws-providers.js";
 import { extractShape, compareSSESequences } from "./schema.js";
-import { geminiLiveSetupCompleteShape, geminiLiveAudioEventShapes } from "./sdk-shapes.js";
+import {
+  geminiLiveSetupCompleteShape,
+  geminiLiveAudioEventShapes,
+  geminiLiveToolCallEventShapes,
+} from "./sdk-shapes.js";
 import {
   startDriftServer,
+  startGeminiLiveDriftServer,
   stopDriftServer,
   collectMockWSMessages,
   GEMINI_WS_PATH,
@@ -240,6 +253,29 @@ function startFakeProvider(options: FakeProviderOptions = {}): Promise<FakeProvi
             // OTHER cause a zero-message live failure can have.
             if (options.muteAfterSetup) return;
             if (hasTools) {
+              // A Live tool turn is an AUDIO turn that ALSO calls the function:
+              // the model speaks, THEN asks for the call, as two messages
+              // (`serverContent` and `toolCall` are alternatives of one union
+              // on `LiveServerMessage`, never combined).
+              //
+              // The ORDER is recovered from the live drift artifact, not
+              // invented: the probe collects up to and including the FIRST
+              // `toolCall`, the leg's `toolCallCount > 0` assertion passed, and
+              // a `serverContent` was present in what it collected — so the
+              // provider sent `serverContent` strictly BEFORE the `toolCall`.
+              // The old fake sent a bare `toolCall`, which modelled the MOCK's
+              // bug rather than the provider, and so could not reproduce it.
+              conn.send(
+                JSON.stringify({
+                  serverContent: {
+                    modelTurn: {
+                      parts: [
+                        { inlineData: { mimeType: "audio/pcm;rate=24000", data: "AAAAAA==" } },
+                      ],
+                    },
+                  },
+                }),
+              );
               conn.send(
                 JSON.stringify({
                   toolCall: {
@@ -306,14 +342,34 @@ async function withProvider<T>(
 }
 
 /** Drive the REAL probe against the fake provider. */
-function probe(provider: FakeProvider, tools?: object[], waitMs?: number) {
-  return geminiLiveWS({ apiKey: "fake-key" }, "Greet me aloud", tools, OBSERVED_MODEL, {
+function probe(provider: FakeProvider, tools?: object[], waitMs?: number, prompt = AUDIO_PROMPT) {
+  return geminiLiveWS({ apiKey: "fake-key" }, prompt, tools, OBSERVED_MODEL, {
     host: "localhost",
     port: provider.port,
     ca: cert,
     waitMs,
   });
 }
+
+/** The `functionDeclarations` the live tool-call leg declares, verbatim. */
+const WEATHER_TOOLS = [
+  {
+    functionDeclarations: [
+      {
+        name: "get_weather",
+        description: "Get weather",
+        parameters: {
+          type: "object",
+          properties: { city: { type: "string" } },
+          required: ["city"],
+        },
+      },
+    ],
+  },
+];
+
+/** The prompt the live tool-call leg sends, verbatim. */
+const TOOL_PROMPT = "Weather in Paris";
 
 // ---------------------------------------------------------------------------
 // The reproduction: what the live endpoint did to a TEXT request
@@ -667,6 +723,187 @@ describe("three-way AUDIO comparison: sdk shapes × provider turn × aimock", ()
       realResult.events,
       textShapedMock,
     );
+
+    const critical = diffs.filter((d) => d.severity === "critical");
+    expect(critical.length).toBeGreaterThan(0);
+    expect(critical.map((d) => d.path).join(" ")).toContain("inlineData");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The TOOL turn, run locally end to end
+// ---------------------------------------------------------------------------
+//
+// Run 31896605497's head drift report carried exactly one Gemini Live diff, on
+// the TOOL-CALL leg (the audio leg graded clean):
+//
+//   severity: critical
+//   path:     SSE:serverContent
+//   issue:    real API emits event type "serverContent" but mock does not
+//   real:     serverContent
+//   mock:     <absent>
+//
+// The provider was NOT emitting an event aimock has never heard of — aimock
+// emits `serverContent` in every other branch of the Live handler. What it
+// could not do was emit one in a TOOL turn, for two compounding reasons:
+//
+//   1. the leg drove the mock with the shared, text-shaped TOOL_FIXTURE, whose
+//      Live rendering is a bare `toolCall` with no model turn at all; and
+//   2. the ONE fixture shape that expresses "the model speaks AND calls a
+//      function" — an AudioResponse carrying the `toolCalls` companion — was
+//      silently dropping that companion in the Live handler's audio branch.
+//
+// So (2) made the correct drive (1) inexpressible. Both are fixed, and the
+// three tests below hold each end of that down: the mis-drive still reproduces
+// the reported critical, the corrected drive grades clean, and a mock that
+// loses the model turn still goes critical.
+describe("three-way TOOL comparison: sdk shapes × provider turn × aimock", () => {
+  let liveInstance: ServerInstance;
+  let sharedInstance: ServerInstance;
+
+  beforeAll(async () => {
+    liveInstance = await startGeminiLiveDriftServer();
+    sharedInstance = await startDriftServer();
+  });
+
+  afterAll(async () => {
+    await stopDriftServer(liveInstance);
+    await stopDriftServer(sharedInstance);
+  });
+
+  /**
+   * Drive aimock exactly as the tool-call drift leg's mock side does, against
+   * whichever fixture set is under test.
+   */
+  async function driveMockTool(instance: ServerInstance): Promise<unknown[]> {
+    const mockWs = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+    mockWs.send(
+      JSON.stringify({
+        setup: {
+          model: OBSERVED_MODEL,
+          tools: WEATHER_TOOLS,
+          generationConfig: { responseModalities: GEMINI_LIVE_RESPONSE_MODALITIES },
+        },
+      }),
+    );
+    const setupMsgs = await mockWs.waitForMessages(1);
+    const raw: unknown[] = [JSON.parse(setupMsgs[0])];
+    mockWs.send(
+      JSON.stringify({
+        clientContent: {
+          turns: [{ role: "user", parts: [{ text: TOOL_PROMPT }] }],
+          turnComplete: true,
+        },
+      }),
+    );
+    // A short budget on purpose: a mock that never emits the `toolCall` must
+    // fail as the collector's own "timed out … Collected N messages" — which
+    // names the defect — rather than as vitest's bare per-test timeout, which
+    // names nothing. Everything here is local and answers in milliseconds.
+    const content = await collectMockWSMessages(
+      mockWs,
+      (msg) => !!msg && typeof msg === "object" && "toolCall" in msg,
+      3000,
+      1,
+    );
+    raw.push(...content.rawMessages);
+    mockWs.close();
+    return raw;
+  }
+
+  function toEvents(raw: unknown[]) {
+    return raw.map((msg) => ({
+      type: classifyGeminiMessage(msg as Record<string, unknown>),
+      dataShape: extractShape(msg),
+    }));
+  }
+
+  const toolSdkShapes = () => [geminiLiveSetupCompleteShape(), ...geminiLiveToolCallEventShapes()];
+
+  it("REPRODUCTION: the text-shaped tool fixture still reports SSE:serverContent as <absent>", async () => {
+    // The mis-drive, kept alive on purpose. This is the reported failure, not a
+    // paraphrase of it: the shared TOOL_FIXTURE renders as a bare `toolCall`,
+    // and grading that against a provider turn that speaks first produces the
+    // artifact's diff verbatim. If a future change made this pass, the leg
+    // would have stopped being able to see the bug it was built for.
+    const realResult = await withProvider({}, (provider) =>
+      probe(provider, WEATHER_TOOLS, undefined, TOOL_PROMPT),
+    );
+    const mockRaw = await driveMockTool(sharedInstance);
+
+    // The mock's own turn: a tool call and nothing before it.
+    expect(summarizeGeminiLiveTurn(mockRaw)).toMatchObject({
+      toolCallCount: 1,
+      audioPartCount: 0,
+      textPartCount: 0,
+    });
+
+    const diffs = compareSSESequences(toolSdkShapes(), realResult.events, toEvents(mockRaw));
+    expect(diffs).toContainEqual(
+      expect.objectContaining({
+        path: "SSE:serverContent",
+        severity: "critical",
+        expected: "serverContent",
+        real: "serverContent",
+        mock: "<absent>",
+      }),
+    );
+  });
+
+  it("aimock streams the model turn BEFORE the tool call for the Live tool fixture", async () => {
+    const raw = await driveMockTool(liveInstance);
+
+    // Ordering is the whole point, so it is asserted on the SEQUENCE, not on
+    // counts: counts alone would pass a mock that spoke after calling, which is
+    // what the handler used to do (its `turnComplete` trailed the `toolCall`
+    // and the probe therefore never saw it).
+    expect(toEvents(raw).map((e) => e.type)).toEqual([
+      "setupComplete",
+      "serverContent",
+      "toolCall",
+    ]);
+
+    const turn = summarizeGeminiLiveTurn(raw);
+    expect(turn.setupCompleteCount).toBe(1);
+    expect(turn.audioPartCount).toBeGreaterThan(0);
+    expect(turn.toolCallCount).toBe(1);
+    // AUDIO modality: the turn speaks, it does not write.
+    expect(turn.textPartCount).toBe(0);
+  });
+
+  it("reports NO critical drift between the sdk tool shapes, the provider turn, and aimock", async () => {
+    const realResult = await withProvider({}, (provider) =>
+      probe(provider, WEATHER_TOOLS, undefined, TOOL_PROMPT),
+    );
+    const mockRaw = await driveMockTool(liveInstance);
+
+    const diffs = compareSSESequences(toolSdkShapes(), realResult.events, toEvents(mockRaw));
+
+    expect(diffs.filter((d) => d.severity === "critical")).toEqual([]);
+  });
+
+  it("GUARD: a mock whose model turn lost its audio IS reported as critical drift", async () => {
+    // Non-vacuity of the test above. The mock side here keeps the correct EVENT
+    // SEQUENCE — serverContent then toolCall — and only empties the model turn,
+    // so a comparison that graded event types alone would call this clean.
+    const realResult = await withProvider({}, (provider) =>
+      probe(provider, WEATHER_TOOLS, undefined, TOOL_PROMPT),
+    );
+    const hollowMock = [
+      { type: "setupComplete", dataShape: extractShape({ setupComplete: {} }) },
+      {
+        type: "serverContent",
+        dataShape: extractShape({ serverContent: { modelTurn: { parts: [{ text: "" }] } } }),
+      },
+      {
+        type: "toolCall",
+        dataShape: extractShape({
+          toolCall: { functionCalls: [{ name: "get_weather", args: {}, id: "x" }] },
+        }),
+      },
+    ];
+
+    const diffs = compareSSESequences(toolSdkShapes(), realResult.events, hollowMock);
 
     const critical = diffs.filter((d) => d.severity === "critical");
     expect(critical.length).toBeGreaterThan(0);

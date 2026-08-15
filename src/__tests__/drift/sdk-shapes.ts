@@ -1252,6 +1252,32 @@ export function geminiLiveAudioEventShapes(): SSEEventShape[] {
 
 export function geminiLiveToolCallEventShapes(): SSEEventShape[] {
   return [
+    // The model turn that precedes the call. A Live session carries exactly one
+    // response modality and it is AUDIO, so the turn in which the model decides
+    // to call a function is itself an audio turn — `serverContent` and
+    // `toolCall` are alternatives of `LiveServerMessage`'s message union, so
+    // they arrive as two messages, `serverContent` first.
+    //
+    // Listing it here is what lets the leg grade the event's FIELDS and not
+    // merely its presence: `triangulateAt` raises critical drift only for a
+    // field the SDK shape and the real API both have and the mock lacks, so
+    // without a `serverContent` entry a field-level regression on it could
+    // never be critical.
+    //
+    // NOT PROVEN: that the provider's pre-`toolCall` `serverContent` carries
+    // inlineData audio specifically. The drift artifact records the event type
+    // only. A field the real API turns out not to send grades as `SDK EXTRA`
+    // (info), never as a false critical.
+    {
+      type: "serverContent",
+      dataShape: extractShape({
+        serverContent: {
+          modelTurn: {
+            parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: "AAAAAA==" } }],
+          },
+        },
+      }),
+    },
     {
       type: "toolCall",
       dataShape: extractShape({

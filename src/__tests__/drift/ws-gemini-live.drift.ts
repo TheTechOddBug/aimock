@@ -64,7 +64,7 @@ import {
   type LiveModelEntry,
 } from "./providers.js";
 import {
-  startDriftServer,
+  startGeminiLiveDriftServer,
   stopDriftServer,
   collectMockWSMessages,
   classifyGeminiMessage,
@@ -81,7 +81,7 @@ let instance: ServerInstance;
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
 
 beforeAll(async () => {
-  instance = await startDriftServer();
+  instance = await startGeminiLiveDriftServer();
 });
 
 afterAll(async () => {
@@ -375,6 +375,21 @@ describe.skipIf(!GOOGLE_API_KEY)("Gemini Live WS drift", () => {
     expect(
       mockTurn.toolCallCount,
       `Mock emitted no toolCall: ${JSON.stringify(mockTurn)}`,
+    ).toBeGreaterThan(0);
+    // The mock must SPEAK before it calls. A Live tool turn is an AUDIO turn
+    // that also calls a function, and the mock driven by a text-shaped
+    // tool-only fixture issued a bare `toolCall` with no model turn at all —
+    // reported as `SSE:serverContent … mock:"<absent>"`. Graded here on the mock
+    // side directly, because `compareSSESequences` can only see the absence
+    // while the REAL side happens to send the event, and a provider that
+    // stopped sending it would silently retire the check.
+    //
+    // Deliberately NOT asserted on the real side: what the provider puts in its
+    // pre-`toolCall` `serverContent` is unproven, so requiring audio parts
+    // there would red the leg on an unverified assumption rather than on drift.
+    expect(
+      mockTurn.audioPartCount,
+      `Mock issued a toolCall with no model turn before it: ${JSON.stringify(mockTurn)}`,
     ).toBeGreaterThan(0);
 
     const diffs = compareSSESequences(sdkEvents, realResult.events, mockEvents);
