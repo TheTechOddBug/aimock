@@ -126,6 +126,10 @@ interface FakeProviderOptions {
   emitTextInsteadOfAudio?: boolean;
   /** Never end the turn. */
   omitTurnComplete?: boolean;
+  /** Accept the socket and say NOTHING — not even `setupComplete`. */
+  muteFromStart?: boolean;
+  /** Send `setupComplete`, then ignore the client's turn entirely. */
+  muteAfterSetup?: boolean;
 }
 
 /** The client-to-server messages the fake provider understands. */
@@ -194,6 +198,10 @@ function startFakeProvider(options: FakeProviderOptions = {}): Promise<FakeProvi
         let hasTools = false;
 
         conn.on("message", (raw: string) => {
+          // The live failure mode: the session is accepted and nothing comes
+          // back. Handled before parsing so the provider is mute no matter what
+          // the probe sends.
+          if (options.muteFromStart) return;
           let msg: LiveClientMessage;
           try {
             msg = JSON.parse(raw) as LiveClientMessage;
@@ -228,6 +236,9 @@ function startFakeProvider(options: FakeProviderOptions = {}): Promise<FakeProvi
           }
 
           if (msg.clientContent) {
+            // A session that establishes fine and then produces no turn — the
+            // OTHER cause a zero-message live failure can have.
+            if (options.muteAfterSetup) return;
             if (hasTools) {
               conn.send(
                 JSON.stringify({
@@ -295,11 +306,12 @@ async function withProvider<T>(
 }
 
 /** Drive the REAL probe against the fake provider. */
-function probe(provider: FakeProvider, tools?: object[]) {
+function probe(provider: FakeProvider, tools?: object[], waitMs?: number) {
   return geminiLiveWS({ apiKey: "fake-key" }, "Greet me aloud", tools, OBSERVED_MODEL, {
     host: "localhost",
     port: provider.port,
     ca: cert,
+    waitMs,
   });
 }
 
@@ -363,6 +375,58 @@ describe("REPRODUCTION: a TEXT-modality Live session is refused with 1007", () =
     expect(err).toBeInstanceOf(WSClosedError);
     expect((err as WSClosedError).code).toBe(1007);
     expect((err as WSClosedError).reason).toContain("(TEXT, AUDIO)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The CURRENT live failure: accepted, then nothing
+// ---------------------------------------------------------------------------
+//
+// The live legs now fail as a bare zero-message timeout. Two causes produce
+// that, and the drift-report artifact could not tell them apart:
+//
+//   A. the session was never established — no `setupComplete` ever arrived;
+//   B. the session WAS established and the turn produced nothing.
+//
+// The per-call message cursor means B's collected count is also 0 (step 2
+// consumed the `setupComplete`), so both printed `Collected 0 messages: []`.
+// These two tests are the discriminator, driven through the REAL probe: the
+// failure now names the step it was on AND the dynamically-resolved model, so
+// the next live run states which cause it hit instead of repeating the
+// ambiguity.
+
+describe("a zero-message live failure names its cause", () => {
+  it("A: a provider mute from the start fails at step=setupComplete", async () => {
+    const err = (await withProvider({ muteFromStart: true }, (provider) =>
+      probe(provider, undefined, 500).then(
+        () => null,
+        (e: unknown) => e,
+      ),
+    )) as Error;
+
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toContain("step=setupComplete");
+    expect(err.message).toContain(`model=${OBSERVED_MODEL}`);
+    // Nothing was read because nothing was sent — an all-zero data tally is the
+    // transport stating it was not the deaf party.
+    expect(err.message).toContain("frames text=0 binary=0");
+  });
+
+  it("B: a provider that answers setup but not the turn fails at step=turn", async () => {
+    const err = (await withProvider({ muteAfterSetup: true }, (provider) =>
+      probe(provider, undefined, 500).then(
+        () => null,
+        (e: unknown) => e,
+      ),
+    )) as Error;
+
+    expect(err).toBeInstanceOf(Error);
+    // The distinction the artifact could not previously make.
+    expect(err.message).toContain("step=turn");
+    expect(err.message).toContain(`model=${OBSERVED_MODEL}`);
+    // The session WAS established: one frame was read before the surface went
+    // quiet, which is what separates this from case A.
+    expect(err.message).toContain("frames text=1");
   });
 });
 
