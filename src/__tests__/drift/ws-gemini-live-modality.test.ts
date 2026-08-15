@@ -796,10 +796,14 @@ describe("three-way TOOL comparison: sdk shapes × provider turn × aimock", () 
         },
       }),
     );
+    // A short budget on purpose: a mock that never emits the `toolCall` must
+    // fail as the collector's own "timed out … Collected N messages" — which
+    // names the defect — rather than as vitest's bare per-test timeout, which
+    // names nothing. Everything here is local and answers in milliseconds.
     const content = await collectMockWSMessages(
       mockWs,
       (msg) => !!msg && typeof msg === "object" && "toolCall" in msg,
-      15000,
+      3000,
       1,
     );
     raw.push(...content.rawMessages);
