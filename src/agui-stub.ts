@@ -47,6 +47,7 @@ export type {
   AGUIInterrupt,
   AGUIResumeEntry,
   AGUIRunFinishedOutcome,
+  AGUITokenUsage,
   AGUIFixtureMatch,
   AGUIFixture,
   AGUIMockOptions,
