@@ -30,7 +30,45 @@ const toolResultFixture: Fixture = {
   response: { content: "Weather in NYC is sunny, 72F" },
 };
 
-const allFixtures: Fixture[] = [textFixture, toolResultFixture, toolFixture, errorFixture];
+/** Audio-only turn: no companion modalities. */
+const audioFixture: Fixture = {
+  match: { userMessage: "sing" },
+  response: { audio: { b64Json: "QUJD", contentType: "audio/pcm;rate=24000" } },
+};
+
+/**
+ * Audio turn that ALSO calls a function and speaks text — the companion
+ * modalities `AudioResponse` documents as preserved (types.ts). Over the Live
+ * protocol `serverContent` and `toolCall` are alternatives of one message
+ * union, so this must arrive as `serverContent` then `toolCall`, not as a
+ * functionCall part (which is how the HTTP generateContent path carries it).
+ */
+const audioToolFixture: Fixture = {
+  match: { userMessage: "forecast" },
+  response: {
+    audio: { b64Json: "REVG", contentType: "audio/pcm;rate=24000" },
+    content: "Let me check.",
+    toolCalls: [{ name: "get_weather", arguments: '{"city":"Paris"}', id: "call_fixed_0" }],
+  },
+};
+
+const audioToolResultFixture: Fixture = {
+  match: { toolCallId: "call_fixed_0" },
+  response: { content: "Sunny." },
+};
+
+// Tool-result fixtures precede the fixtures whose turn produced them: the
+// router takes the FIRST match, and the user message that triggered the tool
+// call is still in the conversation on the follow-up turn.
+const allFixtures: Fixture[] = [
+  textFixture,
+  toolResultFixture,
+  audioToolResultFixture,
+  toolFixture,
+  errorFixture,
+  audioFixture,
+  audioToolFixture,
+];
 
 // --- helpers ---
 
@@ -1104,6 +1142,80 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
     expect(msg.error.code).toBe(13); // gRPC INTERNAL
     expect(msg.error.message).toBe("Fixture response did not match any known type");
     expect(msg.error.status).toBe("INTERNAL");
+
+    ws.close();
+  });
+
+  it("streams an audio-only turn as one serverContent carrying inlineData and turnComplete", async () => {
+    instance = await createServer(allFixtures);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1);
+    ws.send(clientContentMsg("sing"));
+
+    const raw = await ws.waitForMessages(2);
+    expect(JSON.parse(raw[1])).toEqual({
+      serverContent: {
+        modelTurn: { parts: [{ inlineData: { mimeType: "audio/pcm;rate=24000", data: "QUJD" } }] },
+        turnComplete: true,
+      },
+    });
+
+    ws.close();
+  });
+
+  it("streams an audio turn WITH companions as serverContent, then toolCall, then turnComplete", async () => {
+    // The companions used to be dropped: the handler emitted the audio and
+    // returned, so a recorded turn that spoke AND called a function replayed as
+    // audio alone. `toolCall` is a separate message here because the Live
+    // protocol unions it with `serverContent` — it is not a part.
+    instance = await createServer(allFixtures);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1);
+    ws.send(clientContentMsg("forecast"));
+
+    const raw = await ws.waitForMessages(4);
+    expect(JSON.parse(raw[1])).toEqual({
+      serverContent: {
+        modelTurn: {
+          parts: [
+            { inlineData: { mimeType: "audio/pcm;rate=24000", data: "REVG" } },
+            { text: "Let me check." },
+          ],
+        },
+      },
+    });
+    expect(JSON.parse(raw[2])).toEqual({
+      toolCall: {
+        functionCalls: [{ name: "get_weather", args: { city: "Paris" }, id: "call_fixed_0" }],
+      },
+    });
+    expect(JSON.parse(raw[3])).toEqual({ serverContent: { turnComplete: true } });
+
+    ws.close();
+  });
+
+  it("carries the audio turn's companions into conversation history", async () => {
+    // The wire message is only half the fix: a dropped tool call also left the
+    // session unable to answer the client's toolResponse, because history held
+    // "[audio]" and no tool_calls at all. Answering the follow-up proves the
+    // emitted id and the recorded id are the same id.
+    instance = await createServer(allFixtures);
+    const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
+
+    ws.send(setupMsg());
+    await ws.waitForMessages(1);
+    ws.send(clientContentMsg("forecast"));
+    await ws.waitForMessages(4);
+
+    ws.send(toolResponseMsg("get_weather", { temp: 20 }, "call_fixed_0"));
+
+    const raw = await ws.waitForMessages(6);
+    expect(JSON.parse(raw[4]).serverContent.modelTurn.parts[0].text).toBe("Sunny.");
+    expect(JSON.parse(raw[5])).toEqual({ serverContent: { turnComplete: true } });
 
     ws.close();
   });
