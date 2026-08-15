@@ -429,7 +429,7 @@ const DATA_FROZEN: Record<string, { members: () => string[]; pin: string }> = {
   },
   "includeFamilies.gemini": {
     members: () => [...includeFamilies.gemini].sort(),
-    pin: "c2e2c56b8f8d5fc56152b4633e7d3782e95b7eeb9bc123da71f00e884a54a743",
+    pin: "566fb89af6862badeff1d95ecfa511dcd1fc757feeb60a8ff8fec563952cadbc",
   },
   "excludeFamilies.openai": {
     members: () => [...excludeFamilies.openai].sort(),
@@ -441,7 +441,7 @@ const DATA_FROZEN: Record<string, { members: () => string[]; pin: string }> = {
   },
   "excludeFamilies.gemini": {
     members: () => [...excludeFamilies.gemini].sort(),
-    pin: "c95dedab7588212bbba0bf9ab6434bfd43a449adbe7b35f81f48271ee849a9c2",
+    pin: "3c8fb0b7cee776619467afd34407bde69e30b063ae263da4871096e7a7afca1d",
   },
   // The realtime canary's seed sets, previously pinned NOWHERE. An edit to
   // either one was invisible to every guard in the repo: adding a family to

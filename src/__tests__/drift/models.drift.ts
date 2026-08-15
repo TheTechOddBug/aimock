@@ -382,6 +382,9 @@ describe("full live /models wave is fully classified (2026-07-16 drift)", () => 
       "gemini-3.5-flash",
       "gemini-3.5-flash-lite",
       "gemini-3.6-flash",
+      "gemini-3.7-flash",
+      // Restricted EAP surface — explicit exclude (text-capable, but pre-GA)
+      "gemini-3.7-flash-video-understanding-eap",
       // Preview text tiers — auto-excluded by the -preview pattern rule
       "gemini-3-flash-preview",
       "gemini-3-pro-preview",
