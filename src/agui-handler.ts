@@ -15,6 +15,7 @@ import type {
   AGUIRunStartedEvent,
   AGUIRunFinishedEvent,
   AGUIRunFinishedOutcome,
+  AGUITokenUsage,
   AGUIRunErrorEvent,
   AGUITextMessageStartEvent,
   AGUITextMessageContentEvent,
@@ -154,6 +155,13 @@ export interface AGUIBuildOpts {
   parentRunId?: string;
   /** For tool call builder: include a result event */
   result?: string;
+  /**
+   * Token usage to attach to the terminal RUN_FINISHED / RUN_ERROR event.
+   * Optional and never synthesized: aimock does not estimate token counts
+   * from fixture content, so `usage` is emitted only when a caller supplies
+   * it explicitly (same policy as the Bedrock/Cohere/Gemini usage overrides).
+   */
+  usage?: AGUITokenUsage[];
 }
 
 // ─── Event builders ──────────────────────────────────────────────────────────
@@ -169,7 +177,7 @@ function makeRunStarted(opts?: AGUIBuildOpts): AGUIRunStartedEvent {
 
 function makeRunFinished(
   started: AGUIRunStartedEvent,
-  finishOpts?: { outcome?: AGUIRunFinishedOutcome; result?: unknown },
+  finishOpts?: { outcome?: AGUIRunFinishedOutcome; result?: unknown; usage?: AGUITokenUsage[] },
 ): AGUIRunFinishedEvent {
   return {
     type: "RUN_FINISHED",
@@ -177,6 +185,7 @@ function makeRunFinished(
     runId: started.runId,
     ...(finishOpts?.result !== undefined ? { result: finishOpts.result } : {}),
     ...(finishOpts?.outcome !== undefined ? { outcome: finishOpts.outcome } : {}),
+    ...(finishOpts?.usage !== undefined ? { usage: finishOpts.usage } : {}),
   };
 }
 
@@ -203,7 +212,7 @@ export function buildTextResponse(text: string, opts?: AGUIBuildOpts): AGUIEvent
       type: "TEXT_MESSAGE_END",
       messageId,
     } as AGUITextMessageEndEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -221,7 +230,7 @@ export function buildTextChunkResponse(text: string, opts?: AGUIBuildOpts): AGUI
       role: "assistant",
       delta: text,
     } as AGUITextMessageChunkEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -264,7 +273,7 @@ export function buildToolCallResponse(
     } as AGUIToolCallResultEvent);
   }
 
-  events.push(makeRunFinished(started));
+  events.push(makeRunFinished(started, { usage: opts?.usage }));
   return events;
 }
 
@@ -280,7 +289,7 @@ export function buildStateUpdate(snapshot: unknown, opts?: AGUIBuildOpts): AGUIE
       type: "STATE_SNAPSHOT",
       snapshot,
     } as AGUIStateSnapshotEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -296,7 +305,7 @@ export function buildStateDelta(patches: unknown[], opts?: AGUIBuildOpts): AGUIE
       type: "STATE_DELTA",
       delta: patches,
     } as AGUIStateDeltaEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -312,7 +321,7 @@ export function buildMessagesSnapshot(messages: AGUIMessage[], opts?: AGUIBuildO
       type: "MESSAGES_SNAPSHOT",
       messages,
     } as AGUIMessagesSnapshotEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -348,7 +357,7 @@ export function buildReasoningResponse(text: string, opts?: AGUIBuildOpts): AGUI
       type: "REASONING_END",
       messageId,
     } as AGUIReasoningEndEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -372,7 +381,7 @@ export function buildActivityResponse(
       content,
       replace: true,
     } as AGUIActivitySnapshotEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -392,6 +401,7 @@ export function buildErrorResponse(
       type: "RUN_ERROR",
       message,
       ...(code !== undefined ? { code } : {}),
+      ...(opts?.usage !== undefined ? { usage: opts.usage } : {}),
     } as AGUIRunErrorEvent,
   ];
 }
@@ -432,7 +442,7 @@ export function buildStepWithText(
       type: "STEP_FINISHED",
       stepName,
     } as AGUIStepFinishedEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -457,7 +467,11 @@ export function buildCompositeResponse(
   }
 
   const hasError = inner.some((e) => e.type === "RUN_ERROR");
-  return [started, ...inner, ...(hasError ? [] : [makeRunFinished(started)])];
+  return [
+    started,
+    ...inner,
+    ...(hasError ? [] : [makeRunFinished(started, { usage: opts?.usage })]),
+  ];
 }
 
 // ─── Convenience event builders ─────────────────────────────────────────────
@@ -481,7 +495,7 @@ export function buildActivityDelta(
       activityType,
       patch,
     } as AGUIActivityDeltaEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -507,7 +521,7 @@ export function buildToolCallChunk(
       ...(opts?.parentMessageId !== undefined ? { parentMessageId: opts.parentMessageId } : {}),
       delta,
     } as AGUIToolCallChunkEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -524,7 +538,7 @@ export function buildRawEvent(event: unknown, source?: string, opts?: AGUIBuildO
       event,
       ...(source !== undefined ? { source } : {}),
     } as AGUIRawEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -541,7 +555,7 @@ export function buildCustomEvent(name: string, value: unknown, opts?: AGUIBuildO
       name,
       value,
     } as AGUICustomEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -561,7 +575,7 @@ export function buildReasoningChunk(
       ...(opts?.messageId !== undefined ? { messageId: opts.messageId } : {}),
       delta,
     } as AGUIReasoningMessageChunkEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 
@@ -584,7 +598,7 @@ export function buildReasoningEncryptedValue(
       entityId,
       encryptedValue,
     } as AGUIReasoningEncryptedValueEvent,
-    makeRunFinished(started),
+    makeRunFinished(started, { usage: opts?.usage }),
   ];
 }
 

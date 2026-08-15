@@ -74,12 +74,14 @@ export interface AGUIRunFinishedEvent extends AGUIBaseEvent {
   runId: string;
   result?: unknown;
   outcome?: AGUIRunFinishedOutcome;
+  usage?: AGUITokenUsage[];
 }
 
 export interface AGUIRunErrorEvent extends AGUIBaseEvent {
   type: "RUN_ERROR";
   message: string;
   code?: string;
+  usage?: AGUITokenUsage[];
 }
 
 export interface AGUIStepStartedEvent extends AGUIBaseEvent {
@@ -341,6 +343,23 @@ export interface AGUIResumeEntry {
 export type AGUIRunFinishedOutcome =
   | { type: "success" }
   | { type: "interrupt"; interrupts: AGUIInterrupt[] };
+
+/**
+ * Numeric-only token usage summary, mirroring `TokenUsageSchema` in
+ * `@ag-ui/core`. Deliberately carries no content-bearing or identifying
+ * fields — only provider/model labels and non-negative integer token counts.
+ * Carried as an array on RUN_FINISHED / RUN_ERROR so a run that invokes
+ * multiple models keeps them separate.
+ */
+export interface AGUITokenUsage {
+  provider?: string;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  reasoningTokens?: number;
+  cachedInputTokens?: number;
+}
 
 // ─── Request types ───────────────────────────────────────────────────────────
 

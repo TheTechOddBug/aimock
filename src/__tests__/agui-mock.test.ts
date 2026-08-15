@@ -3,7 +3,7 @@ import * as http from "node:http";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AGUIEvent, AGUIRunAgentInput } from "../agui-types.js";
+import type { AGUIEvent, AGUIRunAgentInput, AGUITokenUsage } from "../agui-types.js";
 import { AGUIMock } from "../agui-mock.js";
 import {
   buildTextResponse,
@@ -1709,6 +1709,68 @@ describe("AGUIMock recorder — structured user content", () => {
 // ---------------------------------------------------------------------------
 // NO_USER_MESSAGE_SENTINEL — wire-format compatibility guard
 // ---------------------------------------------------------------------------
+
+describe("AG-UI token usage on terminal events", () => {
+  const usage: AGUITokenUsage[] = [
+    {
+      provider: "openai",
+      model: "gpt-4o",
+      inputTokens: 12,
+      outputTokens: 34,
+      totalTokens: 46,
+      reasoningTokens: 5,
+      cachedInputTokens: 2,
+    },
+  ];
+
+  it("buildTextResponse attaches usage to RUN_FINISHED when supplied", () => {
+    const events = buildTextResponse("hello", { usage });
+    const finished = events.find((e) => e.type === "RUN_FINISHED") as unknown as Record<
+      string,
+      unknown
+    >;
+    expect(finished.usage).toEqual(usage);
+  });
+
+  it("buildErrorResponse attaches usage to RUN_ERROR when supplied", () => {
+    const events = buildErrorResponse("boom", "ERR_500", { usage });
+    const errored = events.find((e) => e.type === "RUN_ERROR") as unknown as Record<
+      string,
+      unknown
+    >;
+    expect(errored.usage).toEqual(usage);
+  });
+
+  it("never synthesizes usage when the caller does not supply it", () => {
+    // aimock does not estimate token counts from fixture content (same policy
+    // as the Bedrock/Cohere/Gemini usage overrides): absent in, absent out.
+    const finished = buildTextResponse("hello").find(
+      (e) => e.type === "RUN_FINISHED",
+    ) as unknown as Record<string, unknown>;
+    expect("usage" in finished).toBe(false);
+
+    const errored = buildErrorResponse("boom").find(
+      (e) => e.type === "RUN_ERROR",
+    ) as unknown as Record<string, unknown>;
+    expect("usage" in errored).toBe(false);
+  });
+
+  it("emits usage over the wire on the SSE stream", async () => {
+    agui = new AGUIMock({ port: 0 });
+    agui.onRun("usage please", buildTextResponse("ok", { usage }));
+    await agui.start();
+
+    const resp = await post(agui.url, aguiInput("usage please"));
+    expect(resp.status).toBe(200);
+
+    const parsed = parseSSEEvents(resp.body);
+    const finished = parsed.find((e) => e.type === "RUN_FINISHED") as unknown as Record<
+      string,
+      unknown
+    >;
+    expect(finished.usage).toEqual(usage);
+  });
+});
 
 describe("NO_USER_MESSAGE_SENTINEL", () => {
   it("preserves the historical on-disk sentinel string", () => {
