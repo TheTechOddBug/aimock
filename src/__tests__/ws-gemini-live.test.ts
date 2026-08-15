@@ -52,8 +52,26 @@ const audioToolFixture: Fixture = {
   },
 };
 
-const audioToolResultFixture: Fixture = {
-  match: { toolCallId: "call_fixed_0" },
+/**
+ * Answers the follow-up turn ONLY if the session recorded the audio turn's
+ * companions in its own conversation history.
+ *
+ * Matching on `toolCallId` would NOT do: that reads the id off the client's
+ * incoming toolResponse, so it matches whether or not the handler ever recorded
+ * the assistant turn — a guard that cannot fail. The predicate reads the
+ * ASSISTANT message the handler pushed, which is the thing under test.
+ */
+const audioHistoryFixture: Fixture = {
+  match: {
+    predicate: (req) => {
+      const assistant = req.messages.find((m) => m.role === "assistant");
+      return (
+        assistant?.content === "Let me check." &&
+        assistant?.tool_calls?.[0]?.id === "call_fixed_0" &&
+        assistant?.tool_calls?.[0]?.function.name === "get_weather"
+      );
+    },
+  },
   response: { content: "Sunny." },
 };
 
@@ -63,7 +81,7 @@ const audioToolResultFixture: Fixture = {
 const allFixtures: Fixture[] = [
   textFixture,
   toolResultFixture,
-  audioToolResultFixture,
+  audioHistoryFixture,
   toolFixture,
   errorFixture,
   audioFixture,
@@ -1200,9 +1218,10 @@ describe("WebSocket Gemini Live BidiGenerateContent", () => {
 
   it("carries the audio turn's companions into conversation history", async () => {
     // The wire message is only half the fix: a dropped tool call also left the
-    // session unable to answer the client's toolResponse, because history held
-    // "[audio]" and no tool_calls at all. Answering the follow-up proves the
-    // emitted id and the recorded id are the same id.
+    // session's history holding "[audio]" and no tool_calls at all. The
+    // follow-up fixture matches on that history (see `audioHistoryFixture`), so
+    // answering it proves the companions were recorded AND that the id on the
+    // wire is the id in history.
     instance = await createServer(allFixtures);
     const ws = await connectWebSocket(instance.url, GEMINI_WS_PATH);
 
