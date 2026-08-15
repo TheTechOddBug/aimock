@@ -294,6 +294,7 @@ export type {
   AGUIInterrupt,
   AGUIResumeEntry,
   AGUIRunFinishedOutcome,
+  AGUITokenUsage,
 } from "./agui-types.js";
 export type { AGUIBuildOpts } from "./agui-handler.js";
 export { matchesFixture as matchesAGUIFixture } from "./agui-handler.js";

@@ -464,7 +464,33 @@ async function processMessage(
     return;
   }
 
-  // Audio response — single frame with inlineData and turnComplete: true
+  // Audio response — an AUDIO-modality model turn, plus the companion
+  // modalities `AudioResponse` documents (types.ts) as preserved alongside it.
+  //
+  // COMPANION PLACEMENT is protocol-specific, and the Live protocol does NOT
+  // place a tool call where the HTTP protocol does. On `generateContent` a
+  // functionCall is a PART, so gemini.ts's `buildGeminiAudioParts` appends it to
+  // the same `content.parts` array as the audio. On Live, `serverContent` and
+  // `toolCall` are alternatives of ONE union: `@google/genai`'s
+  // `LiveServerMessage` declares them as sibling optional fields and the
+  // BidiGenerateContent reference states the response's `messageType` union
+  // "can be only one of the following". A turn that both speaks and calls a
+  // function is therefore TWO messages, not one part list —
+  //
+  //   serverContent{modelTurn.parts} → toolCall{functionCalls} → serverContent{turnComplete}
+  //
+  // — which is also the order every other branch of this handler already emits
+  // and the order the live provider was observed to use (its tool turn sent a
+  // `serverContent` strictly before the `toolCall`).
+  //
+  // Emitting only the audio and returning — the previous behavior — silently
+  // discarded the tool call and the text content of a recorded audio turn, the
+  // exact loss types.ts's AudioResponse companions exist to prevent.
+  //
+  // NOT handled here: `AudioResponse.reasoning`. This handler has no thought
+  // channel in ANY branch (nothing in it emits `thought: true`), so replaying
+  // reasoning from the audio branch alone would invent a Live-wide capability
+  // out of one fixture field. That gap is real but separate.
   if (isAudioResponse(response)) {
     journal.add({
       method: "WS",
@@ -486,20 +512,62 @@ async function processMessage(
       data = audioResp.audio.b64Json;
     }
 
-    ws.send(
-      JSON.stringify({
-        serverContent: {
-          modelTurn: {
-            parts: [{ inlineData: { mimeType, data } }],
-          },
-          turnComplete: true,
-        },
-      }),
-    );
+    // Part order mirrors gemini.ts's `buildGeminiAudioParts`: audio first, then
+    // the text companion.
+    const parts: GeminiLivePart[] = [{ inlineData: { mimeType, data } }];
+    if (audioResp.content) {
+      parts.push({ text: audioResp.content });
+    }
+
+    // Stable IDs resolved once, so the wire message and conversation history
+    // agree (same contract as the tool-call branches below).
+    const resolvedToolCalls = (audioResp.toolCalls ?? []).map((tc) => ({
+      ...tc,
+      resolvedId: tc.id ?? generateToolCallId(),
+    }));
+
+    if (resolvedToolCalls.length === 0) {
+      ws.send(
+        JSON.stringify({
+          serverContent: { modelTurn: { parts }, turnComplete: true },
+        }),
+      );
+    } else {
+      ws.send(JSON.stringify({ serverContent: { modelTurn: { parts } } }));
+
+      if (!ws.isClosed) {
+        const functionCalls = resolvedToolCalls.map((tc) => {
+          let argsObj: Record<string, unknown>;
+          try {
+            argsObj = JSON.parse(tc.arguments || "{}") as Record<string, unknown>;
+          } catch {
+            defaults.logger.warn(
+              `Malformed JSON in fixture tool call arguments for "${tc.name}": ${tc.arguments}`,
+            );
+            argsObj = {};
+          }
+          return { name: tc.name, args: argsObj, id: tc.resolvedId };
+        });
+        ws.send(JSON.stringify({ toolCall: { functionCalls } }));
+      }
+
+      if (!ws.isClosed) {
+        ws.send(JSON.stringify({ serverContent: { turnComplete: true } }));
+      }
+    }
 
     session.conversationHistory.push({
       role: "assistant",
-      content: "[audio]",
+      content: audioResp.content ?? "[audio]",
+      ...(resolvedToolCalls.length > 0
+        ? {
+            tool_calls: resolvedToolCalls.map((tc) => ({
+              id: tc.resolvedId,
+              type: "function" as const,
+              function: { name: tc.name, arguments: tc.arguments },
+            })),
+          }
+        : {}),
     });
     return;
   }

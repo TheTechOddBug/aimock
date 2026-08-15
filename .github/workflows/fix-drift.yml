@@ -928,10 +928,13 @@ jobs:
       # commitSyncChanges, but that commit lives only in the runner's working tree,
       # and the "Push branch + create PR" step above fires only on
       # reason == 'ok-applied'. So this step pushes a DISTINCT branch and opens a
-      # needs-human PR. NO AUTO-MERGE: a human sets `Decision: include` (or closes
-      # to reject) and merges, and the NEXT drift-sync run reads the approved note
-      # from main and applies the mechanical edit. Without a persisted note that
-      # two-run hand-off can never start.
+      # needs-human PR. NO AUTO-MERGE, and NO two-run hand-off for a new family:
+      # `includeFamilies` is checksum-pinned, so adding a family moves the pin and
+      # reds the freeze test gate-2 re-runs, while gate-1's allowlist bars drift-sync
+      # from re-pinning — a follow-up run reports `gate-failed`, not `ok-applied`. A
+      # human classifies BY HAND in one commit (registry + both re-pins + the note +
+      # the offline /models wave) and closes the PR. The note still has to persist:
+      # it is what makes the decision reachable and reviewable in the repo.
       #
       # Re-fire discipline (no PR spam): three layers, idempotent in EVERY run
       # shape, applied in this order. PRIMARY — skip when an open PR already carries
@@ -1563,12 +1566,17 @@ jobs:
             echo "structural mismatch). It wrote the note file(s) below and opened this PR so"
             echo "the decision is REACHABLE in the repo."
             echo ""
-            echo "> **Not auto-merged — a human decides.** For a *new-family* note: set the"
-            echo "> note's decision line to \`Decision: include\` (to classify it) or delete the"
-            echo "> note / close this PR (to reject), then **merge this PR**. The NEXT drift-sync"
-            echo "> run reads the approved note from \`main\` and mechanically applies the registry"
-            echo "> edit (still zero-LLM — a human-authored marker, not generated code), opening a"
-            echo "> separate data-only PR. That two-run hand-off is how the loop closes."
+            echo "> **Not auto-merged — a human decides, and applies it by hand.**"
+            echo "> For a *new-family* note, DO NOT expect merging this PR to apply anything:"
+            echo "> \`includeFamilies\` is checksum-pinned, and adding a family moves that pin,"
+            echo "> which reds the freeze test gate-2 re-runs. drift-sync cannot re-pin — the"
+            echo "> gate-1 allowlist permits only \`model-registry.ts\` and \`drift-proposals/\`."
+            echo "> So a follow-up run would report \`gate-failed\`, not \`ok-applied\`."
+            echo ">"
+            echo "> The procedure that actually works, in ONE commit: add the family to"
+            echo "> \`includeFamilies\` (or \`excludeFamilies\` to reject), re-pin BOTH checksums,"
+            echo "> resolve the note file(s) below, and update the offline \`/models\` wave."
+            echo "> Then close this PR. Prior examples: 72f85f8, 936b59c."
             echo ""
             echo "### Note file(s) in this PR"
             echo ""

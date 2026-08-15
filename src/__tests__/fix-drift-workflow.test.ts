@@ -2694,10 +2694,19 @@ describe("fix-drift.yml — needs-human notes are PERSISTED (pushed + PR'd), not
     );
   });
 
-  it("the needs-human persist step's PR body tells a human to set Decision: include and merge (closing the two-run loop), never auto-merged", () => {
+  it("the needs-human persist step's PR body states the procedure that ACTUALLY applies a family, and never auto-merges", () => {
     const body = codeOf(persistStep());
-    expect(body).toContain("Decision: include");
-    // No `gh pr merge` anywhere (asserted globally too) — human merges.
+    // The body used to instruct `Decision: include` + merge, promising a
+    // two-run hand-off. That path cannot work: `includeFamilies` is
+    // checksum-pinned, adding a family moves the pin and reds the freeze test
+    // gate-2 re-runs, and gate-1's allowlist bars drift-sync from re-pinning —
+    // a follow-up run reports `gate-failed`, never `ok-applied`. Every
+    // classification in this repo's history landed BY HAND (72f85f8, 936b59c).
+    // This pins the corrected instruction so the false one cannot come back.
+    expect(body).not.toContain("Decision: include");
+    expect(body).toContain("re-pin BOTH checksums");
+    expect(body).toMatch(/by hand/i);
+    // No `gh pr merge` anywhere (asserted globally too) — a human merges.
     expect(body).not.toMatch(/gh pr merge/);
   });
 

@@ -148,6 +148,7 @@ export const includeFamilies: Record<Provider, Set<string>> = {
     "gemini-3.5-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.6-flash",
+    "gemini-3.7-flash",
   ]),
 };
 
@@ -286,6 +287,21 @@ export const excludeFamilies: Record<Provider, Set<string>> = {
     "gemini-2.0-flash-thinking-exp",
     // Live/full-duplex voice — owned by the realtime canary, not this text check
     "gemini-live",
+    // Restricted EARLY-ACCESS (EAP) surface, not a GA tier. Google's own live
+    // /models entry declares `displayName` AND `description` as
+    // "[Confidential] Gemini 3.7 Flash Video Understanding EAP" — the only one
+    // of the 54 live entries carrying either marker. NOT excluded for being
+    // "video" by name: it genuinely declares `generateContent` (same method set
+    // as its GA sibling gemini-3.7-flash), so it IS text-capable. It is excluded
+    // because it is a gated pre-GA surface, which is the same policy
+    // PREVIEW_FAMILY applies to every `-preview` tier — aimock does not mock
+    // pre-GA surfaces. It carries no trailing `-preview` token, so that rule
+    // cannot reach it and it must be enumerated here (mirrors the
+    // `-preview-tts` / `-preview-customtools` entries above).
+    //
+    // Decision: EXCLUDE, recorded in
+    // drift-proposals/gemini-gemini-3.7-flash-video-understanding-eap-new-family.md.
+    "gemini-3.7-flash-video-understanding-eap",
     // NOTE: every `-preview` family (gemini-3.x preview tiers, deep-research
     // previews, antigravity-preview-05, computer-use-preview-10, image/tts/robotics
     // previews, lyria/veo/nano-banana previews, gemini-embedding-2-preview, …) is

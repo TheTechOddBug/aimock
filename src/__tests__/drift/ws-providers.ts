@@ -28,7 +28,17 @@ interface WSResult {
 
 interface TLSWSClient {
   send(data: string): void;
-  waitUntil(predicate: (msg: unknown) => boolean, timeoutMs?: number): Promise<unknown[]>;
+  /**
+   * `step` names the protocol step being awaited (e.g. `"setupComplete"`), and
+   * is carried into the failure text. Without it, every stage of a multi-step
+   * handshake fails with the same sentence, so a probe that never got past
+   * setup and one whose turn produced nothing are indistinguishable in CI.
+   */
+  waitUntil(
+    predicate: (msg: unknown) => boolean,
+    timeoutMs?: number,
+    step?: string,
+  ): Promise<unknown[]>;
   close(): void;
 }
 
@@ -115,6 +125,53 @@ export function parseCloseFrame(payload: Buffer): { code: number; reason: string
   const code = payload.length >= 2 ? payload.readUInt16BE(0) : 1005;
   const reason = payload.length > 2 ? payload.subarray(2).toString("utf-8") : "";
   return { code, reason };
+}
+
+/**
+ * Per-opcode count of the RFC 6455 frames a connection has received.
+ *
+ * The point is that NOTHING the transport is handed can be invisible. A
+ * zero-message failure used to be a single, ambiguous sentence — "Collected 0
+ * messages" — that a mute provider and a provider whose frames this client
+ * could not decode produced identically. With the tally attached, `text=0
+ * binary=0 unhandled=0` says the surface really sent nothing, while any nonzero
+ * count says bytes arrived and the fault is on this side of the wire.
+ */
+export interface WSFrameTally {
+  /** Data frames with opcode 0x1. */
+  text: number;
+  /** Data frames with opcode 0x2 — read exactly like text (both carry JSON). */
+  binary: number;
+  /** Continuation frames (opcode 0x0) folded into a fragmented message. */
+  continuation: number;
+  /** Control frames: ping (0x9), pong (0xA), close (0x8). */
+  ping: number;
+  pong: number;
+  close: number;
+  /**
+   * Frames whose opcode this client does not implement. Counted rather than
+   * dropped: an unhandled frame is the one thing that must never be silent,
+   * because silence is what it would otherwise be mistaken for.
+   */
+  unhandled: number;
+}
+
+function emptyFrameTally(): WSFrameTally {
+  return { text: 0, binary: 0, continuation: 0, ping: 0, pong: 0, close: 0, unhandled: 0 };
+}
+
+/**
+ * Render a connection's frame tally, plus the protocol step that was waiting,
+ * for a failure message. Appended AFTER {@link describeCollected} so the
+ * collector's `waitUntil timeout after <n>ms. Collected <n> messages:`
+ * recognizer keeps matching an uninterrupted prefix.
+ */
+export function describeTransport(tally: WSFrameTally, step?: string): string {
+  return (
+    `Transport: ${step ? `step=${step} ` : ""}frames text=${tally.text} ` +
+    `binary=${tally.binary} continuation=${tally.continuation} ping=${tally.ping} ` +
+    `pong=${tally.pong} close=${tally.close} unhandled=${tally.unhandled}.`
+  );
 }
 
 /**
@@ -320,6 +377,24 @@ export function connectTLSWebSocket(
       let closeInfo: { code: number; reason: string } | null = null;
       // Connection-scoped cursor so successive waitUntil calls resume where the last left off
       let checkedUpTo = 0;
+      // Every frame this connection has received, by opcode. Read by the
+      // failure paths so a zero-message outcome states what DID arrive.
+      const tally = emptyFrameTally();
+      // Fragment reassembly buffer (RFC 6455 §5.4). A data frame with FIN=0
+      // starts a message that continuation frames extend; only the final
+      // fragment emits. Non-empty means a message is mid-flight.
+      let fragments: Buffer[] = [];
+
+      /** Decode a completed message payload and wake every pending waiter. */
+      const emitMessage = (payload: Buffer) => {
+        const text = payload.toString("utf-8");
+        try {
+          messages.push(JSON.parse(text));
+        } catch {
+          messages.push(text);
+        }
+        for (const r of messageResolvers) r();
+      };
 
       socket.on("data", (data: Buffer) => {
         buffer = Buffer.concat([buffer, data]);
@@ -357,7 +432,11 @@ export function connectTLSWebSocket(
               socket.write(buildMaskedTextFrame(Buffer.from(data, "utf-8")));
             },
 
-            waitUntil(predicate: (msg: unknown) => boolean, timeoutMs = 30000): Promise<unknown[]> {
+            waitUntil(
+              predicate: (msg: unknown) => boolean,
+              timeoutMs = 30000,
+              step?: string,
+            ): Promise<unknown[]> {
               return new Promise((resolve, reject) => {
                 const collected: unknown[] = [];
                 let settled = false;
@@ -376,7 +455,8 @@ export function connectTLSWebSocket(
                   reject(
                     new WSClosedError(
                       `WebSocket closed by server during waitUntil: code=${info.code} ` +
-                        `reason=${JSON.stringify(info.reason)}. ${describeCollected(collected)}`,
+                        `reason=${JSON.stringify(info.reason)}. ${describeCollected(collected)} ` +
+                        `${describeTransport(tally, step)}`,
                       info.code,
                       info.reason,
                     ),
@@ -410,7 +490,8 @@ export function connectTLSWebSocket(
                     removeResolver();
                     reject(
                       new Error(
-                        `waitUntil timeout after ${timeoutMs}ms. ${describeCollected(collected)}`,
+                        `waitUntil timeout after ${timeoutMs}ms. ${describeCollected(collected)} ` +
+                          `${describeTransport(tally, step)}`,
                       ),
                     );
                   }
@@ -426,7 +507,8 @@ export function connectTLSWebSocket(
                     reject(
                       new Error(
                         `WebSocket error during waitUntil: ${socketError.message}. ` +
-                          `Collected ${collected.length} messages.`,
+                          `Collected ${collected.length} messages. ` +
+                          `${describeTransport(tally, step)}`,
                       ),
                     );
                     return;
@@ -486,6 +568,7 @@ export function connectTLSWebSocket(
         while (buffer.length >= 2) {
           const byte0 = buffer[0];
           const byte1 = buffer[1];
+          const fin = (byte0 & 0x80) !== 0;
           const opcode = byte0 & 0x0f;
           let payloadLength = byte1 & 0x7f;
           let offset = 2;
@@ -506,26 +589,52 @@ export function connectTLSWebSocket(
           const framePayload = buffer.subarray(offset, offset + payloadLength);
           buffer = buffer.subarray(offset + payloadLength);
 
-          if (opcode === 0x1) {
-            // text frame
-            const text = framePayload.toString("utf-8");
-            try {
-              const parsed = JSON.parse(text);
-              messages.push(parsed);
-            } catch {
-              messages.push(text);
+          if (opcode === 0x1 || opcode === 0x2) {
+            // A data frame. TEXT and BINARY are decoded IDENTICALLY: this
+            // protocol's payload is UTF-8 JSON either way, and which opcode a
+            // provider picks is its own choice — `@google/genai` decodes an
+            // inbound Blob/ArrayBuffer for exactly that reason. Treating 0x2 as
+            // unreadable is what made a talking provider look mute.
+            if (opcode === 0x1) tally.text++;
+            else tally.binary++;
+            if (fin) {
+              emitMessage(framePayload);
+            } else {
+              // Copy: `framePayload` is a view onto the receive buffer, which
+              // is replaced on the next socket "data" event.
+              fragments = [Buffer.from(framePayload)];
             }
-            for (const r of messageResolvers) r();
+          } else if (opcode === 0x0) {
+            // Continuation of a fragmented message. Emit only on FIN — a
+            // partial message must NOT be surfaced as if it were complete.
+            tally.continuation++;
+            if (fragments.length > 0) {
+              fragments.push(Buffer.from(framePayload));
+              if (fin) {
+                const complete = Buffer.concat(fragments);
+                fragments = [];
+                emitMessage(complete);
+              }
+            }
           } else if (opcode === 0x8) {
             // close frame — keep the code/reason before ending the socket, then
             // wake any pending waitUntil so it can report the stated reason.
             // Socket lifecycle is deliberately unchanged: still a plain end().
+            tally.close++;
             closeInfo = parseCloseFrame(framePayload);
             socket.end();
             for (const r of messageResolvers) r();
           } else if (opcode === 0x9) {
-            // ping — respond with pong per RFC 6455
+            // ping — respond with pong per RFC 6455. Control frames may be
+            // interleaved between fragments, so this must not touch `fragments`.
+            tally.ping++;
             socket.write(buildMaskedPongFrame(framePayload));
+          } else if (opcode === 0xa) {
+            tally.pong++;
+          } else {
+            // An opcode this client does not implement. Counted, never dropped
+            // silently — see WSFrameTally.
+            tally.unhandled++;
           }
         }
       });
@@ -559,7 +668,7 @@ export async function openaiResponsesWS(
   // Terminal: a completion event ("response.completed"/"response.done", both
   // observed in the wild) OR a request-level error frame — see
   // isResponsesWSTerminal for why the error frame must be terminal too.
-  const rawMessages = await ws.waitUntil(isResponsesWSTerminal);
+  const rawMessages = await ws.waitUntil(isResponsesWSTerminal, undefined, "response");
 
   ws.close();
 
@@ -597,7 +706,11 @@ export async function openaiRealtimeWS(
   );
 
   // Step 1: Wait for session.created
-  const sessionCreated = await ws.waitUntil((msg: any) => msg?.type === "session.created");
+  const sessionCreated = await ws.waitUntil(
+    (msg: any) => msg?.type === "session.created",
+    undefined,
+    "session.created",
+  );
 
   // Step 2: Send session.update.
   // GA requires session.type:"realtime" and renames the legacy `modalities`
@@ -612,7 +725,11 @@ export async function openaiRealtimeWS(
   ws.send(JSON.stringify({ type: "session.update", session }));
 
   // Step 3: Wait for session.updated
-  const sessionUpdated = await ws.waitUntil((msg: any) => msg?.type === "session.updated");
+  const sessionUpdated = await ws.waitUntil(
+    (msg: any) => msg?.type === "session.updated",
+    undefined,
+    "session.updated",
+  );
 
   // Step 4: Send conversation.item.create
   ws.send(
@@ -627,13 +744,21 @@ export async function openaiRealtimeWS(
   );
 
   // Step 5: Wait for conversation.item.added (GA)
-  const itemCreated = await ws.waitUntil((msg: any) => msg?.type === "conversation.item.added");
+  const itemCreated = await ws.waitUntil(
+    (msg: any) => msg?.type === "conversation.item.added",
+    undefined,
+    "conversation.item.added",
+  );
 
   // Step 6: Send response.create
   ws.send(JSON.stringify({ type: "response.create" }));
 
   // Step 7: Collect until response.done
-  const responseMessages = await ws.waitUntil((msg: any) => msg?.type === "response.done");
+  const responseMessages = await ws.waitUntil(
+    (msg: any) => msg?.type === "response.done",
+    undefined,
+    "response.done",
+  );
 
   ws.close();
 
@@ -683,6 +808,12 @@ export const GEMINI_LIVE_HOST = "generativelanguage.googleapis.com";
 export interface GeminiLiveTransportOptions extends TLSWSConnectOptions {
   /** Host override. Defaults to {@link GEMINI_LIVE_HOST}. */
   host?: string;
+  /**
+   * Per-step wait budget in ms. Defaults to the client's 30s, which is what the
+   * live leg uses. Exists so a test can drive the REAL probe against a provider
+   * that goes mute — the live failure mode — without waiting out 30 seconds.
+   */
+  waitMs?: number;
 }
 
 /**
@@ -757,9 +888,16 @@ export async function geminiLiveWS(
   if (tools) setup.tools = tools;
   ws.send(JSON.stringify({ setup }));
 
-  // Step 2: Wait for setupComplete
+  // Step 2: Wait for setupComplete. The step LABEL is what makes a silent run
+  // diagnosable: `step=setupComplete` means the session was never established,
+  // `step=turn` below means it was and the turn produced nothing — two very
+  // different causes that previously failed with identical text. The MODEL rides
+  // along because it is resolved dynamically from the live listing, so a failure
+  // that does not name it cannot be attributed to a model at all.
   const setupComplete = await ws.waitUntil(
     (msg: any) => msg && typeof msg === "object" && "setupComplete" in msg,
+    transport?.waitMs,
+    `setupComplete model=${model}`,
   );
 
   // Step 3: Send client content
@@ -773,14 +911,18 @@ export async function geminiLiveWS(
   );
 
   // Step 4: Collect until turnComplete or toolCall
-  const responseMessages = await ws.waitUntil((msg: any) => {
-    if (!msg || typeof msg !== "object") return false;
-    if ("toolCall" in msg) return true;
-    if ("serverContent" in msg) {
-      return (msg as any).serverContent?.turnComplete === true;
-    }
-    return false;
-  });
+  const responseMessages = await ws.waitUntil(
+    (msg: any) => {
+      if (!msg || typeof msg !== "object") return false;
+      if ("toolCall" in msg) return true;
+      if ("serverContent" in msg) {
+        return (msg as any).serverContent?.turnComplete === true;
+      }
+      return false;
+    },
+    transport?.waitMs,
+    `turn model=${model}`,
+  );
 
   ws.close();
 
