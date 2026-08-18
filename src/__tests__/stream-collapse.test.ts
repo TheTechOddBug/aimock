@@ -1999,6 +1999,302 @@ describe("collapseOpenAISSE Responses API function calls", () => {
       { name: "get_weather", arguments: '{"city":"Paris"}', id: "call_abc" },
     ]);
   });
+
+  it("backfills id and name from output_item.done when the .added event was absent", () => {
+    // The opening `response.output_item.added` never arrives; the first
+    // arguments delta creates the accumulator (with empty id/name) and the
+    // closing `response.output_item.done` backfills both from the item.
+    const body = [
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_bf",
+        output_index: 0,
+        delta: '{"x":1}',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_bf",
+          call_id: "call_backfill",
+          name: "backfilled_fn",
+          arguments: '{"x":1}',
+          status: "completed",
+        },
+      })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0]).toMatchObject({
+      name: "backfilled_fn",
+      arguments: '{"x":1}',
+      id: "call_backfill",
+    });
+    expect(result.content).toBeUndefined();
+  });
+
+  it("adopts full arguments from output_item.done when the delta stream produced none", () => {
+    // No `response.function_call_arguments.*` events at all: the `.added` entry
+    // stays empty-args until `output_item.done` supplies the full string.
+    const body = [
+      `data: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_nd",
+          call_id: "call_nodelta",
+          name: "no_deltas",
+          arguments: "",
+          status: "in_progress",
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_nd",
+          call_id: "call_nodelta",
+          name: "no_deltas",
+          arguments: '{"a":true}',
+          status: "completed",
+        },
+      })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0]).toMatchObject({
+      name: "no_deltas",
+      arguments: '{"a":true}',
+      id: "call_nodelta",
+    });
+  });
+
+  it("creates a brand-new entry from output_item.done when no prior event registered the output_index", () => {
+    // Nothing precedes the finalizer: no `.added`, no argument deltas. The
+    // `output_item.done` item alone must yield a complete tool call instead of
+    // being swallowed by the `response.*` catch-all.
+    const body = [
+      `data: ${JSON.stringify({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_only",
+          call_id: "call_done_only",
+          name: "done_only",
+          arguments: '{"from":"done"}',
+          status: "completed",
+        },
+      })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0]).toMatchObject({
+      name: "done_only",
+      arguments: '{"from":"done"}',
+      id: "call_done_only",
+    });
+    expect(result.content).toBeUndefined();
+  });
+
+  it("output_item.done does not overwrite non-empty delta-accumulated arguments", () => {
+    // The deltas already carry the complete string; a done item whose
+    // `arguments` DIFFERS must be ignored — adopt-only-when-empty, never
+    // re-append and never overwrite.
+    const body = [
+      `data: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_g1",
+          call_id: "call_guard1",
+          name: "guarded",
+          arguments: "",
+          status: "in_progress",
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_g1",
+        output_index: 0,
+        delta: '{"q":"from-deltas"}',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_g1",
+          call_id: "call_guard1",
+          name: "guarded",
+          arguments: '{"q":"from-done-DIFFERENT"}',
+          status: "completed",
+        },
+      })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0].arguments).toBe('{"q":"from-deltas"}');
+  });
+
+  it("function_call_arguments.done does not double-append onto delta-accumulated arguments", () => {
+    // The `.done` event repeats the fully-assembled arguments; appending it to
+    // the already-complete delta accumulation would corrupt the JSON. Use a
+    // differing payload so overwrite-instead-of-ignore is also caught.
+    const body = [
+      `data: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_g2",
+          call_id: "call_guard2",
+          name: "guarded2",
+          arguments: "",
+          status: "in_progress",
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_g2",
+        output_index: 0,
+        delta: '{"q":"from-deltas"}',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.done",
+        item_id: "fc_g2",
+        output_index: 0,
+        arguments: '{"q":"from-args-done-DIFFERENT"}',
+      })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0].arguments).toBe('{"q":"from-deltas"}');
+    expect(JSON.parse(result.toolCalls![0].arguments)).toEqual({ q: "from-deltas" });
+  });
+
+  it("adopts arguments from a delta-less function_call_arguments.done into an existing entry", () => {
+    // `.added` opened the call but no argument deltas followed; the bare
+    // `function_call_arguments.done` (with no closing `output_item.done`)
+    // supplies the arguments.
+    const body = [
+      `data: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_ad",
+          call_id: "call_adopt",
+          name: "adopt_args",
+          arguments: "",
+          status: "in_progress",
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.done",
+        item_id: "fc_ad",
+        output_index: 0,
+        arguments: '{"k":"v"}',
+      })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0]).toMatchObject({
+      name: "adopt_args",
+      arguments: '{"k":"v"}',
+      id: "call_adopt",
+    });
+  });
+
+  it("creates a new entry from a bare function_call_arguments.done when nothing preceded it", () => {
+    // The only event for this output_index is the arguments `.done`. It carries
+    // no name and no call_id, so the collapsed call has an empty name and the
+    // id field is omitted entirely (empty string is falsy in the spread guard).
+    const body = [
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.done",
+        item_id: "fc_bare",
+        output_index: 0,
+        arguments: '{"solo":1}',
+      })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0].name).toBe("");
+    expect(result.toolCalls![0].arguments).toBe('{"solo":1}');
+    expect(result.toolCalls![0].id).toBeUndefined();
+    expect(result.content).toBeUndefined();
+  });
+
+  it("omits the tool-call id when the function_call item has no call_id", () => {
+    // Defensive: a function_call item missing `call_id` accumulates with
+    // `id: ""`, and the empty id is dropped from the collapsed toolCall (same
+    // falsy-spread rule as the sibling collapsers).
+    const body = [
+      `data: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_noid",
+          name: "no_call_id",
+          arguments: "",
+          status: "in_progress",
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_noid",
+        output_index: 0,
+        delta: '{"n":2}',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_noid",
+          name: "no_call_id",
+          arguments: '{"n":2}',
+          status: "completed",
+        },
+      })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0].name).toBe("no_call_id");
+    expect(result.toolCalls![0].arguments).toBe('{"n":2}');
+    expect(result.toolCalls![0].id).toBeUndefined();
+  });
 });
 
 describe("collapseAnthropicSSE with thinking", () => {
