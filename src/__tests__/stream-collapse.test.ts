@@ -1773,6 +1773,158 @@ describe("collapseOpenAISSE with reasoning", () => {
   });
 });
 
+describe("collapseOpenAISSE Responses API function calls", () => {
+  it("collapses a tool-call-only Responses stream into toolCalls (not empty content)", () => {
+    // The exact event sequence the OpenAI Responses API (and aimock's own
+    // replay path) emits for a function call: output_item.added(function_call)
+    // → function_call_arguments.delta* → function_call_arguments.done →
+    // output_item.done(function_call). Before the fix, all of these were
+    // dropped by the `response.*` catch-all, yielding empty content and no
+    // toolCalls.
+    const body = [
+      `data: ${JSON.stringify({ type: "response.created", response: {} })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_123",
+          call_id: "call_abc",
+          name: "get_weather",
+          arguments: "",
+          status: "in_progress",
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_123",
+        output_index: 0,
+        delta: '{"ci',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_123",
+        output_index: 0,
+        delta: 'ty":"Paris"}',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.done",
+        item_id: "fc_123",
+        output_index: 0,
+        arguments: '{"city":"Paris"}',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_123",
+          call_id: "call_abc",
+          name: "get_weather",
+          arguments: '{"city":"Paris"}',
+          status: "completed",
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({ type: "response.completed", response: {} })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.toolCalls).toBeDefined();
+    expect(result.toolCalls).toHaveLength(1);
+    expect(result.toolCalls![0].name).toBe("get_weather");
+    expect(result.toolCalls![0].arguments).toBe('{"city":"Paris"}');
+    expect(JSON.parse(result.toolCalls![0].arguments)).toEqual({ city: "Paris" });
+    // The tool-call id is the Responses API `call_id` (what a tool result
+    // references), not the internal `fc_…` item id.
+    expect(result.toolCalls![0].id).toBe("call_abc");
+    expect(result.content).toBeUndefined();
+  });
+
+  it("collapses multiple Responses function calls keyed by output_index", () => {
+    const body = [
+      `data: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_0",
+          call_id: "call_0",
+          name: "lookup",
+          arguments: "",
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_0",
+        output_index: 0,
+        delta: '{"q":"a"}',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 1,
+        item: {
+          type: "function_call",
+          id: "fc_1",
+          call_id: "call_1",
+          name: "search",
+          arguments: "",
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_1",
+        output_index: 1,
+        delta: '{"q":"b"}',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.done",
+        item_id: "fc_1",
+        output_index: 1,
+        arguments: '{"q":"b"}',
+      })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.toolCalls).toHaveLength(2);
+    expect(result.toolCalls![0]).toMatchObject({
+      name: "lookup",
+      arguments: '{"q":"a"}',
+      id: "call_0",
+    });
+    expect(result.toolCalls![1]).toMatchObject({
+      name: "search",
+      arguments: '{"q":"b"}',
+      id: "call_1",
+    });
+    expect(result.content).toBeUndefined();
+  });
+
+  it("does not regress: Responses text-only stream still collapses to content", () => {
+    const body = [
+      `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Hello" })}`,
+      "",
+      `data: ${JSON.stringify({ type: "response.completed", response: {} })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.content).toBe("Hello");
+    expect(result.toolCalls).toBeUndefined();
+  });
+});
+
 describe("collapseAnthropicSSE with thinking", () => {
   it("extracts reasoning from thinking_delta events", () => {
     const body = [
