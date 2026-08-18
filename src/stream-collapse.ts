@@ -442,7 +442,7 @@ export function collapseOpenAISSE(rawBody: string): CollapseResult {
       continue;
     }
 
-    // Responses API web search events
+    // Responses API web search + function-call completion events
     if (parsed.type === "response.output_item.done") {
       const item = parsed.item as Record<string, unknown> | undefined;
       if (item?.type === "web_search_call") {
@@ -452,6 +452,90 @@ export function collapseOpenAISSE(rawBody: string): CollapseResult {
           continue;
         }
       }
+      if (item?.type === "function_call" && typeof parsed.output_index === "number") {
+        // Finalize the accumulated tool call. Fill id/name when the opening
+        // `.added` event was absent, and adopt the full `arguments` ONLY when
+        // the delta stream produced none — never re-append, since the deltas
+        // already carry the complete string.
+        const entry = toolCallMap.get(parsed.output_index);
+        if (entry) {
+          if (!entry.id && typeof item.call_id === "string") entry.id = item.call_id;
+          if (!entry.name && typeof item.name === "string") entry.name = item.name;
+          if (entry.arguments === "" && typeof item.arguments === "string") {
+            entry.arguments = item.arguments;
+          }
+        } else {
+          const created = {
+            id: typeof item.call_id === "string" ? item.call_id : "",
+            name: typeof item.name === "string" ? item.name : "",
+            arguments: typeof item.arguments === "string" ? item.arguments : "",
+          };
+          toolCallMap.set(parsed.output_index, created);
+          orderAtoms.push({ kind: "toolCall", ref: created });
+        }
+        continue;
+      }
+    }
+
+    // Responses API function-call streaming events. A tool call arrives as
+    // `response.output_item.added` (a `function_call` item) → one or more
+    // `response.function_call_arguments.delta` → `response.function_call_arguments.done`
+    // (plus the closing `response.output_item.done` handled above). Mirror the
+    // Chat-Completions tool-call accumulation below so a tool-call-only turn
+    // collapses to `toolCalls` instead of being silently dropped by the
+    // `response.*` catch-all. Key by `output_index` (present on every one of
+    // these events); its integer space is disjoint from the Chat-Completions
+    // `tool_calls[].index` space because a single stream is never both shapes.
+    if (parsed.type === "response.output_item.added") {
+      const item = parsed.item as Record<string, unknown> | undefined;
+      if (item?.type === "function_call" && typeof parsed.output_index === "number") {
+        if (!toolCallMap.has(parsed.output_index)) {
+          const created = {
+            // The Responses API `call_id` is what a tool result references, so
+            // capture THAT (not the internal `fc_…` item id) as the tool-call
+            // id — matching what the replay path treats as `toolCall.id`.
+            id: typeof item.call_id === "string" ? item.call_id : "",
+            name: typeof item.name === "string" ? item.name : "",
+            arguments: "",
+          };
+          toolCallMap.set(parsed.output_index, created);
+          orderAtoms.push({ kind: "toolCall", ref: created });
+        }
+        continue;
+      }
+    }
+    if (
+      parsed.type === "response.function_call_arguments.delta" &&
+      typeof parsed.delta === "string" &&
+      typeof parsed.output_index === "number"
+    ) {
+      let entry = toolCallMap.get(parsed.output_index);
+      if (!entry) {
+        entry = { id: "", name: "", arguments: "" };
+        toolCallMap.set(parsed.output_index, entry);
+        orderAtoms.push({ kind: "toolCall", ref: entry });
+      }
+      entry.arguments += parsed.delta;
+      continue;
+    }
+    if (
+      parsed.type === "response.function_call_arguments.done" &&
+      typeof parsed.output_index === "number"
+    ) {
+      // The `.done` event repeats the fully-assembled `arguments`; adopt it only
+      // when the deltas produced nothing (a delta-less stream) so we never
+      // double-append.
+      const entry = toolCallMap.get(parsed.output_index);
+      if (entry) {
+        if (entry.arguments === "" && typeof parsed.arguments === "string") {
+          entry.arguments = parsed.arguments;
+        }
+      } else if (typeof parsed.arguments === "string") {
+        const created = { id: "", name: "", arguments: parsed.arguments };
+        toolCallMap.set(parsed.output_index, created);
+        orderAtoms.push({ kind: "toolCall", ref: created });
+      }
+      continue;
     }
 
     // Responses API text content events
