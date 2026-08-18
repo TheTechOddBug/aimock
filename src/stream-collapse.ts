@@ -541,6 +541,9 @@ export function collapseOpenAISSE(rawBody: string): CollapseResult {
     // Responses API text content events
     if (parsed.type === "response.output_text.delta" && typeof parsed.delta === "string") {
       content += parsed.delta;
+      if (parsed.delta.length > 0) {
+        orderAtoms.push({ kind: "text", text: parsed.delta });
+      }
       continue;
     }
 

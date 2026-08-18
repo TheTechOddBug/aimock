@@ -1923,6 +1923,82 @@ describe("collapseOpenAISSE Responses API function calls", () => {
     expect(result.content).toBe("Hello");
     expect(result.toolCalls).toBeUndefined();
   });
+
+  it("tool-first Responses stream (function_call before output_text) yields ordered blocks", () => {
+    // #274: a Responses stream that emits a function_call output item BEFORE
+    // assistant text is interleaved, so the collapsed fixture must carry the
+    // ordered `blocks` field — the replay path consumes it to preserve the
+    // tool-before-text ordering that the flat content/toolCalls shape loses.
+    const body = [
+      `data: ${JSON.stringify({ type: "response.created", response: {} })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.output_item.added",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_123",
+          call_id: "call_abc",
+          name: "get_weather",
+          arguments: "",
+          status: "in_progress",
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_123",
+        output_index: 0,
+        delta: '{"ci',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.delta",
+        item_id: "fc_123",
+        output_index: 0,
+        delta: 'ty":"Paris"}',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.function_call_arguments.done",
+        item_id: "fc_123",
+        output_index: 0,
+        arguments: '{"city":"Paris"}',
+      })}`,
+      "",
+      `data: ${JSON.stringify({
+        type: "response.output_item.done",
+        output_index: 0,
+        item: {
+          type: "function_call",
+          id: "fc_123",
+          call_id: "call_abc",
+          name: "get_weather",
+          arguments: '{"city":"Paris"}',
+          status: "completed",
+        },
+      })}`,
+      "",
+      `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "Here " })}`,
+      "",
+      `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "you go" })}`,
+      "",
+      `data: ${JSON.stringify({ type: "response.completed", response: {} })}`,
+      "",
+    ].join("\n");
+
+    const result = collapseOpenAISSE(body);
+    expect(result.blocks).toBeDefined();
+    expect(result.blocks).toEqual([
+      { type: "toolCall", name: "get_weather", arguments: '{"city":"Paris"}', id: "call_abc" },
+      { type: "text", text: "Here you go" },
+    ]);
+    // The flat representations stay correct alongside the ordered blocks.
+    expect(result.content).toBe("Here you go");
+    expect(result.toolCalls).toEqual([
+      { name: "get_weather", arguments: '{"city":"Paris"}', id: "call_abc" },
+    ]);
+  });
 });
 
 describe("collapseAnthropicSSE with thinking", () => {
