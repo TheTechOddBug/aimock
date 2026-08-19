@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.39.0] - 2026-08-18
+
 ### Added
 
 - **AG-UI `RUN_FINISHED` and `RUN_ERROR` events now carry an optional `usage` field.** AG-UI's canonical `events.ts` declares an optional `usage: TokenUsage[]` on both terminal event schemas, but aimock's event interfaces carried neither. A new exported `AGUITokenUsage` type — numeric-only, mirroring `@ag-ui/core`'s `TokenUsageSchema` field for field (`provider` / `model` labels plus non-negative-integer `inputTokens`, `outputTokens`, `totalTokens`, `reasoningTokens`, `cachedInputTokens`, and no content-bearing or identifying fields) — is added as `usage?: AGUITokenUsage[]` on `AGUIRunFinishedEvent` and `AGUIRunErrorEvent`, and exported from both the package root and the `agui-stub` entrypoint. The field is reachable, not merely declarative: `AGUIBuildOpts` gains a `usage` option that is threaded to the terminal `RUN_FINISHED` of every builder and to `RUN_ERROR` in `buildErrorResponse`. Following the repo's existing usage policy (Bedrock / Cohere / Gemini), token counts are never synthesized from fixture content — `usage` is emitted only when a caller supplies it explicitly, so existing callers see byte-identical events. It is an array so a run that invokes multiple models keeps their counts separate (#378)
