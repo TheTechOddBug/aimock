@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- `aimock-pytest` 0.5.3 now defaults to `@copilotkit/aimock` 1.39.0.
+
 ## [1.39.0] - 2026-08-18
 
 ### Added
