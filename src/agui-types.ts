@@ -54,6 +54,9 @@ export interface AGUIBaseEvent {
   type: AGUIEventType;
   timestamp?: number;
   rawEvent?: unknown;
+  // Declared once here because canonical AG-UI declares it once on
+  // BaseEventSchema, so every event type carries it.
+  metadata?: Record<string, unknown>;
 }
 
 // ─── Individual event interfaces ─────────────────────────────────────────────

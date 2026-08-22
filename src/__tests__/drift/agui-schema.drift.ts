@@ -18,6 +18,14 @@ const CANONICAL_EVENTS_PATH = path.resolve(
   import.meta.dirname,
   "../../../../ag-ui/sdks/typescript/packages/core/src/events.ts",
 );
+// Sibling modules of events.ts. A canonical field may be declared through a
+// named schema alias imported from one of them (e.g. `metadata:
+// OptionalMetadataSchema` from ./metadata), so optionality cannot be read off
+// events.ts alone.
+const CANONICAL_CORE_SRC_DIR = path.resolve(
+  import.meta.dirname,
+  "../../../../ag-ui/sdks/typescript/packages/core/src",
+);
 const AIMOCK_TYPES_PATH = path.resolve(import.meta.dirname, "../../agui-types.ts");
 
 // ---------------------------------------------------------------------------
@@ -44,18 +52,93 @@ function parseCanonicalEventTypes(source: string): string[] {
   return members;
 }
 
+/** Maps an exported schema name to the source text of its definition. */
+type SchemaAliases = Map<string, string>;
+
+/**
+ * Build a name -> definition map for every `export const X = ...` in the
+ * canonical core package.
+ *
+ * Optionality is otherwise decided by substring-matching `.optional()` in a
+ * field's own text, which silently reads a named alias as required — the
+ * failure that reported all 33 events as CRITICAL when upstream declared
+ * `metadata: OptionalMetadataSchema`.
+ */
+function buildSchemaAliases(dir: string): SchemaAliases {
+  const aliases: SchemaAliases = new Map();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir).filter((f) => f.endsWith(".ts"));
+  } catch {
+    return aliases; // Absent checkout is reported by the suite's own guard.
+  }
+  for (const entry of entries) {
+    const source = fs.readFileSync(path.join(dir, entry), "utf-8");
+    for (const match of source.matchAll(/export const (\w+)\s*=\s*([\s\S]*?);\s*$/gm)) {
+      if (!aliases.has(match[1])) aliases.set(match[1], match[2].trim());
+    }
+  }
+  return aliases;
+}
+
+// A definition may alias another alias; bound the walk so a circular or
+// self-referential export cannot hang the parse.
+const MAX_ALIAS_HOPS = 5;
+
+/**
+ * Decide whether a field definition is optional, following named aliases.
+ */
+function isOptionalDef(fieldDef: string, aliases: SchemaAliases, hops = 0): boolean {
+  if (fieldDef.includes(".optional()") || fieldDef.includes(".default(")) return true;
+  if (hops >= MAX_ALIAS_HOPS) return false;
+  // Only a bare identifier is an alias reference; anything else is an inline
+  // Zod expression whose own text already settled the question above.
+  const bare = fieldDef.match(/^(\w+)$/);
+  if (!bare) return false;
+  const target = aliases.get(bare[1]);
+  if (target === undefined) return false;
+  return isOptionalDef(target, aliases, hops + 1);
+}
+
+/**
+ * Split an object-literal body on its top-level commas.
+ *
+ * A field definition can span lines — upstream writes `parentMessageId` as a
+ * `.string().nullable().optional().transform(...)` chain broken across five of
+ * them. Matching line by line sees only `z` and calls the field required, so
+ * entries are cut on commas at nesting depth zero instead.
+ */
+function splitTopLevelEntries(body: string): string[] {
+  const entries: string[] = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (ch === "(" || ch === "{" || ch === "[") depth++;
+    else if (ch === ")" || ch === "}" || ch === "]") depth--;
+    else if (ch === "," && depth === 0) {
+      entries.push(body.slice(start, i));
+      start = i + 1;
+    }
+  }
+  entries.push(body.slice(start));
+  return entries.filter((e) => e.trim().length > 0);
+}
+
 /**
  * Extract field definitions from a Zod `.extend({...})` block body.
  */
-function extractExtendFields(extendBody: string): FieldInfo[] {
+function extractExtendFields(extendBody: string, aliases: SchemaAliases): FieldInfo[] {
   // Strip comment lines so they don't match as field definitions
   const cleanBody = extendBody.replace(/^\s*\/\/.*$/gm, "");
   const fields: FieldInfo[] = [];
-  for (const fieldMatch of cleanBody.matchAll(/(\w+)\s*:\s*(.+)/g)) {
-    const fieldName = fieldMatch[1];
-    const fieldDef = fieldMatch[2].replace(/,\s*$/, "").trim();
-    const optional = fieldDef.includes(".optional()") || fieldDef.includes(".default(");
-    fields.push({ name: fieldName, optional });
+  for (const entry of splitTopLevelEntries(cleanBody)) {
+    const fieldMatch = entry.match(/^\s*(\w+)\s*:\s*([\s\S]+)$/);
+    if (!fieldMatch) continue;
+    // Collapse the chain back onto one line so alias detection and the
+    // `.optional()` scan see the whole definition.
+    const fieldDef = fieldMatch[2].replace(/\s+/g, " ").trim();
+    fields.push({ name: fieldMatch[1], optional: isOptionalDef(fieldDef, aliases) });
   }
   return fields;
 }
@@ -76,7 +159,7 @@ function extractExtendFields(extendBody: string): FieldInfo[] {
  * Parse base fields from `BaseEventSchema = z.object({...})` in canonical source.
  * Falls back to hardcoded defaults if parsing fails.
  */
-function parseCanonicalBaseFields(source: string): FieldInfo[] {
+function parseCanonicalBaseFields(source: string, aliases: SchemaAliases): FieldInfo[] {
   const baseMatch = source.match(
     /export const BaseEventSchema\s*=\s*z\s*\.\s*object\(\{([\s\S]*?)\}\)/,
   );
@@ -87,14 +170,14 @@ function parseCanonicalBaseFields(source: string): FieldInfo[] {
       { name: "rawEvent", optional: true },
     ];
   }
-  return extractExtendFields(baseMatch[1]);
+  return extractExtendFields(baseMatch[1], aliases);
 }
 
-function parseCanonicalSchemas(source: string): Map<string, SchemaInfo> {
+function parseCanonicalSchemas(source: string, aliases: SchemaAliases): Map<string, SchemaInfo> {
   const schemas = new Map<string, SchemaInfo>();
 
   // Parse base event fields dynamically from BaseEventSchema
-  const baseFields = parseCanonicalBaseFields(source);
+  const baseFields = parseCanonicalBaseFields(source, aliases);
 
   // Pass 1: collect raw schema definitions keyed by schema name
   interface RawSchema {
@@ -134,7 +217,7 @@ function parseCanonicalSchemas(source: string): Map<string, SchemaInfo> {
     const ownFields: FieldInfo[] = [];
     const extendPattern = /\.extend\(\{([\s\S]*?)\}\)/g;
     for (const extendMatch of body.matchAll(extendPattern)) {
-      ownFields.push(...extractExtendFields(extendMatch[1]));
+      ownFields.push(...extractExtendFields(extendMatch[1], aliases));
     }
     fieldsBySchemaName.set(schemaName, ownFields);
   }
@@ -291,7 +374,10 @@ describe.skipIf(!canonicalExists || !aimockExists)("AG-UI schema drift", () => {
     aimockSource = fs.readFileSync(AIMOCK_TYPES_PATH, "utf-8");
     canonicalTypes = parseCanonicalEventTypes(canonicalSource);
     aimockTypes = parseAimockEventTypes(aimockSource);
-    canonicalSchemas = parseCanonicalSchemas(canonicalSource);
+    canonicalSchemas = parseCanonicalSchemas(
+      canonicalSource,
+      buildSchemaAliases(CANONICAL_CORE_SRC_DIR),
+    );
     aimockInterfaces = parseAimockInterfaces(aimockSource);
   }
 
@@ -438,5 +524,81 @@ describe.skipIf(!canonicalExists || !aimockExists)("AG-UI schema drift", () => {
     expect(runStarted).toBeDefined();
     expect(runStarted!.fields.map((f) => f.name)).toContain("threadId");
     expect(runStarted!.fields.map((f) => f.name)).toContain("runId");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Parser regression guards — run without the ag-ui checkout, since they only
+// exercise the parser against synthetic source.
+// ---------------------------------------------------------------------------
+
+describe("canonical field optionality", () => {
+  it("reads optionality through a named schema alias", () => {
+    // Upstream declares `metadata: OptionalMetadataSchema`, which carries no
+    // literal `.optional()`. Reading the field text alone reported it as
+    // required and marked every event type CRITICAL.
+    const aliases = new Map([["OptionalMetadataSchema", "MetadataSchema.optional()"]]);
+    const [field] = extractExtendFields("  metadata: OptionalMetadataSchema,", aliases);
+
+    expect(field.name).toBe("metadata");
+    expect(field.optional).toBe(true);
+  });
+
+  it("follows a chain of aliases", () => {
+    const aliases = new Map([
+      ["OuterSchema", "MiddleSchema"],
+      ["MiddleSchema", "InnerSchema.optional()"],
+    ]);
+    const [field] = extractExtendFields("  nested: OuterSchema,", aliases);
+
+    expect(field.optional).toBe(true);
+  });
+
+  it("keeps a required alias required", () => {
+    // The resolver must not assume every alias is optional — a field aliased
+    // to a non-optional schema is still genuine critical drift.
+    const aliases = new Map([["MetadataSchema", "z.record(z.any())"]]);
+    const [field] = extractExtendFields("  metadata: MetadataSchema,", aliases);
+
+    expect(field.optional).toBe(false);
+  });
+
+  it("terminates on a self-referential alias", () => {
+    const aliases = new Map([["LoopSchema", "LoopSchema"]]);
+    const [field] = extractExtendFields("  looped: LoopSchema,", aliases);
+
+    expect(field.optional).toBe(false);
+  });
+
+  it("reads optionality off a field definition split across lines", () => {
+    // Upstream's `parentMessageId` chain. Matching line by line saw only `z`
+    // and reported the field as required.
+    const body = [
+      "  toolCallId: z.string(),",
+      "  parentMessageId: z",
+      "    .string()",
+      "    .nullable()",
+      "    .optional()",
+      "    .transform((v) => v ?? undefined),",
+    ].join("\n");
+    const fields = extractExtendFields(body, new Map());
+
+    expect(fields.map((f) => f.name)).toEqual(["toolCallId", "parentMessageId"]);
+    expect(fields.find((f) => f.name === "parentMessageId")!.optional).toBe(true);
+    expect(fields.find((f) => f.name === "toolCallId")!.optional).toBe(false);
+  });
+
+  it("does not split on commas nested inside a field definition", () => {
+    const fields = extractExtendFields('  role: z.enum(["user", "assistant"]),', new Map());
+
+    expect(fields.map((f) => f.name)).toEqual(["role"]);
+  });
+
+  it("still reads inline optionality with no aliases in play", () => {
+    const [optional] = extractExtendFields("  name: z.string().optional(),", new Map());
+    const [required] = extractExtendFields("  messageId: z.string(),", new Map());
+
+    expect(optional.optional).toBe(true);
+    expect(required.optional).toBe(false);
   });
 });
