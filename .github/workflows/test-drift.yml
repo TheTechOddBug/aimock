@@ -48,7 +48,7 @@ jobs:
         run: git clone --depth 1 https://github.com/ag-ui-protocol/ag-ui.git ../ag-ui
 
       - name: Run AG-UI schema drift test
-        run: npx vitest run src/__tests__/drift/agui-schema.drift.ts --config vitest.config.drift.ts
+        run: npx vitest run src/__tests__/drift/agui-schema.drift.ts src/__tests__/drift/agui-nonevent-schema.drift.ts --config vitest.config.drift.ts
 
   drift:
     if: github.event_name != 'pull_request'

@@ -18,7 +18,6 @@
 import { describe, it, expect } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import type { AGUIInterrupt, AGUIMessage } from "../../agui-types.js";
 
 const CANONICAL_TYPES_PATH = path.resolve(
   import.meta.dirname,
@@ -73,80 +72,128 @@ const MIRRORS: Array<{ canonical: string; aimock: string }> = [
   { canonical: "InterruptSchema", aimock: "AGUIInterrupt" },
 ];
 
-const canonicalExists = fs.existsSync(CANONICAL_TYPES_PATH);
-const aimockExists = fs.existsSync(AIMOCK_TYPES_PATH);
+/**
+ * Read a source file, returning the error rather than throwing, so the
+ * availability gate below can report *which* side is missing.
+ */
+function readSource(file: string): { source: string; error: string | null } {
+  try {
+    const source = fs.readFileSync(file, "utf-8");
+    if (source.trim() === "") return { source: "", error: `${file} is empty` };
+    return { source, error: null };
+  } catch (err: unknown) {
+    return { source: "", error: err instanceof Error ? err.message : String(err) };
+  }
+}
 
-describe.skipIf(!canonicalExists || !aimockExists)("AG-UI non-event schema drift", () => {
-  const canonicalSource = canonicalExists ? fs.readFileSync(CANONICAL_TYPES_PATH, "utf-8") : "";
-  const aimockSource = aimockExists ? fs.readFileSync(AIMOCK_TYPES_PATH, "utf-8") : "";
+const canonical = readSource(CANONICAL_TYPES_PATH);
+const aimock = readSource(AIMOCK_TYPES_PATH);
 
-  it("has both sources available", () => {
-    expect(canonicalExists).toBe(true);
-    expect(aimockExists).toBe(true);
-  });
+/**
+ * Escape hatch for a developer running `pnpm test:drift` with no sibling ag-ui
+ * checkout. Deliberately inert under CI: `CI` is set by every GitHub Actions
+ * runner, so the opt-out cannot be inherited by an automated lane, and a CI run
+ * without the canonical checkout fails instead of reporting a clean drift check.
+ */
+const localOptOut =
+  process.env.AIMOCK_ALLOW_MISSING_AGUI_CHECKOUT === "1" && process.env.CI !== "true";
 
-  it("parses the canonical non-event schemas it compares", () => {
-    // Positive control: a mirror silently going unparsed would make the drift
-    // assertion below vacuously green.
-    for (const { canonical } of MIRRORS) {
-      expect(canonicalSchemaBody(canonicalSource, canonical), `${canonical} body`).toBeTruthy();
+/**
+ * Availability gate. This block is deliberately NOT skipped by the same
+ * condition it checks: putting the "are the sources there?" assertion inside a
+ * `describe.skipIf(!sourcesThere)` — as this file originally did — makes a
+ * missing canonical checkout skip the assertion that was supposed to catch it,
+ * so the whole file exits 0 while comparing nothing.
+ */
+describe("AG-UI non-event schema sources", () => {
+  it("has both schema sources available", () => {
+    // aimock's own types ship in this repo; unreadable is always a hard failure.
+    expect(aimock.error, `aimock types unreadable at ${AIMOCK_TYPES_PATH}: ${aimock.error}`).toBe(
+      null,
+    );
+
+    if (canonical.error !== null && localOptOut) {
+      console.warn(
+        `AIMOCK_ALLOW_MISSING_AGUI_CHECKOUT=1: skipping AG-UI non-event drift comparison (${canonical.error}).`,
+      );
+      // Pin the opt-out's own precondition so it can never apply inside CI.
+      expect(process.env.CI, "the missing-checkout opt-out must never apply in CI").not.toBe(
+        "true",
+      );
+      return;
     }
-    for (const { aimock } of new Map(MIRRORS.map((m) => [m.aimock, m])).values()) {
-      expect(aimockInterfaceBody(aimockSource, aimock), `${aimock} body`).toBeTruthy();
-    }
-    // The canonical field must actually be declared where we expect to read it,
-    // so an upstream rename fails loudly here instead of reading as "no drift".
-    expect(canonicalSchemaBody(canonicalSource, "InterruptSchema")).toContain("subagentRunId");
+
+    expect(
+      canonical.error,
+      `canonical ag-ui types unreadable at ${CANONICAL_TYPES_PATH}: ${canonical.error}. ` +
+        `Clone the canonical repo next to this one (git clone --depth 1 ` +
+        `https://github.com/ag-ui-protocol/ag-ui.git ../ag-ui), or set ` +
+        `AIMOCK_ALLOW_MISSING_AGUI_CHECKOUT=1 to skip the comparison locally.`,
+    ).toBe(null);
   });
+});
 
-  it("mirrors canonical subagentRunId onto the non-event interfaces", () => {
-    const drifts: string[] = [];
+const canonicalSource = canonical.source;
+const aimockSource = aimock.source;
 
-    for (const { canonical, aimock } of MIRRORS) {
-      const canonicalBody = canonicalSchemaBody(canonicalSource, canonical);
-      const aimockBody = aimockInterfaceBody(aimockSource, aimock);
-      if (canonicalBody === null || aimockBody === null) continue; // reported above
-      if (!/^\s*subagentRunId\s*:/m.test(canonicalBody)) continue;
+/** Matches the canonical `subagentRunId` field declaration in a zod object body. */
+const CANONICAL_SUBAGENT_RUN_ID = /^\s*subagentRunId\s*:/m;
+/** Matches aimock's mirrored optional field declaration. */
+const AIMOCK_SUBAGENT_RUN_ID = /^\s*subagentRunId\?\s*:\s*string;/m;
 
-      if (!/^\s*subagentRunId\?\s*:\s*string;/m.test(aimockBody)) {
-        drifts.push(
-          `${canonical} declares optional "subagentRunId" but aimock's ${aimock} does not mirror it`,
-        );
+// Skipped ONLY under the explicit local opt-out asserted above; a missing
+// checkout without that opt-out has already failed the gate.
+describe.skipIf(canonical.error !== null || aimock.error !== null)(
+  "AG-UI non-event schema drift",
+  () => {
+    it("parses the canonical non-event schemas it compares", () => {
+      // Positive control: a mirror silently going unparsed would make the drift
+      // assertion below vacuously green.
+      for (const { canonical: schemaName } of MIRRORS) {
+        expect(canonicalSchemaBody(canonicalSource, schemaName), `${schemaName} body`).toBeTruthy();
       }
-    }
+      for (const { aimock: interfaceName } of new Map(MIRRORS.map((m) => [m.aimock, m])).values()) {
+        expect(
+          aimockInterfaceBody(aimockSource, interfaceName),
+          `${interfaceName} body`,
+        ).toBeTruthy();
+      }
+    });
 
-    expect(drifts, `Non-event subagent attribution drift:\n  ${drifts.join("\n  ")}`).toEqual([]);
-  });
-});
+    it("mirrors canonical subagentRunId onto the non-event interfaces", () => {
+      const drifts: string[] = [];
 
-// ---------------------------------------------------------------------------
-// Type-level guard. The structural check above reads source text; this one
-// fails the typecheck instead, so removing the field breaks consumers loudly
-// even if the ag-ui checkout is absent and the suite above skips.
-//
-// NOTE: tsconfig.json excludes src/__tests__, so `pnpm build` does NOT cover
-// this. Typecheck it explicitly:
-//   npx tsc --noEmit --strict --module NodeNext --moduleResolution NodeNext \
-//     --target ES2022 src/__tests__/drift/agui-nonevent-schema.drift.ts
-// ---------------------------------------------------------------------------
+      for (const { canonical: schemaName, aimock: interfaceName } of MIRRORS) {
+        const canonicalBody = canonicalSchemaBody(canonicalSource, schemaName);
+        const aimockBody = aimockInterfaceBody(aimockSource, interfaceName);
+        if (canonicalBody === null || aimockBody === null) continue; // reported above
 
-describe("non-event subagent attribution is expressible in the type system", () => {
-  it("accepts subagentRunId on a message and on an interrupt", () => {
-    // Object literals, so excess-property checking rejects these at compile
-    // time if the field is not declared.
-    const message: AGUIMessage = {
-      id: "msg_1",
-      role: "assistant",
-      content: "hi",
-      subagentRunId: "sub_1",
-    };
-    const interrupt: AGUIInterrupt = {
-      id: "int_1",
-      reason: "approval",
-      subagentRunId: "sub_1",
-    };
+        // The canonical side is ASSERTED, not used as a silent precondition. An
+        // upstream rename or removal of `subagentRunId` is exactly the drift this
+        // file exists to catch, so `continue`-ing past it here would report the
+        // rename as "no drift".
+        if (!CANONICAL_SUBAGENT_RUN_ID.test(canonicalBody)) {
+          drifts.push(
+            `canonical ${schemaName} no longer declares "subagentRunId" — upstream renamed or ` +
+              `removed it; update MIRRORS and aimock's ${interfaceName} to match`,
+          );
+          continue;
+        }
 
-    expect(message.subagentRunId).toBe("sub_1");
-    expect(interrupt.subagentRunId).toBe("sub_1");
-  });
-});
+        if (!AIMOCK_SUBAGENT_RUN_ID.test(aimockBody)) {
+          drifts.push(
+            `${schemaName} declares optional "subagentRunId" but aimock's ${interfaceName} does not mirror it`,
+          );
+        }
+      }
+
+      expect(drifts, `Non-event subagent attribution drift:\n  ${drifts.join("\n  ")}`).toEqual([]);
+    });
+  },
+);
+
+// A type-level companion guard used to live here. It asserted nothing at
+// runtime and the `tsc` invocation its comment documented was wired into no
+// script and no CI lane, so it read as a second guard while being theatre. The
+// structural check above is the guard; it now runs in CI (test-drift.yml) and
+// fails loudly rather than skipping when the canonical checkout is absent.
