@@ -102,6 +102,27 @@ const PROVIDER_LABEL_MAP: Record<string, ProviderMapping> = {
 // ---------------------------------------------------------------------------
 
 const AGUI_TYPES_FILE = "src/agui-types.ts";
+
+/**
+ * Vitest FILENAME FILTER (substring match on the test file path) selecting the
+ * whole AG-UI drift surface, not one hardcoded file. Keep this in lockstep with
+ * the `agui-schema-drift` job in `.github/workflows/test-drift.yml`, which runs
+ * the same filter.
+ *
+ * NAMING CONTRACT: an AG-UI drift guard MUST be named
+ * `src/__tests__/drift/agui-<something>.drift.ts` so both consumers pick it up
+ * automatically; a differently-named file would silently never run.
+ * `vitest.config.drift.ts` scopes `include` to the drift-suffixed files, so the
+ * filter cannot pull in plain `.test.ts` helpers from the same directory. No
+ * provider API keys are required — these files compare `src/agui-types.ts` against the
+ * cloned canonical ag-ui repo only.
+ */
+const AGUI_DRIFT_TEST_FILTER = "src/__tests__/drift/agui-";
+
+/**
+ * Report metadata only: the file a human should open when AG-UI drift is
+ * reported. Not a run target — see `AGUI_DRIFT_TEST_FILTER` for that.
+ */
 const AGUI_DRIFT_TEST = "src/__tests__/drift/agui-schema.drift.ts";
 
 // ---------------------------------------------------------------------------
@@ -1511,7 +1532,7 @@ function runAgUiDriftTests(): VitestJsonResult | null {
 
   try {
     const stdout = execSync(
-      `npx vitest run ${AGUI_DRIFT_TEST} --config vitest.config.drift.ts --reporter=json`,
+      `npx vitest run ${AGUI_DRIFT_TEST_FILTER} --config vitest.config.drift.ts --reporter=json`,
       {
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
