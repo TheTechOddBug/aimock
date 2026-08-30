@@ -27,6 +27,7 @@ import {
   parseKnownModelsCanary,
   collectDriftEntries,
   collectAgUiDriftEntries,
+  runAgUiVitest,
   classifyAgUiCheckout,
   AGUI_CANONICAL_TYPES_RELPATH,
   computeExitCode,
@@ -3272,24 +3273,18 @@ describe("WS-5 — SURFACE_REGISTRY coverage & integrity", () => {
 //
 // The AG-UI leg used to DROP any failed assertion whose message matched none of
 // its three recognizers — no entry, no counter, no warning — so a genuinely
-// failing guard produced zero entries, exit 0 and `conclusion: "clean"`. The
-// fixtures below are REAL vitest `--reporter=json` failure messages captured by
-// mutating `src/agui-types.ts` (deleting `subagentRunId` from `AGUIMessage`, and
-// renaming `TEXT_MESSAGE_START` in `AGUIEventType`) and running
+// failing guard produced zero entries, exit 0 and `conclusion: "clean"`. That is
+// a PRE-EXISTING hole in the EXISTING `agui-schema.drift.ts`: two of its
+// assertions (`should parse aimock event types`, and any bare `expect` outside
+// the three recognized report shapes) fail with messages no recognizer claims.
+// The fixtures below are REAL vitest `--reporter=json` failure messages captured
+// by mutating `src/agui-types.ts` (renaming `TEXT_MESSAGE_START` in
+// `AGUIEventType`) and running
 // `vitest run src/__tests__/drift/agui- --config vitest.config.drift.ts
 // --reporter=json`. They are not hand-authored: the single-glyph `…(N)` ellipsis,
 // the `AssertionError:` prefix and the frame layout are exactly what vitest emits.
 
-/** Real failure of the non-event `subagentRunId` guard — matches NO recognizer. */
-const AGUI_NONEVENT_FAILURE = [
-  "AssertionError: Non-event subagent attribution drift:",
-  `  BaseMessageSchema declares optional "subagentRunId" but aimock's AGUIMessage does not mirror it`,
-  `  ToolMessageSchema declares optional "subagentRunId" but aimock's AGUIMessage does not mirror it: expected [ …(4) ] to deeply equal []`,
-  "    at /repo/src/__tests__/drift/agui-nonevent-schema.drift.ts:190:89",
-  "    at file:///repo/node_modules/.pnpm/@vitest+runner@3.2.4/node_modules/@vitest/runner/dist/chunk-hooks.js:155:11",
-].join("\n");
-
-/** Real failure of an EXISTING agui-schema.drift.ts assertion — also unrecognized. */
+/** Real failure of an EXISTING agui-schema.drift.ts assertion — matches NO recognizer. */
 const AGUI_UNPARSEABLE_SCHEMA_FAILURE = [
   "AssertionError: expected [ Array(36) ] to include 'TEXT_MESSAGE_START'",
   "    at Proxy.<anonymous> (file:///repo/node_modules/.pnpm/@vitest+expect@3.2.4/node_modules/@vitest/expect/dist/index.js:1191:15)",
@@ -3308,9 +3303,9 @@ describe("collectAgUiDriftEntries — fail-closed on uninterpretable failures", 
     const result = collectAgUiDriftEntries(
       makeResult([
         makeAssertion({
-          ancestorTitles: ["AG-UI non-event schema drift"],
-          title: "mirrors canonical subagentRunId onto the non-event interfaces",
-          failureMessages: [AGUI_NONEVENT_FAILURE],
+          ancestorTitles: ["AG-UI schema drift"],
+          title: "should parse aimock event types",
+          failureMessages: [AGUI_UNPARSEABLE_SCHEMA_FAILURE],
         }),
       ]),
     );
@@ -3318,13 +3313,11 @@ describe("collectAgUiDriftEntries — fail-closed on uninterpretable failures", 
     expect(result.entries).toEqual([]);
     expect(result.quarantine).toHaveLength(1);
     expect(result.quarantine[0].provider).toBe("AG-UI");
-    expect(result.quarantine[0].testName).toContain(
-      "mirrors canonical subagentRunId onto the non-event interfaces",
-    );
+    expect(result.quarantine[0].testName).toContain("should parse aimock event types");
     expect(result.quarantine[0].rawLocation).toBe(
-      "/repo/src/__tests__/drift/agui-nonevent-schema.drift.ts:190:89",
+      "/repo/src/__tests__/drift/agui-schema.drift.ts:404:25",
     );
-    expect(result.quarantine[0].message).toBe(AGUI_NONEVENT_FAILURE);
+    expect(result.quarantine[0].message).toBe(AGUI_UNPARSEABLE_SCHEMA_FAILURE);
 
     // The invariant, stated as the collector's terminal signal: a run that
     // could not interpret a real failure must NOT be a reusable clean baseline.
@@ -3375,16 +3368,67 @@ describe("collectAgUiDriftEntries — fail-closed on uninterpretable failures", 
     expect(result.entries[0].diffs[0].path).toBe("AGUIEventType.TEXT_MESSAGE_START");
   });
 
-  it("stays silent on passing assertions and on a run with no failures", () => {
+  it("stays silent on passing assertions", () => {
     const result = collectAgUiDriftEntries(
-      makeResult([
-        makeAssertion({ status: "passed", failureMessages: [] }),
-        makeAssertion({ status: "failed", failureMessages: [] }),
-      ]),
+      makeResult([makeAssertion({ status: "passed", failureMessages: [] })]),
     );
     expect(result.entries).toEqual([]);
     expect(result.quarantine).toEqual([]);
     expect(computeExitCode(0, 0, false, 0)).toBe(0);
+  });
+
+  it("quarantines a FAILED assertion that carries no failure message at all", () => {
+    // A failed assertion with an empty `failureMessages` array is the LEAST
+    // interpretable failure there is, so it belongs in the same fail-closed lane
+    // as an unrecognized message — not skipped as if the run were clean. The
+    // collector used to `continue` past it, which read as exit 0 / "clean" and
+    // re-opened the exact hole the quarantine lane exists to close.
+    const result = collectAgUiDriftEntries(
+      makeResult([
+        makeAssertion({
+          status: "failed",
+          ancestorTitles: ["AG-UI schema drift"],
+          title: "event field shapes match canonical schemas",
+          failureMessages: [],
+        }),
+      ]),
+    );
+    expect(result.entries).toEqual([]);
+    expect(result.quarantine).toHaveLength(1);
+    expect(result.quarantine[0].provider).toBe("AG-UI");
+    expect(result.quarantine[0].testName).toContain("event field shapes match canonical schemas");
+    expect(result.quarantine[0].rawLocation).toBe("");
+    expect(result.quarantine[0].message).toMatch(/no failure message/i);
+
+    const exitCode = computeExitCode(0, result.quarantine.length, false, 0);
+    expect(exitCode).toBe(5);
+    expect(conclusionForExitCode(exitCode)).toBe("quarantine");
+  });
+});
+
+describe("runAgUiVitest — a zero-exit run with unparseable stdout is never clean", () => {
+  // TWIN SYMMETRY: the HTTP leg's `runDriftTests()` throws
+  // "Drift tests passed but produced unparseable output" on exactly this
+  // condition. The AG-UI leg used to return `{ testResults: [] }`, which the
+  // collector reads as "no failures" — exit 0, `conclusion: "clean"` — so a lane
+  // that emitted garbage instead of a report certified AG-UI as drift-free.
+
+  it("throws on a zero-exit run whose stdout is not vitest JSON", () => {
+    expect(() => runAgUiVitest(() => "vitest crashed before writing a report")).toThrow(
+      /unparseable output/i,
+    );
+  });
+
+  it("returns the parsed result when the zero-exit stdout IS vitest JSON", () => {
+    expect(runAgUiVitest(() => JSON.stringify({ testResults: [] }))).toEqual({ testResults: [] });
+  });
+
+  it("still returns null (infra skip, exit 1) when the lane could not run at all", () => {
+    expect(
+      runAgUiVitest(() => {
+        throw new Error("spawn npx ENOENT");
+      }),
+    ).toBeNull();
   });
 });
 
