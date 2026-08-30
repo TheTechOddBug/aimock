@@ -287,6 +287,55 @@ export const excludeFamilies: Record<Provider, Set<string>> = {
     "gemini-2.0-flash-thinking-exp",
     // Live/full-duplex voice — owned by the realtime canary, not this text check
     "gemini-live",
+    // The Gemini 3.5 Transcribe line, GA 2026-08-26, first observed by the daily
+    // /models canary on 2026-08-27 (that later date is the `Detected:` stamp in
+    // the notes under drift-proposals/ — two dates for two events, not a
+    // disagreement). Two ids ship as ONE model on TWO surfaces, and they are two
+    // distinct normalized families, so both are enumerated.
+    //
+    // Classified on DECLARED CAPABILITY, not on the "transcribe" substring.
+    // Google's model card gives both the same signature — input `Audio (up to
+    // 1 hour)`, output `Text, Word annotations` — i.e. speech->text only. They
+    // emit no chat completion of their own; the text they return is a
+    // transcript of the caller's audio. That is the realtime/audio canary's
+    // domain (voice-models.ts), exactly like `gemini-live` above, and it can
+    // never be TEXT-GENERATION drift.
+    //
+    // `-live` carries a second, independently observed capability fact. The Live
+    // leg's discovery filters SOLELY on declared `bidiGenerateContent` (no name
+    // heuristic — see ws-gemini-live.drift.ts), and it selected this id, so the
+    // model does declare that method. Google then refused the session out of
+    // band: `code=1007 reason="The requested combination of response modalities
+    // (AUDIO) is not supported by the model. models/gemini-3.5-transcribe-live"`
+    // (run 33296393200). So it is a bidi Live surface that emits TEXT and cannot
+    // emit AUDIO — a streaming transcriber, not a native-audio model.
+    //
+    // NOTE membership here is a CLASSIFICATION for the `/models` listing check
+    // in models.drift.ts and nothing more: it says the family is accounted for,
+    // not which endpoints aimock implements for it. Mirrors the OpenAI
+    // `gpt-transcribe` / `gpt-live-transcribe` pair above.
+    //
+    // Decision: EXCLUDE, recorded in
+    // drift-proposals/gemini-gemini-3.5-transcribe-new-family.md and
+    // drift-proposals/gemini-gemini-3.5-transcribe-live-new-family.md.
+    "gemini-3.5-transcribe",
+    "gemini-3.5-transcribe-live",
+    // Gemini Omni Flash, GA 2026-08-27. Non-text generative media, in the same
+    // category as the veo-* / lyria-* / imagen-* entries.
+    //
+    // Classified on DECLARED CAPABILITY, not on the "omni" substring — "omni"
+    // names OpenAI's TEXT-capable omni line, so the substring would have argued
+    // the opposite. Google's release note calls it "our fast, conversational
+    // video generation and editing model", and its model-card signature is
+    // input `Video with audio` -> output `Video with audio` (extension,
+    // keyframe interpolation, 360p-4K). It produces no text turn, so it cannot
+    // be text-generation drift. Its `-preview` sibling `gemini-omni-flash-preview`
+    // is already auto-excluded by PREVIEW_FAMILY; this GA id carries no
+    // `-preview` token, so that rule cannot reach it and it must be enumerated.
+    //
+    // Decision: EXCLUDE, recorded in
+    // drift-proposals/gemini-gemini-omni-1.1-flash-new-family.md.
+    "gemini-omni-1.1-flash",
     // Restricted EARLY-ACCESS (EAP) surface, not a GA tier. Google's own live
     // /models entry declares `displayName` AND `description` as
     // "[Confidential] Gemini 3.7 Flash Video Understanding EAP" — the only one
