@@ -129,8 +129,14 @@ function splitTopLevelEntries(body: string): string[] {
  * Extract field definitions from a Zod `.extend({...})` block body.
  */
 function extractExtendFields(extendBody: string, aliases: SchemaAliases): FieldInfo[] {
-  // Strip comment lines so they don't match as field definitions
-  const cleanBody = extendBody.replace(/^\s*\/\/.*$/gm, "");
+  // Strip comments so they don't match as field definitions. Trailing comments
+  // must go too, not just whole-line ones: `delta: z.array(z.any()), // JSON
+  // Patch (RFC 6902)` splits on its top-level comma, and the comment then
+  // leads the NEXT entry, so the field-name match fails and that field is
+  // dropped silently. That is how canonical STATE_DELTA.subagentRunId read as
+  // absent. Safe to strip unconditionally here: no canonical schema literal
+  // contains `//`.
+  const cleanBody = extendBody.replace(/\/\/[^\n]*/g, "");
   const fields: FieldInfo[] = [];
   for (const entry of splitTopLevelEntries(cleanBody)) {
     const fieldMatch = entry.match(/^\s*(\w+)\s*:\s*([\s\S]+)$/);
@@ -592,6 +598,20 @@ describe("canonical field optionality", () => {
     const fields = extractExtendFields('  role: z.enum(["user", "assistant"]),', new Map());
 
     expect(fields.map((f) => f.name)).toEqual(["role"]);
+  });
+
+  it("reads a field that follows a trailing comment", () => {
+    // Upstream's STATE_DELTA. The comment trails the previous field, so after
+    // the top-level comma split it heads the `subagentRunId` entry and hid the
+    // field entirely — reported as aimock-only rather than canonical.
+    const body = [
+      "  delta: z.array(z.any()), // JSON Patch (RFC 6902)",
+      "  subagentRunId: z.string().optional(),",
+    ].join("\n");
+    const fields = extractExtendFields(body, new Map());
+
+    expect(fields.map((f) => f.name)).toEqual(["delta", "subagentRunId"]);
+    expect(fields.find((f) => f.name === "subagentRunId")!.optional).toBe(true);
   });
 
   it("still reads inline optionality with no aliases in play", () => {

@@ -38,6 +38,10 @@ export type AGUIEventType =
   | "REASONING_MESSAGE_CHUNK"
   | "REASONING_END"
   | "REASONING_ENCRYPTED_VALUE"
+  // Subagents
+  | "SUBAGENT_STARTED"
+  | "SUBAGENT_FINISHED"
+  | "SUBAGENT_ERROR"
   // Special
   | "RAW"
   | "CUSTOM"
@@ -90,11 +94,13 @@ export interface AGUIRunErrorEvent extends AGUIBaseEvent {
 export interface AGUIStepStartedEvent extends AGUIBaseEvent {
   type: "STEP_STARTED";
   stepName: string;
+  subagentRunId?: string;
 }
 
 export interface AGUIStepFinishedEvent extends AGUIBaseEvent {
   type: "STEP_FINISHED";
   stepName: string;
+  subagentRunId?: string;
 }
 
 // Text messages
@@ -115,17 +121,20 @@ export interface AGUITextMessageStartEvent extends AGUIBaseEvent {
   messageId: string;
   role: AGUITextMessageRole;
   name?: string;
+  subagentRunId?: string;
 }
 
 export interface AGUITextMessageContentEvent extends AGUIBaseEvent {
   type: "TEXT_MESSAGE_CONTENT";
   messageId: string;
   delta: string;
+  subagentRunId?: string;
 }
 
 export interface AGUITextMessageEndEvent extends AGUIBaseEvent {
   type: "TEXT_MESSAGE_END";
   messageId: string;
+  subagentRunId?: string;
 }
 
 export interface AGUITextMessageChunkEvent extends AGUIBaseEvent {
@@ -134,6 +143,7 @@ export interface AGUITextMessageChunkEvent extends AGUIBaseEvent {
   role?: AGUITextMessageRole;
   delta?: string;
   name?: string;
+  subagentRunId?: string;
 }
 
 // Tool calls
@@ -143,17 +153,20 @@ export interface AGUIToolCallStartEvent extends AGUIBaseEvent {
   toolCallId: string;
   toolCallName: string;
   parentMessageId?: string;
+  subagentRunId?: string;
 }
 
 export interface AGUIToolCallArgsEvent extends AGUIBaseEvent {
   type: "TOOL_CALL_ARGS";
   toolCallId: string;
   delta: string;
+  subagentRunId?: string;
 }
 
 export interface AGUIToolCallEndEvent extends AGUIBaseEvent {
   type: "TOOL_CALL_END";
   toolCallId: string;
+  subagentRunId?: string;
 }
 
 export interface AGUIToolCallChunkEvent extends AGUIBaseEvent {
@@ -162,6 +175,7 @@ export interface AGUIToolCallChunkEvent extends AGUIBaseEvent {
   toolCallName?: string;
   parentMessageId?: string;
   delta?: string;
+  subagentRunId?: string;
 }
 
 export interface AGUIToolCallResultEvent extends AGUIBaseEvent {
@@ -170,6 +184,7 @@ export interface AGUIToolCallResultEvent extends AGUIBaseEvent {
   toolCallId: string;
   content: string;
   role?: "tool";
+  subagentRunId?: string;
 }
 
 // State
@@ -177,11 +192,13 @@ export interface AGUIToolCallResultEvent extends AGUIBaseEvent {
 export interface AGUIStateSnapshotEvent extends AGUIBaseEvent {
   type: "STATE_SNAPSHOT";
   snapshot: unknown;
+  subagentRunId?: string;
 }
 
 export interface AGUIStateDeltaEvent extends AGUIBaseEvent {
   type: "STATE_DELTA";
   delta: unknown[]; // JSON Patch (RFC 6902)
+  subagentRunId?: string;
 }
 
 export interface AGUIMessagesSnapshotEvent extends AGUIBaseEvent {
@@ -197,6 +214,7 @@ export interface AGUIActivitySnapshotEvent extends AGUIBaseEvent {
   activityType: string;
   content: Record<string, unknown>;
   replace?: boolean;
+  subagentRunId?: string;
 }
 
 export interface AGUIActivityDeltaEvent extends AGUIBaseEvent {
@@ -204,6 +222,7 @@ export interface AGUIActivityDeltaEvent extends AGUIBaseEvent {
   messageId: string;
   activityType: string;
   patch: unknown[];
+  subagentRunId?: string;
 }
 
 // Reasoning
@@ -211,34 +230,40 @@ export interface AGUIActivityDeltaEvent extends AGUIBaseEvent {
 export interface AGUIReasoningStartEvent extends AGUIBaseEvent {
   type: "REASONING_START";
   messageId: string;
+  subagentRunId?: string;
 }
 
 export interface AGUIReasoningMessageStartEvent extends AGUIBaseEvent {
   type: "REASONING_MESSAGE_START";
   messageId: string;
   role: "reasoning";
+  subagentRunId?: string;
 }
 
 export interface AGUIReasoningMessageContentEvent extends AGUIBaseEvent {
   type: "REASONING_MESSAGE_CONTENT";
   messageId: string;
   delta: string;
+  subagentRunId?: string;
 }
 
 export interface AGUIReasoningMessageEndEvent extends AGUIBaseEvent {
   type: "REASONING_MESSAGE_END";
   messageId: string;
+  subagentRunId?: string;
 }
 
 export interface AGUIReasoningMessageChunkEvent extends AGUIBaseEvent {
   type: "REASONING_MESSAGE_CHUNK";
   messageId?: string;
   delta?: string;
+  subagentRunId?: string;
 }
 
 export interface AGUIReasoningEndEvent extends AGUIBaseEvent {
   type: "REASONING_END";
   messageId: string;
+  subagentRunId?: string;
 }
 
 export type AGUIReasoningEncryptedValueSubtype = "tool-call" | "message";
@@ -248,6 +273,38 @@ export interface AGUIReasoningEncryptedValueEvent extends AGUIBaseEvent {
   subtype: AGUIReasoningEncryptedValueSubtype;
   entityId: string;
   encryptedValue: string;
+  subagentRunId?: string;
+}
+
+// Subagents
+
+export interface AGUISubagentStartedEvent extends AGUIBaseEvent {
+  type: "SUBAGENT_STARTED";
+  subagentRunId: string;
+  name: string;
+  description?: string;
+  parentSubagentRunId?: string;
+  // Link back to the tool call (and the message that held it) that spawned this
+  // subagent, for the agents-as-tools pattern. Lets a consumer correlate the
+  // subagent to its spawning call without inspecting rawEvent.metadata.
+  parentToolCallId?: string;
+  parentMessageId?: string;
+}
+
+export interface AGUISubagentFinishedEvent extends AGUIBaseEvent {
+  type: "SUBAGENT_FINISHED";
+  subagentRunId: string;
+  result?: unknown;
+  // Absent means success (the legacy reading). Unlike RUN_FINISHED.outcome this
+  // field postdates the valueless-field cleanup, so it never tolerates null.
+  outcome?: AGUISubagentFinishedOutcome;
+}
+
+export interface AGUISubagentErrorEvent extends AGUIBaseEvent {
+  type: "SUBAGENT_ERROR";
+  subagentRunId: string;
+  message: string;
+  code?: string;
 }
 
 // Special
@@ -256,12 +313,14 @@ export interface AGUIRawEvent extends AGUIBaseEvent {
   type: "RAW";
   event: unknown;
   source?: string;
+  subagentRunId?: string;
 }
 
 export interface AGUICustomEvent extends AGUIBaseEvent {
   type: "CUSTOM";
   name: string;
   value: unknown;
+  subagentRunId?: string;
 }
 
 // Deprecated
@@ -317,6 +376,9 @@ export type AGUIEvent =
   | AGUIReasoningMessageChunkEvent
   | AGUIReasoningEndEvent
   | AGUIReasoningEncryptedValueEvent
+  | AGUISubagentStartedEvent
+  | AGUISubagentFinishedEvent
+  | AGUISubagentErrorEvent
   | AGUIRawEvent
   | AGUICustomEvent
   | AGUIThinkingStartEvent
@@ -346,6 +408,19 @@ export interface AGUIResumeEntry {
 export type AGUIRunFinishedOutcome =
   | { type: "success" }
   | { type: "interrupt"; interrupts: AGUIInterrupt[] };
+
+/**
+ * Mirrors `AGUIRunFinishedOutcome` one level down: a subagent's terminal closes
+ * its stream segment for this run either because the work completed
+ * ("success") or because the workflow is paused awaiting outside input
+ * ("suspended" — on resume the same `subagentRunId` is re-announced as a
+ * continuation). `interruptIds` names the run-level interrupts this subagent
+ * directly owns, and may be absent: an ancestor that suspended because a
+ * descendant interrupted owns no interrupt itself.
+ */
+export type AGUISubagentFinishedOutcome =
+  | { type: "success" }
+  | { type: "suspended"; interruptIds?: string[] };
 
 /**
  * Numeric-only token usage summary, mirroring `TokenUsageSchema` in
