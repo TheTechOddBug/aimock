@@ -127,3 +127,86 @@ describe("openai transcription line is classified as EXCLUDED (PR #343)", () => 
     ).toEqual([]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The 2026-08-26/27 Gemini transcription + omni-video line — BEHAVIOURAL
+// coverage of the classification, in the same shape as the OpenAI block above.
+//
+// `gemini-3.5-transcribe`, `gemini-3.5-transcribe-live` and
+// `gemini-omni-1.1-flash` were classified EXCLUDE in model-registry.ts on the
+// provider's own DECLARED capabilities (see the rationale comment beside the
+// entries, and drift-proposals/). Without the assertions below the only thing
+// that would redden if an entry were dropped is the `excludeFamilies.gemini`
+// membership CHECKSUM in logic-pin.test.ts — which says "the data moved" and
+// nothing about what the classification MEANS.
+//
+// The `gemini-3.5-transcribe` / `gemini-3.5-transcribe-live` pair is asserted
+// in BOTH directions on purpose: the first key is a strict PREFIX of the
+// second, the same substring/prefix hazard the OpenAI `gpt-live` block exists
+// for. They are DIFFERENT families and both must be classified on their own
+// entry, not by one swallowing the other.
+// ---------------------------------------------------------------------------
+
+describe("gemini transcription + omni-video line is classified as EXCLUDED", () => {
+  it("gemini-3.5-transcribe is EXCLUDED in a /models-shaped payload", () => {
+    expect(isClassifiedFamily("gemini-3.5-transcribe", "gemini")).toBe(true);
+    expect(
+      unclassifiedFamilies(
+        [
+          "gemini-3.5-flash", // include, for a realistic mixed listing
+          "gemini-3.5-transcribe",
+          "gemini-3.5-transcribe-2026-08-26", // dated snapshot collapses onto the family
+        ],
+        "gemini",
+      ),
+    ).toEqual([]);
+  });
+
+  it("gemini-3.5-transcribe-live is EXCLUDED in a /models-shaped payload", () => {
+    expect(isClassifiedFamily("gemini-3.5-transcribe-live", "gemini")).toBe(true);
+    expect(
+      unclassifiedFamilies(
+        [
+          "gemini-3.5-flash",
+          "gemini-3.5-transcribe-live",
+          "gemini-3.5-transcribe-live-2026-08-26",
+          "gemini-live", // the pre-existing full-duplex Live surface
+        ],
+        "gemini",
+      ),
+    ).toEqual([]);
+  });
+
+  it("gemini-omni-1.1-flash is EXCLUDED in a /models-shaped payload", () => {
+    expect(isClassifiedFamily("gemini-omni-1.1-flash", "gemini")).toBe(true);
+    expect(
+      unclassifiedFamilies(
+        [
+          "gemini-3.5-flash",
+          "gemini-omni-1.1-flash",
+          "gemini-omni-1.1-flash-2026-08-27",
+          "gemini-omni-flash-preview", // sibling preview tier, excluded by pattern
+        ],
+        "gemini",
+      ),
+    ).toEqual([]);
+  });
+
+  it("neither transcribe key classifies the other, nor an unrelated extension", () => {
+    // The two entries are distinct families; a `startsWith`-shaped classification
+    // bug would let the shorter key classify the longer one (or vice versa) and
+    // silently swallow a family the canary exists to report.
+    expect(normalizeModelFamily("gemini-3.5-transcribe-live", "gemini")).toBe(
+      "gemini-3.5-transcribe-live",
+    );
+    // NEGATIVE CONTROL: an id that merely EXTENDS an excluded key is still a new
+    // family and must be reported. Without this, `toEqual([])` above is also
+    // what a neutered `unclassifiedFamilies` would produce.
+    expect(unclassifiedFamilies(["gemini-3.5-transcribe-diarize"], "gemini")).toEqual([
+      "gemini-3.5-transcribe-diarize",
+    ]);
+    expect(unclassifiedFamilies(["gemini-omni-1.1-pro"], "gemini")).toEqual([
+      "gemini-omni-1.1-pro",
+    ]);
+  });
+});

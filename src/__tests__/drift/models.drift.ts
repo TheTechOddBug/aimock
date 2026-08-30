@@ -402,6 +402,11 @@ describe("full live /models wave is fully classified (2026-07-16 drift)", () => 
       // image / audio / tts / video / music / robotics / embeddings
       "gemini-2.5-flash-image",
       "gemini-2.5-flash-native-audio-latest",
+      // 2026-08-26/27 GA line (run 33296393200): speech-to-text pair + the
+      // conversational video-generation tier — all explicit excludes
+      "gemini-3.5-transcribe",
+      "gemini-3.5-transcribe-live",
+      "gemini-omni-1.1-flash",
       "gemini-2.5-flash-preview-tts", // explicit exclude (-preview-tts)
       "gemini-2.5-pro-preview-tts", // explicit exclude (-preview-tts)
       "gemini-3-pro-image",
