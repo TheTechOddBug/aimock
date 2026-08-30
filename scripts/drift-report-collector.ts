@@ -1595,22 +1595,35 @@ function ensureAgUiRepo(): boolean {
   return true;
 }
 
-function runAgUiDriftTests(): VitestJsonResult | null {
-  if (!ensureAgUiRepo()) return null;
+/** How the AG-UI leg shells out. Injectable so the parse contract is testable. */
+export type VitestExec = (command: string) => string;
 
+const defaultAgUiExec: VitestExec = (command) =>
+  execSync(command, {
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+    maxBuffer: 50 * 1024 * 1024,
+  });
+
+/**
+ * Run the AG-UI drift lane and return its vitest JSON.
+ *
+ * `null` means the leg could not run at all (infra) — the caller maps that to
+ * the collector's exit-1 "skipped" lane.
+ *
+ * FAIL-CLOSED (twin symmetry): a ZERO-exit run whose stdout cannot be parsed as
+ * vitest JSON THROWS, exactly as the HTTP twin `runDriftTests()` does. It used
+ * to `return { testResults: [] }` — an empty result the collector reads as "no
+ * failures", i.e. exit 0 / `conclusion: "clean"` — so a lane that produced
+ * garbage instead of a report certified AG-UI as drift-free. The two legs face
+ * the same condition and must not disagree about whether it is clean.
+ */
+export function runAgUiVitest(exec: VitestExec = defaultAgUiExec): VitestJsonResult | null {
+  let stdout: string;
   try {
-    const stdout = execSync(
+    stdout = exec(
       `npx vitest run ${AGUI_DRIFT_TEST_FILTER} --config vitest.config.drift.ts --reporter=json`,
-      {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-        maxBuffer: 50 * 1024 * 1024,
-      },
     );
-    const result = parseVitestOutput(stdout, "AG-UI drift JSON parse of successful run failed");
-    if (result) return result;
-    // Tests passed, no failures — return empty result
-    return { testResults: [] };
   } catch (err: unknown) {
     if (hasStdout(err)) {
       const result = parseVitestOutput(err.stdout, "AG-UI drift JSON parse of failed run");
@@ -1620,6 +1633,14 @@ function runAgUiDriftTests(): VitestJsonResult | null {
     console.warn(`AG-UI schema drift tests failed to run: ${msg}`);
     return null;
   }
+  const result = parseVitestOutput(stdout, "AG-UI drift JSON parse of successful run failed");
+  if (result) return result;
+  throw new Error("AG-UI drift tests passed but produced unparseable output");
+}
+
+function runAgUiDriftTests(): VitestJsonResult | null {
+  if (!ensureAgUiRepo()) return null;
+  return runAgUiVitest();
 }
 
 /**
@@ -1636,9 +1657,10 @@ function runAgUiDriftTests(): VitestJsonResult | null {
  * FAIL-CLOSED INVARIANT (W5/N1): a FAILED AG-UI assertion this function cannot
  * structurally interpret MUST NOT vanish. Previously any failure that matched
  * none of the recognizers above was dropped — no entry, no counter, no warning —
- * so a genuinely failing guard (e.g. the non-event `subagentRunId` attribution
- * check, whose message matches none of the three shapes) produced zero entries,
- * exit 0 and `conclusion: "clean"`. Every unrecognized failure is now returned
+ * so a genuinely failing assertion in `agui-schema.drift.ts` (e.g. `should parse
+ * aimock event types`, whose bare `expect` message matches none of the three
+ * shapes) produced zero entries, exit 0 and `conclusion: "clean"`. The same went
+ * for a FAILED assertion carrying no message at all. Every such failure is now returned
  * as a `QuarantineEntry`, reusing the collector's EXISTING quarantine/exit-5
  * lane — the same "held for review, never silently swallowed" contract the HTTP
  * leg already uses. Note this is per-assertion and UNCONDITIONAL: unlike the
@@ -1659,7 +1681,23 @@ export function collectAgUiDriftEntries(results: VitestJsonResult): {
   for (const file of results.testResults) {
     for (const assertion of file.assertionResults) {
       if (assertion.status !== "failed") continue;
-      if (assertion.failureMessages.length === 0) continue;
+
+      const testNameForQuarantine =
+        `${assertion.ancestorTitles.join(" ")} > ${assertion.title}`.trim();
+
+      if (assertion.failureMessages.length === 0) {
+        // A FAILED assertion carrying no message is the least interpretable
+        // failure there is — the collector cannot even see what broke. Skipping
+        // it read as exit 0 / "clean", which is the same fail-open the
+        // quarantine lane below exists to close, so it takes the same lane.
+        quarantine.push({
+          provider: "AG-UI",
+          testName: testNameForQuarantine,
+          rawLocation: "",
+          message: "AG-UI drift assertion failed with no failure message reported by vitest.",
+        });
+        continue;
+      }
 
       const fullMessage = assertion.failureMessages.join("\n");
       const testName = assertion.title || assertion.ancestorTitles.join(" > ");
@@ -1729,7 +1767,7 @@ export function collectAgUiDriftEntries(results: VitestJsonResult): {
         // HTTP leg quarantines its unmappable failures.
         quarantine.push({
           provider: "AG-UI",
-          testName: `${assertion.ancestorTitles.join(" ")} > ${assertion.title}`.trim(),
+          testName: testNameForQuarantine,
           rawLocation: extractRawLocation(fullMessage),
           message: fullMessage,
         });
