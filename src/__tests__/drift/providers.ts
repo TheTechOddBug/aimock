@@ -118,10 +118,23 @@ export interface LiveModelEntry {
  * model.
  */
 export function selectLiveModel(models: LiveModelEntry[], preferred: string[] = []): string | null {
-  const liveIds = models
+  const liveIds = liveModelIds(models);
+  return preferred.find((p) => liveIds.includes(p)) ?? liveIds[0] ?? null;
+}
+
+/**
+ * The usable (non-deprecated, non-empty) ids from a `/models` listing, in the
+ * provider's own order.
+ *
+ * Shared by {@link selectLiveModel} — which takes the first — and by
+ * {@link resolveLiveModelCandidates}, which keeps the whole ordered list for a
+ * leg that must try more than one because the LISTING alone cannot settle the
+ * capability it needs (see that function's note).
+ */
+function liveModelIds(models: LiveModelEntry[]): string[] {
+  return models
     .filter((m) => typeof m.id === "string" && m.id.length > 0 && m.deprecated !== true)
     .map((m) => m.id);
-  return preferred.find((p) => liveIds.includes(p)) ?? liveIds[0] ?? null;
 }
 
 /**
@@ -172,9 +185,60 @@ export function resolveLiveModel(
   return promise;
 }
 
-/** Test-only: clear the {@link resolveLiveModel} memo cache between cases. */
+/**
+ * Outcome of resolving the FULL ordered candidate list for a leg — the same
+ * three-way classification as {@link ResolvedModel}, carrying every usable id
+ * instead of just the first.
+ */
+export type ResolvedCandidates = { models: string[] } | { infra: number } | { unavailable: true };
+
+/** Per-key memo for {@link resolveLiveModelCandidates}. */
+const resolvedCandidatesCache = new Map<string, Promise<ResolvedCandidates>>();
+
+/**
+ * Resolve EVERY usable model from a provider's listing, MEMOIZED per `key`,
+ * with the same infra/unavailable classification as {@link resolveLiveModel}.
+ *
+ * WHY A LIST. `resolveLiveModel` takes the first usable id, which is right
+ * whenever the listing filter already settles the capability the leg needs. It
+ * is NOT right when the listing cannot express that capability. Gemini Live is
+ * that case: `/models` declares `bidiGenerateContent` but says nothing about
+ * which RESPONSE MODALITY a model serves, and the two are genuinely
+ * independent — `gemini-3.5-transcribe-live` declares `bidiGenerateContent` and
+ * yet emits only TEXT, so a leg driving AUDIO must be able to move past it to
+ * the next candidate. The provider's own refusal is the only authority on that
+ * capability, so the leg learns it by asking (see `driveGeminiLiveAudio` in
+ * ws-providers.ts) — never by pattern-matching the model NAME.
+ */
+export function resolveLiveModelCandidates(
+  key: string,
+  fetchListing: () => Promise<{ status: number; models: LiveModelEntry[] }>,
+): Promise<ResolvedCandidates> {
+  const cached = resolvedCandidatesCache.get(key);
+  if (cached) return cached;
+  const promise = (async (): Promise<ResolvedCandidates> => {
+    try {
+      const { status, models } = await fetchListing();
+      if (isInfraSkip(status)) return { infra: status };
+      if (status >= 400) return { unavailable: true };
+      const ids = liveModelIds(models);
+      return ids.length > 0 ? { models: ids } : { unavailable: true };
+    } catch (err) {
+      if (err instanceof InfraError) return { infra: err.status };
+      throw err;
+    }
+  })();
+  resolvedCandidatesCache.set(key, promise);
+  return promise;
+}
+
+/**
+ * Test-only: clear the {@link resolveLiveModel} and
+ * {@link resolveLiveModelCandidates} memo caches between cases.
+ */
 export function __resetResolveLiveModelCache(): void {
   resolvedModelCache.clear();
+  resolvedCandidatesCache.clear();
 }
 
 // ---------------------------------------------------------------------------

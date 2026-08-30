@@ -21,7 +21,7 @@ interface ProviderConfig {
   apiKey: string;
 }
 
-interface WSResult {
+export interface WSResult {
   events: SSEEventShape[];
   rawMessages: unknown[];
 }
@@ -778,19 +778,32 @@ export async function openaiRealtimeWS(
 // ---------------------------------------------------------------------------
 
 /**
- * The ONE response modality every Live (`bidiGenerateContent`) model supports.
+ * The response modality this leg drives: the one a native-audio Live model
+ * actually emits.
  *
- * Google's Live API permits exactly one modality per session, and every model
- * currently exposing `bidiGenerateContent` is a native-audio model that accepts
- * only `AUDIO`. Requesting `TEXT` is refused out-of-band with an RFC 6455 CLOSE
- * frame — observed verbatim from the live endpoint as
+ * Google's Live API permits exactly ONE modality per session, and a
+ * native-audio model accepts only `AUDIO`. Requesting `TEXT` on one is refused
+ * out-of-band with an RFC 6455 CLOSE frame — observed verbatim from the live
+ * endpoint as
  *
  *   code=1007 reason="The requested combination of response modalities (TEXT)
  *   is not supported by the model. models/gemini-3.1-flash-live-preview"
  *
- * so this leg drives the AUDIO shape, which is the shape the model actually
- * emits. See ws-gemini-live-modality.test.ts for the local reproduction of that
- * refusal and the red/green pair over this function.
+ * so this leg drives the AUDIO shape, which is the shape those models emit.
+ *
+ * `bidiGenerateContent` does NOT imply AUDIO, though, and the original form of
+ * this comment claimed it did. Google shipped `gemini-3.5-transcribe-live` on
+ * 2026-08-26: a streaming SPEECH-TO-TEXT model that declares
+ * `bidiGenerateContent` and emits only TEXT. It refused the mirror-image
+ * session with the mirror-image frame
+ *
+ *   code=1007 reason="The requested combination of response modalities (AUDIO)
+ *   is not supported by the model. models/gemini-3.5-transcribe-live"
+ *
+ * (drift run 33296393200). Modality is therefore a PER-MODEL capability the
+ * listing does not express, which is what {@link driveGeminiLiveAudio} exists
+ * to resolve. See ws-gemini-live-modality.test.ts for the local reproduction of
+ * both refusals and the red/green pairs over this function.
  */
 export const GEMINI_LIVE_RESPONSE_MODALITIES = ["AUDIO"];
 
@@ -860,6 +873,83 @@ export function summarizeGeminiLiveTurn(messages: unknown[]): {
   }
 
   return { setupCompleteCount, audioPartCount, textPartCount, turnCompleteCount, toolCallCount };
+}
+
+/**
+ * True when a WS failure is the provider REFUSING the requested response
+ * modality for that model — RFC 6455 code 1007 with Google's verbatim reason.
+ *
+ * This is a CAPABILITY answer, not an error: the provider is stating that this
+ * model does not serve the modality asked for, which is exactly the fact the
+ * `/models` listing omits. {@link driveGeminiLiveAudio} treats it as
+ * "disqualify this candidate and try the next", never as drift.
+ *
+ * Matched on the reason PREFIX Google emits, which is modality-agnostic — the
+ * TEXT refusal (2026-08, native-audio models) and the AUDIO refusal (2026-08-30,
+ * `gemini-3.5-transcribe-live`) are the same sentence with the modality
+ * substituted. Deliberately NOT matched on the model name in the reason: the
+ * name is the one part of that string that carries no capability signal.
+ */
+export function isModalityRefusal(err: unknown): err is WSClosedError {
+  return (
+    err instanceof WSClosedError &&
+    err.code === 1007 &&
+    /requested combination of response modalities/i.test(err.reason)
+  );
+}
+
+/** A candidate the provider disqualified, with the reason it gave. */
+export interface RefusedGeminiLiveCandidate {
+  model: string;
+  reason: string;
+}
+
+/** Outcome of {@link driveGeminiLiveAudio}. */
+export interface GeminiLiveAudioDrive {
+  /** The model that actually served the AUDIO turn (fully qualified). */
+  model: string;
+  result: WSResult;
+  /** Candidates the provider refused AUDIO on, in the order it refused them. */
+  refused: RefusedGeminiLiveCandidate[];
+}
+
+/**
+ * Drive an AUDIO Live turn against the first candidate that ACTUALLY SERVES
+ * AUDIO, learning that capability from the provider rather than from the id.
+ *
+ * `candidates` is the ordered list of `bidiGenerateContent` models the live
+ * listing exposed (see `resolveLiveModelCandidates`). Declaring that method is
+ * necessary but not sufficient: a streaming transcriber declares it and emits
+ * only TEXT. So each candidate is tried in listing order and a
+ * {@link isModalityRefusal} close advances to the next — the provider's own
+ * refusal is the authority, and no capability is ever re-derived from the model
+ * NAME (the mis-classification this leg has already been bitten by twice).
+ *
+ * Returns `null` when EVERY candidate refused AUDIO. That is an honest
+ * unavailability — the listing exposes no model this leg can grade — and the
+ * caller skips on it rather than reporting drift, matching how it treats an
+ * empty listing. Every other failure (handshake infra status, a mute provider,
+ * a timeout) propagates UNCHANGED so this helper can never mask one.
+ */
+export async function driveGeminiLiveAudio(
+  config: ProviderConfig,
+  text: string,
+  tools: object[] | undefined,
+  candidates: string[],
+  transport?: GeminiLiveTransportOptions,
+): Promise<GeminiLiveAudioDrive | null> {
+  const refused: RefusedGeminiLiveCandidate[] = [];
+  for (const candidate of candidates) {
+    const model = candidate.startsWith("models/") ? candidate : `models/${candidate}`;
+    try {
+      const result = await geminiLiveWS(config, text, tools, model, transport);
+      return { model, result, refused };
+    } catch (err) {
+      if (!isModalityRefusal(err)) throw err;
+      refused.push({ model, reason: err.reason });
+    }
+  }
+  return null;
 }
 
 export async function geminiLiveWS(
