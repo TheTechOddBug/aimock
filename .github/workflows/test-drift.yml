@@ -19,7 +19,7 @@ on:
     # guards": check the unit lane first — that is where the value pin lives.
     paths:
       - "src/agui-types.ts"
-      - "src/__tests__/drift/agui-schema.drift.ts"
+      - "src/__tests__/drift/agui-*.drift.ts"
       # PR-scoped live drift leg (drift-live-pr job): trigger when the drift
       # scripts, any drift test, or a drift workflow itself changes.
       - "scripts/drift-*.ts"
@@ -47,8 +47,22 @@ jobs:
       - name: Clone ag-ui repo
         run: git clone --depth 1 https://github.com/ag-ui-protocol/ag-ui.git ../ag-ui
 
-      - name: Run AG-UI schema drift test
-        run: npx vitest run src/__tests__/drift/agui-schema.drift.ts --config vitest.config.drift.ts
+      # The positional argument is a vitest FILENAME FILTER (substring match on
+      # the test file path), NOT a single file — so this runs EVERY AG-UI drift
+      # file, and a future `agui-*.drift.ts` guard is picked up automatically
+      # instead of silently never running. `vitest.config.drift.ts` already
+      # scopes `include` to `src/__tests__/drift/**/*.drift.ts`, so the filter
+      # cannot pull in `*.test.ts` helpers from the same directory.
+      #
+      # NAMING CONTRACT: an AG-UI drift guard MUST be named
+      # `src/__tests__/drift/agui-<something>.drift.ts` to land in this lane.
+      #
+      # This lane needs NO provider API keys — the AG-UI drift files compare
+      # `src/agui-types.ts` against the cloned canonical ag-ui repo only. Do not
+      # widen the filter to the whole drift config: that is `runDriftTests()`'s
+      # job in the credit-burning `drift` leg below, which does need keys.
+      - name: Run AG-UI schema drift tests
+        run: npx vitest run src/__tests__/drift/agui- --config vitest.config.drift.ts
 
   drift:
     if: github.event_name != 'pull_request'
