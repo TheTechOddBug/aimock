@@ -16,7 +16,7 @@
  * report, and the stack-frame layout are exactly what vitest emits.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { formatDriftReport } from "./drift/schema.js";
 import type { ShapeDiff } from "./drift/schema.js";
 import {
@@ -26,6 +26,9 @@ import {
   extractScenario,
   parseKnownModelsCanary,
   collectDriftEntries,
+  collectAgUiDriftEntries,
+  classifyAgUiCheckout,
+  AGUI_CANONICAL_TYPES_RELPATH,
   computeExitCode,
   conclusionForExitCode,
   classifyUnparseableAsInfra,
@@ -45,8 +48,17 @@ import type {
   ParsedDiff,
 } from "../../scripts/drift-types.js";
 import { SURFACE_REGISTRY, KNOWN_SURFACE_SLUGS, isKnownSurface } from "./drift/surface-registry.js";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { resolve } from "node:path";
+import {
+  existsSync,
+  readFileSync,
+  readdirSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { resolve, join } from "node:path";
+import { tmpdir } from "node:os";
 import { isBaseReportReusable, computeDelta } from "../../scripts/drift-delta.js";
 import type { DriftReport } from "../../scripts/drift-types.js";
 
@@ -3251,5 +3263,170 @@ describe("WS-5 — SURFACE_REGISTRY coverage & integrity", () => {
   it("provider labels are unique (legacy fallback reverse-index has no collisions)", () => {
     const labels = Object.values(SURFACE_REGISTRY).map((m) => m.provider);
     expect(new Set(labels).size).toBe(labels.length);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AG-UI leg: the collector must never report "clean" when it cannot see
+// ---------------------------------------------------------------------------
+//
+// The AG-UI leg used to DROP any failed assertion whose message matched none of
+// its three recognizers — no entry, no counter, no warning — so a genuinely
+// failing guard produced zero entries, exit 0 and `conclusion: "clean"`. The
+// fixtures below are REAL vitest `--reporter=json` failure messages captured by
+// mutating `src/agui-types.ts` (deleting `subagentRunId` from `AGUIMessage`, and
+// renaming `TEXT_MESSAGE_START` in `AGUIEventType`) and running
+// `vitest run src/__tests__/drift/agui- --config vitest.config.drift.ts
+// --reporter=json`. They are not hand-authored: the single-glyph `…(N)` ellipsis,
+// the `AssertionError:` prefix and the frame layout are exactly what vitest emits.
+
+/** Real failure of the non-event `subagentRunId` guard — matches NO recognizer. */
+const AGUI_NONEVENT_FAILURE = [
+  "AssertionError: Non-event subagent attribution drift:",
+  `  BaseMessageSchema declares optional "subagentRunId" but aimock's AGUIMessage does not mirror it`,
+  `  ToolMessageSchema declares optional "subagentRunId" but aimock's AGUIMessage does not mirror it: expected [ …(4) ] to deeply equal []`,
+  "    at /repo/src/__tests__/drift/agui-nonevent-schema.drift.ts:190:89",
+  "    at file:///repo/node_modules/.pnpm/@vitest+runner@3.2.4/node_modules/@vitest/runner/dist/chunk-hooks.js:155:11",
+].join("\n");
+
+/** Real failure of an EXISTING agui-schema.drift.ts assertion — also unrecognized. */
+const AGUI_UNPARSEABLE_SCHEMA_FAILURE = [
+  "AssertionError: expected [ Array(36) ] to include 'TEXT_MESSAGE_START'",
+  "    at Proxy.<anonymous> (file:///repo/node_modules/.pnpm/@vitest+expect@3.2.4/node_modules/@vitest/expect/dist/index.js:1191:15)",
+  "    at /repo/src/__tests__/drift/agui-schema.drift.ts:404:25",
+].join("\n");
+
+/** Real failure that IS recognized (the missing-event-type shape). */
+const AGUI_MISSING_TYPE_FAILURE = [
+  "AssertionError: Missing event types:",
+  `[CRITICAL] Event type "TEXT_MESSAGE_START" exists in canonical @ag-ui/core but is missing from aimock AGUIEventType: expected [ { severity: 'CRITICAL', …(1) } ] to deeply equal []`,
+  "    at /repo/src/__tests__/drift/agui-schema.drift.ts:422:58",
+].join("\n");
+
+describe("collectAgUiDriftEntries — fail-closed on uninterpretable failures", () => {
+  it("quarantines a failed AG-UI assertion it cannot interpret instead of reporting clean", () => {
+    const result = collectAgUiDriftEntries(
+      makeResult([
+        makeAssertion({
+          ancestorTitles: ["AG-UI non-event schema drift"],
+          title: "mirrors canonical subagentRunId onto the non-event interfaces",
+          failureMessages: [AGUI_NONEVENT_FAILURE],
+        }),
+      ]),
+    );
+
+    expect(result.entries).toEqual([]);
+    expect(result.quarantine).toHaveLength(1);
+    expect(result.quarantine[0].provider).toBe("AG-UI");
+    expect(result.quarantine[0].testName).toContain(
+      "mirrors canonical subagentRunId onto the non-event interfaces",
+    );
+    expect(result.quarantine[0].rawLocation).toBe(
+      "/repo/src/__tests__/drift/agui-nonevent-schema.drift.ts:190:89",
+    );
+    expect(result.quarantine[0].message).toBe(AGUI_NONEVENT_FAILURE);
+
+    // The invariant, stated as the collector's terminal signal: a run that
+    // could not interpret a real failure must NOT be a reusable clean baseline.
+    const exitCode = computeExitCode(0, result.quarantine.length, false, 0);
+    expect(exitCode).toBe(5);
+    expect(conclusionForExitCode(exitCode)).toBe("quarantine");
+  });
+
+  it("surfaces an uninterpretable failure even on a MIXED run that also produced entries", () => {
+    // Regression for the HTTP leg's `entries.length === 0` gating being copied
+    // here: an unrecognized AG-UI failure must survive alongside a parsed one.
+    const result = collectAgUiDriftEntries(
+      makeResult([
+        makeAssertion({
+          ancestorTitles: ["AG-UI schema drift"],
+          title: "should parse aimock event types",
+          failureMessages: [AGUI_UNPARSEABLE_SCHEMA_FAILURE],
+        }),
+        makeAssertion({
+          ancestorTitles: ["AG-UI schema drift"],
+          title: "all canonical event types are present in aimock",
+          failureMessages: [AGUI_MISSING_TYPE_FAILURE],
+        }),
+      ]),
+    );
+
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0].provider).toBe("AG-UI");
+    expect(result.quarantine).toHaveLength(1);
+    expect(result.quarantine[0].testName).toContain("should parse aimock event types");
+    expect(result.quarantine[0].rawLocation).toBe(
+      "/repo/src/__tests__/drift/agui-schema.drift.ts:404:25",
+    );
+  });
+
+  it("does not quarantine a failure it DID interpret", () => {
+    const result = collectAgUiDriftEntries(
+      makeResult([
+        makeAssertion({
+          ancestorTitles: ["AG-UI schema drift"],
+          title: "all canonical event types are present in aimock",
+          failureMessages: [AGUI_MISSING_TYPE_FAILURE],
+        }),
+      ]),
+    );
+    expect(result.quarantine).toEqual([]);
+    expect(result.entries).toHaveLength(1);
+    expect(result.entries[0].diffs[0].path).toBe("AGUIEventType.TEXT_MESSAGE_START");
+  });
+
+  it("stays silent on passing assertions and on a run with no failures", () => {
+    const result = collectAgUiDriftEntries(
+      makeResult([
+        makeAssertion({ status: "passed", failureMessages: [] }),
+        makeAssertion({ status: "failed", failureMessages: [] }),
+      ]),
+    );
+    expect(result.entries).toEqual([]);
+    expect(result.quarantine).toEqual([]);
+    expect(computeExitCode(0, 0, false, 0)).toBe(0);
+  });
+});
+
+describe("classifyAgUiCheckout — a directory named ag-ui is not a canonical checkout", () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = mkdtempSync(join(tmpdir(), "agui-checkout-"));
+  });
+  afterEach(() => {
+    rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('reports a missing directory as "absent" (cloning is the right next step)', () => {
+    expect(classifyAgUiCheckout(join(tmpRoot, "ag-ui"))).toEqual({ kind: "absent" });
+  });
+
+  it('reports a stale/incomplete checkout as "incomplete", not a git/network failure', () => {
+    const agUi = join(tmpRoot, "ag-ui");
+    mkdirSync(join(agUi, "sdks", "typescript", "packages", "core"), { recursive: true });
+    const status = classifyAgUiCheckout(agUi);
+    expect(status.kind).toBe("incomplete");
+    // The message must name the real problem, not send the reader after git.
+    const reason = status.kind === "incomplete" ? status.reason : "";
+    expect(reason).toContain(AGUI_CANONICAL_TYPES_RELPATH);
+    expect(reason).toMatch(/STALE or INCOMPLETE/);
+    expect(reason).toMatch(/not a git\/network failure/);
+  });
+
+  it("accepts a checkout that actually carries the canonical types file", () => {
+    const agUi = join(tmpRoot, "ag-ui");
+    const canonicalDir = join(agUi, "sdks", "typescript", "packages", "core", "src");
+    mkdirSync(canonicalDir, { recursive: true });
+    writeFileSync(join(canonicalDir, "types.ts"), "export type Placeholder = never;\n");
+    expect(classifyAgUiCheckout(agUi)).toEqual({ kind: "ok" });
+  });
+
+  it("an unusable checkout lands on the AG-UI-skipped lane, never on clean", () => {
+    // ensureAgUiRepo returns false for an incomplete checkout, which main() maps
+    // to agUiSkipped=true → exit 1 / "skipped". The point is that it is NOT 0.
+    const exitCode = computeExitCode(0, 0, true, 0);
+    expect(exitCode).toBe(1);
+    expect(conclusionForExitCode(exitCode)).toBe("skipped");
   });
 });
