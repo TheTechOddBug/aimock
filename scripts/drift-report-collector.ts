@@ -10,7 +10,10 @@
  * Exit codes:
  *   0 — no critical diffs found (or no drift at all)
  *   2 — at least one critical diff exists
- *   5 — at least one failure was quarantined (unparseable/untrusted — needs review)
+ *   5 — at least one failure was quarantined (unparseable/untrusted — needs review).
+ *       Covers BOTH legs: an HTTP failure that could not be mapped to a
+ *       provider, and an AG-UI failure the collector could not structurally
+ *       interpret. An uninterpretable failure is NEVER silently dropped.
  *   6 — at least one live leg timed out having observed ZERO messages: the
  *       surface went silent, so nothing was graded there. Not drift, not a
  *       collector fault, and NOT a clean baseline.
@@ -102,6 +105,27 @@ const PROVIDER_LABEL_MAP: Record<string, ProviderMapping> = {
 // ---------------------------------------------------------------------------
 
 const AGUI_TYPES_FILE = "src/agui-types.ts";
+
+/**
+ * Vitest FILENAME FILTER (substring match on the test file path) selecting the
+ * whole AG-UI drift surface, not one hardcoded file. Keep this in lockstep with
+ * the `agui-schema-drift` job in `.github/workflows/test-drift.yml`, which runs
+ * the same filter.
+ *
+ * NAMING CONTRACT: an AG-UI drift guard MUST be named
+ * `src/__tests__/drift/agui-<something>.drift.ts` so both consumers pick it up
+ * automatically; a differently-named file would silently never run.
+ * `vitest.config.drift.ts` scopes `include` to the drift-suffixed files, so the
+ * filter cannot pull in plain `.test.ts` helpers from the same directory. No
+ * provider API keys are required — these files compare `src/agui-types.ts` against the
+ * cloned canonical ag-ui repo only.
+ */
+const AGUI_DRIFT_TEST_FILTER = "src/__tests__/drift/agui-";
+
+/**
+ * Report metadata only: the file a human should open when AG-UI drift is
+ * reported. Not a run target — see `AGUI_DRIFT_TEST_FILTER` for that.
+ */
 const AGUI_DRIFT_TEST = "src/__tests__/drift/agui-schema.drift.ts";
 
 // ---------------------------------------------------------------------------
@@ -1476,52 +1500,130 @@ export function collectDriftEntries(results: VitestJsonResult): CollectResult {
  * Returns drift entries in the same DriftEntry format as HTTP API drift,
  * or an empty array if the canonical repo is unavailable or tests pass.
  */
-function ensureAgUiRepo(): boolean {
-  const agUiPath = resolve("..", "ag-ui");
+/**
+ * The one file the AG-UI drift tests actually read out of the canonical
+ * checkout. A directory merely NAMED `ag-ui` proves nothing: if this file is
+ * absent the drift suites' `describe.skipIf` gates fire and the whole AG-UI leg
+ * silently reports NOTHING — which the collector would otherwise certify as a
+ * clean baseline. Presence of this file is the checkout's usability test.
+ */
+export const AGUI_CANONICAL_TYPES_RELPATH = "sdks/typescript/packages/core/src/types.ts";
+
+/**
+ * What a candidate `../ag-ui` directory actually is.
+ *
+ *   - `ok`         — a usable canonical checkout (the canonical types file is there).
+ *   - `absent`     — no such directory; cloning is the correct next step.
+ *   - `incomplete` — a directory named `ag-ui` EXISTS but does not contain the
+ *                    canonical sources. This is a stale/wrong/partial checkout,
+ *                    NOT a git or network failure, and must be reported as such:
+ *                    misreporting it sends the reader hunting a network problem
+ *                    that isn't there while the drift leg grades nothing.
+ */
+export type AgUiCheckoutStatus =
+  | { kind: "ok" }
+  | { kind: "absent" }
+  | { kind: "incomplete"; reason: string };
+
+/**
+ * Classify a candidate canonical AG-UI checkout. Pure w.r.t. the filesystem it
+ * is handed (no cloning, no mutation) so it is unit-testable against a temp dir.
+ */
+export function classifyAgUiCheckout(agUiPath: string): AgUiCheckoutStatus {
+  let isDir = false;
   try {
-    if (existsSync(agUiPath) && statSync(agUiPath).isDirectory()) {
-      return true;
-    }
+    isDir = existsSync(agUiPath) && statSync(agUiPath).isDirectory();
   } catch (statErr: unknown) {
     const msg = statErr instanceof Error ? statErr.message : String(statErr);
-    console.warn(`Could not stat AG-UI repo path: ${msg}`);
+    return {
+      kind: "incomplete",
+      reason: `could not stat AG-UI repo path ${agUiPath}: ${msg}`,
+    };
   }
-  {
-    // Not present — try to clone
-    console.log("AG-UI canonical repo not found. Cloning...");
-    try {
-      execSync("git clone --depth 1 https://github.com/ag-ui-protocol/ag-ui.git ../ag-ui", {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-        timeout: 60_000,
-      });
-      console.log("AG-UI repo cloned successfully.");
-      return true;
-    } catch (cloneErr: unknown) {
-      const msg = cloneErr instanceof Error ? cloneErr.message : String(cloneErr);
-      console.warn(`Could not clone AG-UI repo: ${msg}`);
-      console.warn("AG-UI schema drift detection will be skipped.");
-      return false;
-    }
+  if (!isDir) return { kind: "absent" };
+  if (!existsSync(resolve(agUiPath, AGUI_CANONICAL_TYPES_RELPATH))) {
+    return {
+      kind: "incomplete",
+      reason:
+        `${agUiPath} exists but ${AGUI_CANONICAL_TYPES_RELPATH} is missing — the canonical ` +
+        `AG-UI checkout is STALE or INCOMPLETE. This is not a git/network failure: remove the ` +
+        `directory and re-clone (git clone --depth 1 https://github.com/ag-ui-protocol/ag-ui.git).`,
+    };
   }
+  return { kind: "ok" };
 }
 
-function runAgUiDriftTests(): VitestJsonResult | null {
-  if (!ensureAgUiRepo()) return null;
+function ensureAgUiRepo(): boolean {
+  const agUiPath = resolve("..", "ag-ui");
+  const status = classifyAgUiCheckout(agUiPath);
+  if (status.kind === "ok") return true;
+  if (status.kind === "incomplete") {
+    // N5: do NOT proceed. Running the drift suites against an unusable checkout
+    // makes every AG-UI assertion skip, and a leg that graded nothing must never
+    // be able to certify AG-UI as drift-free.
+    console.warn(`AG-UI canonical checkout unusable: ${status.reason}`);
+    console.warn("AG-UI schema drift detection will be skipped.");
+    return false;
+  }
 
+  // Not present — try to clone
+  console.log("AG-UI canonical repo not found. Cloning...");
   try {
-    const stdout = execSync(
-      `npx vitest run ${AGUI_DRIFT_TEST} --config vitest.config.drift.ts --reporter=json`,
-      {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-        maxBuffer: 50 * 1024 * 1024,
-      },
+    execSync("git clone --depth 1 https://github.com/ag-ui-protocol/ag-ui.git ../ag-ui", {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 60_000,
+    });
+  } catch (cloneErr: unknown) {
+    const msg = cloneErr instanceof Error ? cloneErr.message : String(cloneErr);
+    console.warn(`Could not clone AG-UI repo: ${msg}`);
+    console.warn("AG-UI schema drift detection will be skipped.");
+    return false;
+  }
+  // A clone that "succeeded" but still lacks the canonical sources is the same
+  // unusable checkout as above — re-verify rather than assume.
+  const afterClone = classifyAgUiCheckout(agUiPath);
+  if (afterClone.kind !== "ok") {
+    console.warn(
+      `AG-UI repo cloned but the checkout is still unusable: ` +
+        `${afterClone.kind === "incomplete" ? afterClone.reason : `${agUiPath} is absent`}`,
     );
-    const result = parseVitestOutput(stdout, "AG-UI drift JSON parse of successful run failed");
-    if (result) return result;
-    // Tests passed, no failures — return empty result
-    return { testResults: [] };
+    console.warn("AG-UI schema drift detection will be skipped.");
+    return false;
+  }
+  console.log("AG-UI repo cloned successfully.");
+  return true;
+}
+
+/** How the AG-UI leg shells out. Injectable so the parse contract is testable. */
+export type VitestExec = (command: string) => string;
+
+const defaultAgUiExec: VitestExec = (command) =>
+  execSync(command, {
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+    maxBuffer: 50 * 1024 * 1024,
+  });
+
+/**
+ * Run the AG-UI drift lane and return its vitest JSON.
+ *
+ * `null` means the leg could not run at all (infra) — the caller maps that to
+ * the collector's exit-1 "skipped" lane.
+ *
+ * FAIL-CLOSED (twin symmetry): a ZERO-exit run whose stdout cannot be parsed as
+ * vitest JSON THROWS, exactly as the HTTP twin `runDriftTests()` does. It used
+ * to `return { testResults: [] }` — an empty result the collector reads as "no
+ * failures", i.e. exit 0 / `conclusion: "clean"` — so a lane that produced
+ * garbage instead of a report certified AG-UI as drift-free. The two legs face
+ * the same condition and must not disagree about whether it is clean.
+ */
+export function runAgUiVitest(exec: VitestExec = defaultAgUiExec): VitestJsonResult | null {
+  let stdout: string;
+  try {
+    stdout = exec(
+      `npx vitest run ${AGUI_DRIFT_TEST_FILTER} --config vitest.config.drift.ts --reporter=json`,
+    );
   } catch (err: unknown) {
     if (hasStdout(err)) {
       const result = parseVitestOutput(err.stdout, "AG-UI drift JSON parse of failed run");
@@ -1531,6 +1633,14 @@ function runAgUiDriftTests(): VitestJsonResult | null {
     console.warn(`AG-UI schema drift tests failed to run: ${msg}`);
     return null;
   }
+  const result = parseVitestOutput(stdout, "AG-UI drift JSON parse of successful run failed");
+  if (result) return result;
+  throw new Error("AG-UI drift tests passed but produced unparseable output");
+}
+
+function runAgUiDriftTests(): VitestJsonResult | null {
+  if (!ensureAgUiRepo()) return null;
+  return runAgUiVitest();
 }
 
 /**
@@ -1543,9 +1653,26 @@ function runAgUiDriftTests(): VitestJsonResult | null {
  *
  * These are converted to DriftEntry objects that point at `src/agui-types.ts`
  * as the builder file (the file that needs fixing).
+ *
+ * FAIL-CLOSED INVARIANT (W5/N1): a FAILED AG-UI assertion this function cannot
+ * structurally interpret MUST NOT vanish. Previously any failure that matched
+ * none of the recognizers above was dropped — no entry, no counter, no warning —
+ * so a genuinely failing assertion in `agui-schema.drift.ts` (e.g. `should parse
+ * aimock event types`, whose bare `expect` message matches none of the three
+ * shapes) produced zero entries, exit 0 and `conclusion: "clean"`. The same went
+ * for a FAILED assertion carrying no message at all. Every such failure is now returned
+ * as a `QuarantineEntry`, reusing the collector's EXISTING quarantine/exit-5
+ * lane — the same "held for review, never silently swallowed" contract the HTTP
+ * leg already uses. Note this is per-assertion and UNCONDITIONAL: unlike the
+ * HTTP leg's `entries.length === 0`-gated rescue, an unrecognized AG-UI failure
+ * survives a mixed run in which other failures DID parse.
  */
-function collectAgUiDriftEntries(results: VitestJsonResult): DriftEntry[] {
+export function collectAgUiDriftEntries(results: VitestJsonResult): {
+  entries: DriftEntry[];
+  quarantine: QuarantineEntry[];
+} {
   const entries: DriftEntry[] = [];
+  const quarantine: QuarantineEntry[] = [];
 
   // Accumulate all diffs across assertions into a single entry per scenario
   const missingTypesDiffs: ParsedDiff[] = [];
@@ -1554,7 +1681,23 @@ function collectAgUiDriftEntries(results: VitestJsonResult): DriftEntry[] {
   for (const file of results.testResults) {
     for (const assertion of file.assertionResults) {
       if (assertion.status !== "failed") continue;
-      if (assertion.failureMessages.length === 0) continue;
+
+      const testNameForQuarantine =
+        `${assertion.ancestorTitles.join(" ")} > ${assertion.title}`.trim();
+
+      if (assertion.failureMessages.length === 0) {
+        // A FAILED assertion carrying no message is the least interpretable
+        // failure there is — the collector cannot even see what broke. Skipping
+        // it read as exit 0 / "clean", which is the same fail-open the
+        // quarantine lane below exists to close, so it takes the same lane.
+        quarantine.push({
+          provider: "AG-UI",
+          testName: testNameForQuarantine,
+          rawLocation: "",
+          message: "AG-UI drift assertion failed with no failure message reported by vitest.",
+        });
+        continue;
+      }
 
       const fullMessage = assertion.failureMessages.join("\n");
       const testName = assertion.title || assertion.ancestorTitles.join(" > ");
@@ -1600,11 +1743,11 @@ function collectAgUiDriftEntries(results: VitestJsonResult): DriftEntry[] {
       // If THIS assertion did not extract any structured data, try a generic fallback
       const thisAssertionExtracted =
         missingTypesDiffs.length > missingTypesBefore || fieldDriftDiffs.length > fieldDriftBefore;
-      if (
+      const genericCritical =
         !thisAssertionExtracted &&
         (fullMessage.includes("Missing event types") ||
-          fullMessage.includes("Critical field drift"))
-      ) {
+          fullMessage.includes("Critical field drift"));
+      if (genericCritical) {
         // Generic critical failure from the ag-ui schema drift test
         missingTypesDiffs.push({
           severity: "critical",
@@ -1613,6 +1756,20 @@ function collectAgUiDriftEntries(results: VitestJsonResult): DriftEntry[] {
           expected: "(see test output)",
           real: "(see test output)",
           mock: "(see test output)",
+        });
+      }
+
+      if (!thisAssertionExtracted && !genericCritical) {
+        // The fail-closed lane. This assertion FAILED and none of the shapes
+        // above claimed it, so the collector cannot say what drifted — but it
+        // absolutely must not say "clean". Held for review (exit 5), with the
+        // raw pre-strip frame so a human can find the assertion, exactly as the
+        // HTTP leg quarantines its unmappable failures.
+        quarantine.push({
+          provider: "AG-UI",
+          testName: testNameForQuarantine,
+          rawLocation: extractRawLocation(fullMessage),
+          message: fullMessage,
         });
       }
     }
@@ -1642,7 +1799,16 @@ function collectAgUiDriftEntries(results: VitestJsonResult): DriftEntry[] {
     });
   }
 
-  return entries;
+  if (quarantine.length > 0) {
+    console.warn(
+      `WARNING: ${quarantine.length} AG-UI drift failure(s) could not be interpreted by the ` +
+        `collector — quarantined for review (exit 5), NOT reported as clean:`,
+    );
+    for (const q of quarantine)
+      console.warn(`  - ${q.testName} @ ${q.rawLocation || "<no frame>"}`);
+  }
+
+  return { entries, quarantine };
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,15 +1898,18 @@ function main(): void {
   const agUiResults = runAgUiDriftTests();
   const agUiSkipped = agUiResults === null;
   let agUiEntries: DriftEntry[] = [];
+  let agUiQuarantine: QuarantineEntry[] = [];
   if (agUiResults) {
     console.log("Collecting AG-UI schema drift entries...");
-    agUiEntries = collectAgUiDriftEntries(agUiResults);
+    const agUiResult = collectAgUiDriftEntries(agUiResults);
+    agUiEntries = agUiResult.entries;
+    agUiQuarantine = agUiResult.quarantine;
   } else {
     console.warn("WARNING: AG-UI schema drift tests could not run — results will be incomplete.");
   }
 
   const entries = [...httpEntries, ...agUiEntries];
-  const quarantine = httpResult.quarantine;
+  const quarantine = [...httpResult.quarantine, ...agUiQuarantine];
   const timeouts = httpResult.timeouts;
 
   const criticalCount = entries.reduce(
@@ -1779,6 +1948,7 @@ function main(): void {
     console.log(`  AG-UI schema entries: SKIPPED (could not run tests)`);
   } else {
     console.log(`  AG-UI schema entries: ${agUiEntries.length}`);
+    console.log(`  AG-UI uninterpretable failures (quarantined): ${agUiQuarantine.length}`);
   }
   console.log(`  Total entries: ${entries.length}`);
   console.log(`  Critical diffs: ${criticalCount}`);

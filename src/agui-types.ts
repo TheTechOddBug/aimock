@@ -397,6 +397,11 @@ export interface AGUIInterrupt {
   responseSchema?: Record<string, unknown>;
   expiresAt?: string;
   metadata?: Record<string, unknown>;
+  // The subagent whose work raised this interrupt; absent when the root raised
+  // it. Attribution sits on each interrupt rather than on the run because one
+  // run can carry interrupts from several subagents, so a consumer can render
+  // the request inside its own subagent's group.
+  subagentRunId?: string;
 }
 
 export interface AGUIResumeEntry {
@@ -473,6 +478,7 @@ export interface AGUIMessage {
   error?: string;
   toolCallId?: string;
   toolCalls?: AGUIToolCall[];
+  subagentRunId?: string;
 }
 
 export interface AGUIToolDefinition {

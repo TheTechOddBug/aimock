@@ -281,6 +281,10 @@ export type {
   AGUIReasoningEndEvent,
   AGUIReasoningEncryptedValueEvent,
   AGUIReasoningEncryptedValueSubtype,
+  // Subagent events
+  AGUISubagentStartedEvent,
+  AGUISubagentFinishedEvent,
+  AGUISubagentErrorEvent,
   // Special events
   AGUIRawEvent,
   AGUICustomEvent,
@@ -294,6 +298,7 @@ export type {
   AGUIInterrupt,
   AGUIResumeEntry,
   AGUIRunFinishedOutcome,
+  AGUISubagentFinishedOutcome,
   AGUITokenUsage,
 } from "./agui-types.js";
 export type { AGUIBuildOpts } from "./agui-handler.js";
