@@ -59,7 +59,12 @@ import {
   safeUrl,
   selectAdopters,
   topCandidate,
+  buildNextState,
+  scanIsConclusive,
+  serializeState,
+  withKnownAdopters,
   type AdopterState,
+  type AdoptersState,
   type CheckResult,
   type RepoMeta,
   type WallEntry,
@@ -3026,10 +3031,24 @@ const json = (body, status) =>
   });
 globalThis.fetch = async (input) => {
   const url = typeof input === "string" ? input : (input.url ?? String(input));
+  // The REST metadata fallback, reached only for a candidate the --meta-file
+  // does not cover. Defaults to the 404 GitHub gives for a repo that is gone.
+  if (/^https:\\/\\/api\\.github\\.com\\/repos\\//.test(url)) {
+    return json(
+      JSON.parse(process.env.AW_TEST_REPO_JSON ?? '{"message":"Not Found"}'),
+      Number(process.env.AW_TEST_REPO_STATUS ?? "404"),
+    );
+  }
   const m = /^https:\\/\\/api\\.github\\.com\\/user\\/(\\d+)$/.exec(url);
-  if (!m) return png();
-  const login = logins[m[1]];
-  return login === undefined ? json({ message: "Not Found" }, 404) : json({ login }, 200);
+  if (m) {
+    const login = logins[m[1]];
+    return login === undefined ? json({ message: "Not Found" }, 404) : json({ login }, 200);
+  }
+  // The avatar CDN. A non-200 here is how a case makes the logo probe reach no
+  // verdict at all (429 / 5xx), which is different from a definitely-dead logo.
+  const avatar = Number(process.env.AW_TEST_AVATAR_STATUS ?? "200");
+  if (avatar !== 200) return new Response("", { status: avatar });
+  return png();
 };
 process.argv = [process.argv[0], script, ...process.argv.slice(3)];
 await import(pathToFileURL(script).href);
@@ -3060,19 +3079,37 @@ interface MainRun {
   docs: string;
   /** The `--summary` file, or null if the run wrote none. */
   summary: string | null;
+  /** `adopters.json` as it stands AFTER the run — the run is its own producer. */
+  state: AdoptersState;
+  /** The sandbox root, so a case can run a SECOND time against what the first left. */
+  dir: string;
 }
 
 const awRepos = (n: number) => Array.from({ length: n }, (_, i) => `sbx${i}/r`);
 const awAdopters = (repos: string[]): AdopterState[] =>
   repos.map((r) => ({ repo: r, missedRuns: 0 }));
-/** Descending stars, so the rendered order is the argument order. */
-const awMeta = (repos: string[]): Record<string, RepoMeta> =>
-  Object.fromEntries(
+/**
+ * Descending stars, so the rendered order is the argument order.
+ *
+ * Every curated `ADOPTER_DISPLAY` repo is included too, at ZERO stars. The
+ * generator seeds those names into its own scan (see withKnownAdopters), so
+ * without a record here they would be resolved through the API — and the
+ * sandbox has no API, only a blanket avatar stub, so the run would die trying to
+ * read a PNG as JSON. Zero stars is the honest sandbox fact for them: they
+ * resolve, they sit far below STAR_FLOOR, they never render, and the wall these
+ * cases assert on stays exactly the wall the case built.
+ */
+const awMeta = (repos: string[]): Record<string, RepoMeta> => ({
+  ...Object.fromEntries(
+    Object.keys(ADOPTER_DISPLAY).map((r, i) => [r, { stars: 0, ownerId: 900 + i, isFork: false }]),
+  ),
+  ...Object.fromEntries(
     repos.map((r, i) => [r, { stars: OK_STARS - i, ownerId: 100 + i, isFork: false }]),
-  );
+  ),
+});
 const awWall = (repos: string[]) => selectAdopters(awAdopters(repos), metaMap(awMeta(repos)));
 
-async function runMain(opts: {
+interface MainOpts {
   /** What `docs/index.html` already shows when the run starts. */
   page: WallEntry[];
   /** What the state file on the orphan branch says. */
@@ -3083,7 +3120,77 @@ async function runMain(opts: {
   /** false writes the page as renderWall emits it, i.e. NOT prettier-clean. */
   formatted?: boolean;
   args?: string[];
-}): Promise<MainRun> {
+  /** The state file's own `lastScan`. Omitted, the file carries none. */
+  lastScan?: string;
+  /** Non-200 makes every avatar probe reach no verdict — a 429, not a dead logo. */
+  avatarStatus?: number;
+  /** What `api.github.com/repos/...` answers for a candidate the meta file misses. */
+  repoResponse?: { status: number; body: unknown };
+}
+
+/**
+ * Spawns the child against a sandbox that already exists, so a case can run the
+ * generator TWICE over one sandbox and watch the second run read what the first
+ * one wrote. That round trip is the whole point of the state write-back and it
+ * cannot be seen from a single run.
+ */
+function awSpawn(dir: string, opts: MainOpts): MainRun {
+  const script = join(dir, "scripts", "update-adoption-wall.ts");
+  const runner = join(dir, "runner.mjs");
+  const statePath = join(dir, "adopters.json");
+  const metaPath = join(dir, "meta.json");
+  const summaryPath = join(dir, "summary.md");
+  const docsPath = join(dir, "docs", "index.html");
+
+  const child = spawnSync(
+    AW_TSX_BIN,
+    [
+      runner,
+      script,
+      "--state",
+      opts.statePath ?? statePath,
+      "--meta-file",
+      metaPath,
+      "--summary",
+      summaryPath,
+      ...(opts.args ?? []),
+    ],
+    {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        GITHUB_TOKEN: "",
+        AW_TEST_AVATAR_STATUS: String(opts.avatarStatus ?? 200),
+        ...(opts.repoResponse
+          ? {
+              AW_TEST_REPO_STATUS: String(opts.repoResponse.status),
+              AW_TEST_REPO_JSON: JSON.stringify(opts.repoResponse.body),
+            }
+          : {}),
+        // Lets the child's fetch stub answer checkOwnerIdentity truthfully for
+        // the ids this run actually rendered.
+        AW_TEST_LOGINS: JSON.stringify(
+          Object.fromEntries(
+            Object.entries(opts.meta).map(([repo, m]) => [String(m.ownerId), repo.split("/")[0]]),
+          ),
+        ),
+      },
+    },
+  );
+  if (child.error) throw child.error;
+
+  const rawState = existsSync(statePath) ? readFileSync(statePath, "utf-8") : "{}";
+  return {
+    code: child.status ?? -1,
+    log: `${child.stdout}${child.stderr}`,
+    docs: readFileSync(docsPath, "utf-8"),
+    summary: existsSync(summaryPath) ? readFileSync(summaryPath, "utf-8") : null,
+    state: JSON.parse(rawState) as AdoptersState,
+    dir,
+  };
+}
+
+async function runMain(opts: MainOpts): Promise<MainRun> {
   mkdirSync(AW_SANDBOX_HOME, { recursive: true });
   const dir = mkdtempSync(join(AW_SANDBOX_HOME, "run-"));
   mkdirSync(join(dir, "scripts"));
@@ -3108,48 +3215,23 @@ async function runMain(opts: {
   );
 
   const statePath = join(dir, "adopters.json");
-  writeFileSync(statePath, JSON.stringify({ adopters: opts.adopters }), "utf-8");
-  const metaPath = join(dir, "meta.json");
-  writeFileSync(metaPath, JSON.stringify(opts.meta), "utf-8");
-  const summaryPath = join(dir, "summary.md");
-
-  const child = spawnSync(
-    AW_TSX_BIN,
-    [
-      runner,
-      script,
-      "--state",
-      opts.statePath ?? statePath,
-      "--meta-file",
-      metaPath,
-      "--summary",
-      summaryPath,
-      ...(opts.args ?? []),
-    ],
-    {
-      encoding: "utf-8",
-      env: {
-        ...process.env,
-        GITHUB_TOKEN: "",
-        // Lets the child's fetch stub answer checkOwnerIdentity truthfully for
-        // the ids this run actually rendered.
-        AW_TEST_LOGINS: JSON.stringify(
-          Object.fromEntries(
-            Object.entries(opts.meta).map(([repo, m]) => [String(m.ownerId), repo.split("/")[0]]),
-          ),
-        ),
-      },
-    },
+  writeFileSync(
+    statePath,
+    JSON.stringify(
+      opts.lastScan === undefined
+        ? { adopters: opts.adopters }
+        : { lastScan: opts.lastScan, adopters: opts.adopters },
+    ),
+    "utf-8",
   );
-  if (child.error) throw child.error;
+  writeFileSync(join(dir, "meta.json"), JSON.stringify(opts.meta), "utf-8");
 
-  return {
-    code: child.status ?? -1,
-    log: `${child.stdout}${child.stderr}`,
-    docs: readFileSync(docsPath, "utf-8"),
-    summary: existsSync(summaryPath) ? readFileSync(summaryPath, "utf-8") : null,
-  };
+  return awSpawn(dir, opts);
 }
+
+/** An ISO timestamp `days` in the past, for a state file's `lastScan`. */
+const awDaysAgo = (days: number): string =>
+  new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
 /** Exactly what `sed -n 's/^  ! //p'` at workflow :181 pulls out of the log. */
 const scrapedReasons = (log: string): string[] =>
@@ -3316,5 +3398,362 @@ describe("main() end to end: the exit code and log the workflow reads", () => {
     expect(run.summary).toContain("does not exist");
     expect(run.summary).toContain("_No adopter data was read; `docs/` was not modified._");
     expect(run.docs).toContain(`data-repo="sbx0/r"`);
+  }, 60_000);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The state write-back: this script is the PRODUCER of adopters.json
+//
+// It used to be only the reader. Nothing anywhere wrote the file — not this
+// script, not the workflow, not any of the other fifteen workflows — so
+// `lastScan` was stamped by hand once, when the orphan branch was seeded, and
+// never moved again. That turned MAX_STATE_AGE_DAYS from a guard into a FUSE:
+// every run was green until the seed aged past 21 days, and every run after that
+// reported NEEDS-REVIEW and opened a review PR, weekly and forever, over a wall
+// nothing had actually changed.
+//
+// The property these cases exist to hold is narrow and it is the only one that
+// matters: a fresh `lastScan` is a CLAIM that the run resolved the whole adopter
+// list, so a run that could not resolve it must not stamp one. Get that wrong
+// and the staleness guard is measuring how recently the JOB RAN — which it can
+// already tell — instead of how recently the DATA was confirmed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("withKnownAdopters seeds the scan from the curated list, not from the wall", () => {
+  const now = "2026-09-01T00:00:00.000Z";
+
+  // The orphan branch was seeded by parsing the LIVE WALL, so it could only ever
+  // contain repos that were already rendering. `cacheplane/dawnai` is a curated
+  // adopter sitting below the wall's cut, so the parse never saw it — and since
+  // the file is also the candidate list, a repo missing from it could never climb
+  // back on. missingFromState reported the gap every week and nothing closed it.
+  it("adds a curated adopter the incoming file never mentioned", () => {
+    const seeded = withKnownAdopters([{ repo: "a/one" }], now);
+    const dawn = seeded.find((a) => a.repo === "cacheplane/dawnai");
+    expect(dawn).toBeDefined();
+    expect(dawn?.firstSeen).toBe(now);
+    // missedRuns is an INPUT meaning "ask about this one", not a claim that the
+    // scan saw it: buildNextState overwrites it with the scan's real answer.
+    expect(dawn?.missedRuns).toBe(0);
+  });
+
+  it("closes the gap missingFromState reports, for every curated name", () => {
+    expect(missingFromState(withKnownAdopters([], now))).toEqual([]);
+  });
+
+  it("keeps the incoming entry rather than adding a second one, whatever the casing", () => {
+    const incoming: AdopterState[] = [
+      { repo: "CACHEPLANE/DawnAI", channels: ["package"], missedRuns: 4 },
+    ];
+    const seeded = withKnownAdopters(incoming, now);
+    expect(seeded.filter((a) => a.repo.toLowerCase() === "cacheplane/dawnai")).toEqual(incoming);
+  });
+
+  it("never drops or rewrites an entry the file already had", () => {
+    const incoming: AdopterState[] = [{ repo: "a/one", isFork: true, missedRuns: 2 }];
+    expect(withKnownAdopters(incoming, now).slice(0, 1)).toEqual(incoming);
+  });
+});
+
+describe("scanIsConclusive withholds the freshness stamp from a run that reached no verdict", () => {
+  it("says yes when everything resolved and every probe reached a verdict", () => {
+    expect(scanIsConclusive({ indeterminate: [], checks: [ok("a/one"), dead("a/two")] })).toEqual({
+      ok: true,
+    });
+  });
+
+  // A DEAD logo is a finding. A run that established one scanned fine, and
+  // withholding the stamp from it would freeze `lastScan` on the first broken
+  // avatar — three weeks later every run would carry an invented staleness
+  // reason ahead of the real one, and the workflow only carries three reasons
+  // into Slack.
+  it("does not confuse a definitely-dead logo with a probe that reached no verdict", () => {
+    expect(scanIsConclusive({ indeterminate: [], checks: [dead("a/one")] }).ok).toBe(true);
+    expect(scanIsConclusive({ indeterminate: [], checks: [inconclusive("a/one")] }).ok).toBe(false);
+  });
+
+  it("says no when a repo returned no usable metadata, and names it", () => {
+    const verdict = scanIsConclusive({ indeterminate: ["a/one"], checks: [] });
+    expect(verdict.ok).toBe(false);
+    if (verdict.ok) throw new Error("unreachable");
+    expect(verdict.detail).toContain("a/one");
+    expect(verdict.detail).toContain("did not resolve the whole adopter list");
+  });
+});
+
+describe("buildNextState records what the scan found and invents nothing", () => {
+  const scannedAt = "2026-09-01T00:00:00.000Z";
+  const build = (adopters: AdopterState[], resolved: string[], absent: string[]) =>
+    buildNextState({
+      adopters,
+      resolved: new Set(resolved),
+      absent: new Set(absent),
+      scannedAt,
+    });
+
+  it("stamps lastScan with the run's own timestamp", () => {
+    expect(build([{ repo: "a/one" }], ["a/one"], []).lastScan).toBe(scannedAt);
+  });
+
+  it("clears missedRuns for a repo that came back", () => {
+    const next = build([{ repo: "a/one", missedRuns: 3 }], ["a/one"], []);
+    expect(next.adopters?.[0].missedRuns).toBe(0);
+  });
+
+  it("increments missedRuns for a repo the scan definitively did not find", () => {
+    expect(build([{ repo: "a/one", missedRuns: 2 }], [], ["a/one"]).adopters?.[0].missedRuns).toBe(
+      3,
+    );
+    expect(build([{ repo: "a/one" }], [], ["a/one"]).adopters?.[0].missedRuns).toBe(1);
+  });
+
+  // THE ONE THAT MATTERS. An entry already at missedRuns > 0 is filtered out
+  // before the API is asked, so this run never looked at it; a repo that is not
+  // `owner/name` cannot be asked about at all. Incrementing either manufactures
+  // evidence of a disappearance out of a repo nobody looked at, and three of
+  // those in a row is how an adopter falls off a public page for no reason.
+  it("leaves a repo it never looked at exactly as it found it", () => {
+    const untouched: AdopterState[] = [
+      { repo: "a/already-missed", missedRuns: 2 },
+      { repo: "not-owner-slash-name", missedRuns: 0 },
+    ];
+    const next = build(untouched, [], []);
+    expect(next.adopters?.map((a) => a.missedRuns)).toEqual([2, 0]);
+  });
+
+  it("never deletes an entry, however long it has been missing", () => {
+    const next = build(
+      [{ repo: "a/one", missedRuns: 99, firstSeen: "2020-01-01T00:00:00.000Z" }],
+      [],
+      ["a/one"],
+    );
+    expect(next.adopters).toHaveLength(1);
+    expect(next.adopters?.[0].firstSeen).toBe("2020-01-01T00:00:00.000Z");
+  });
+
+  // The TRUST MODEL note at the top of the script says the reader uses the
+  // file's fork claim for NOTHING and reports every disagreement with the API.
+  // A producer that overwrote the claim with the API's answer would erase the
+  // evidence that report exists to surface.
+  it("carries isFork, channels and firstSeen through verbatim", () => {
+    const entry: AdopterState = {
+      repo: "a/one",
+      isFork: true,
+      channels: ["package", "discord"],
+      firstSeen: "2024-05-05T00:00:00.000Z",
+    };
+    expect(build([entry], ["a/one"], []).adopters?.[0]).toEqual({ ...entry, missedRuns: 0 });
+  });
+
+  it("sorts by repo so the orphan branch's weekly diff is the delta, not a reshuffle", () => {
+    const next = build([{ repo: "z/last" }, { repo: "A/first" }, { repo: "m/mid" }], [], []);
+    expect(next.adopters?.map((a) => a.repo)).toEqual(["A/first", "m/mid", "z/last"]);
+  });
+
+  it("serializes in the exact on-disk shape the orphan branch already holds", () => {
+    const text = serializeState(build([{ repo: "a/one" }], ["a/one"], []));
+    expect(text.endsWith("\n")).toBe(true);
+    expect(text).toContain('\n  "lastScan"');
+    expect(JSON.parse(text)).toEqual(build([{ repo: "a/one" }], ["a/one"], []));
+  });
+});
+
+describe("a repo that answered without the facts is not a repo that went away", () => {
+  // fetchRepoMeta yields no meta for BOTH a 404 and a reply missing `fork`, and
+  // before this split the two were indistinguishable downstream. Recording the
+  // second as "the scan did not see it" is how a flaky API becomes a fabricated
+  // missedRuns and, three runs later, an adopter deleted from a public page.
+  it("REST: 404 is a definitive answer, incomplete metadata is not", async () => {
+    const bodies: Record<string, { status: number; body: unknown }> = {
+      "https://api.github.com/repos/a/gone": { status: 404, body: { message: "Not Found" } },
+      "https://api.github.com/repos/a/partial": {
+        status: 200,
+        body: { stargazers_count: 10, owner: { id: 4 } },
+      },
+    };
+    vi.stubGlobal("fetch", async (url: string) => {
+      const r = bodies[url];
+      return new Response(JSON.stringify(r.body), {
+        status: r.status,
+        statusText: r.status === 404 ? "Not Found" : "OK",
+        headers: { "content-type": "application/json" },
+      });
+    });
+    try {
+      const m = new Map<string, RepoMeta>();
+      const indeterminate = new Set<string>();
+      await fetchRepoMetaRest(["a/gone", "a/partial"], m, indeterminate);
+      expect(m.size).toBe(0);
+      expect([...indeterminate]).toEqual(["a/partial"]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("GraphQL: a null node is a definitive answer, a node missing a field is not", async () => {
+    vi.stubGlobal("fetch", async () =>
+      Response.json({
+        data: {
+          r0: null,
+          r1: { isFork: false, owner: { databaseId: 7 } },
+        },
+        errors: [{ type: "NOT_FOUND", message: "Could not resolve to a Repository" }],
+      }),
+    );
+    try {
+      const m = new Map<string, RepoMeta>();
+      const indeterminate = new Set<string>();
+      await fetchRepoMetaGraphQL(["a/gone", "a/partial"], m, indeterminate);
+      expect(m.size).toBe(0);
+      expect([...indeterminate]).toEqual(["a/partial"]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("main() is the producer: the weekly run refreshes the state it read", () => {
+  afterAll(() => {
+    rmSync(AW_SANDBOX_HOME, { recursive: true, force: true });
+  });
+
+  const scenario = (n = MIN_WALL_SIZE) => {
+    const repos = awRepos(n);
+    return { page: awWall(repos), adopters: awAdopters(repos), meta: awMeta(repos), repos };
+  };
+
+  // RED WITHOUT THE FIX: the run resolved everything, exited 0, and left
+  // `lastScan` exactly where it found it, because nothing anywhere wrote the
+  // file. Three weeks of that and the wall reports itself frozen.
+  it("advances lastScan on a CLEAN run that resolved the whole list", async () => {
+    const s = scenario();
+    const before = awDaysAgo(7);
+    const run = await runMain({ ...s, lastScan: before });
+    expect(run.code).toBe(EXIT_CLEAN);
+    expect(run.log).toContain("ADOPTION_STATE_WRITTEN=true");
+    expect(run.state.lastScan).toBeDefined();
+    expect(new Date(run.state.lastScan ?? 0).getTime()).toBeGreaterThan(new Date(before).getTime());
+  }, 60_000);
+
+  // The generator's own staleness check, on the real surface, with the real exit
+  // code the workflow branches on — and then the recovery the write-back buys.
+  it("recovers a state file that has aged past MAX_STATE_AGE_DAYS in one run", async () => {
+    const s = scenario();
+    const first = await runMain({ ...s, lastScan: awDaysAgo(MAX_STATE_AGE_DAYS + 9) });
+    expect(first.code).toBe(EXIT_NEEDS_REVIEW);
+    expect(scrapedReasons(first.log).some((r) => r.includes("past the"))).toBe(true);
+    expect(first.log).toContain("ADOPTION_STATE_WRITTEN=true");
+
+    // The SAME sandbox, reading what the first run wrote. Before the write-back
+    // this second run was byte-identical to the first: NEEDS-REVIEW, a review PR,
+    // every Monday, for a wall that never changed.
+    const second = awSpawn(first.dir, s);
+    expect(second.code).toBe(EXIT_CLEAN);
+    expect(scrapedReasons(second.log)).toEqual([]);
+    // A CLEAN verdict means the generator wrote nothing to docs/, so the workflow
+    // has nothing to commit to the default branch.
+    expect(second.log).toContain("Data changed: false");
+    expect(second.log).not.toContain("Updated docs/index.html.");
+    expect(second.docs).toBe(first.docs);
+  }, 60_000);
+
+  // The stamp is a property of the SCAN, not of the verdict. A run that found a
+  // dead adopter found something out; freezing lastScan on it would add an
+  // invented staleness reason ahead of the real one three weeks later.
+  it("still refreshes state on a NEEDS-REVIEW run whose scan was conclusive", async () => {
+    const before = awRepos(MIN_WALL_SIZE + 1);
+    const after = awRepos(MIN_WALL_SIZE);
+    const run = await runMain({
+      page: awWall(before),
+      adopters: awAdopters(after),
+      meta: awMeta(after),
+      lastScan: awDaysAgo(7),
+    });
+    expect(run.code).toBe(EXIT_NEEDS_REVIEW);
+    expect(run.log).toContain("ADOPTION_STATE_WRITTEN=true");
+  }, 60_000);
+
+  // THE CORRECTNESS PROPERTY. A 429 from the avatar CDN is the run reporting
+  // that its own answers this minute cannot be trusted. Stamping a fresh
+  // lastScan on it would launder a failed scan into apparent freshness, and the
+  // staleness guard would never fire again.
+  it("does NOT advance lastScan when the avatar probes reached no verdict", async () => {
+    const s = scenario();
+    const before = awDaysAgo(7);
+    const run = await runMain({ ...s, lastScan: before, avatarStatus: 429 });
+    expect(run.code).toBe(EXIT_NEEDS_REVIEW);
+    expect(run.log).toContain("ADOPTION_STATE_WRITTEN=false");
+    expect(run.state.lastScan).toBe(before);
+    expect(run.log).toContain("`lastScan` did not advance");
+    // And the reviewer reading the PR is told, because nothing else in the
+    // document would show it.
+    expect(run.summary).toContain("NOT refreshed");
+  }, 60_000);
+
+  // The same rule from the other direction: the verdict was CLEAN and the exit
+  // code was 0, and the stamp is STILL withheld, because one repo answered
+  // without the facts the ranking needs.
+  it("does NOT advance lastScan when a repo returned no usable metadata", async () => {
+    const s = scenario();
+    const before = awDaysAgo(7);
+    const run = await runMain({
+      ...s,
+      adopters: [...s.adopters, { repo: "flaky/repo", missedRuns: 0 }],
+      lastScan: before,
+      repoResponse: { status: 200, body: { stargazers_count: 10, owner: { id: 4242 } } },
+    });
+    expect(run.code).toBe(EXIT_CLEAN);
+    expect(run.log).toContain("ADOPTION_STATE_WRITTEN=false");
+    expect(run.state.lastScan).toBe(before);
+    expect(run.log).toContain("flaky/repo");
+  }, 60_000);
+
+  // A repo the API definitively does not have is the other case, and it IS
+  // recorded: one scan's silence is a missed run, not a removal, and the entry
+  // stays on file with its counter raised.
+  it("records a definitively-absent repo as a missed run without deleting it", async () => {
+    const s = scenario();
+    const run = await runMain({
+      ...s,
+      adopters: [
+        ...s.adopters,
+        { repo: "gone/repo", missedRuns: 0, firstSeen: "2024-01-01T00:00:00.000Z" },
+      ],
+      lastScan: awDaysAgo(7),
+      repoResponse: { status: 404, body: { message: "Not Found" } },
+    });
+    expect(run.log).toContain("ADOPTION_STATE_WRITTEN=true");
+    const gone = run.state.adopters?.find((a) => a.repo === "gone/repo");
+    expect(gone).toBeDefined();
+    expect(gone?.missedRuns).toBe(1);
+    expect(gone?.firstSeen).toBe("2024-01-01T00:00:00.000Z");
+  }, 60_000);
+
+  // --dry-run promises to write nothing. Stamping the state file would be
+  // exactly the write it promised not to make, and would hand the next real run
+  // a freshness claim no scan ever landed.
+  it("writes no state on a dry run", async () => {
+    const s = scenario();
+    const before = awDaysAgo(7);
+    const run = await runMain({ ...s, lastScan: before, args: ["--dry-run"] });
+    expect(run.log).toContain("ADOPTION_STATE_WRITTEN=false");
+    expect(run.state.lastScan).toBe(before);
+  }, 60_000);
+
+  // A curated adopter that never made it into the file gets scanned, and the
+  // refreshed file carries it — so the gap closes itself instead of being
+  // reported forever.
+  it("writes back the curated adopters the incoming file was missing", async () => {
+    const s = scenario();
+    const run = await runMain({ ...s, lastScan: awDaysAgo(7) });
+    expect(run.log).toContain("ADOPTION_STATE_WRITTEN=true");
+    const repos = (run.state.adopters ?? []).map((a) => a.repo);
+    expect(repos).toContain("cacheplane/dawnai");
+    // And it is recorded as SEEN, because the scan actually resolved it.
+    expect(run.state.adopters?.find((a) => a.repo === "cacheplane/dawnai")?.missedRuns).toBe(0);
+    // The report of the INCOMING file's gap is untouched: it describes what the
+    // producer that wrote the file failed to discover, and running it over the
+    // seeded list would answer "none" every time.
+    expect(run.summary).toContain("Known adopters the scan did not report");
   }, 60_000);
 });

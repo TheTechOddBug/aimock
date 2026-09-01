@@ -6,14 +6,18 @@ name: Update Adoption Wall
 
 on:
   schedule:
-    # Mondays 17:00 UTC. The weekly adoption scan pushes adopters.json to the
-    # adoption-data branch on Mondays at 16:03 UTC, so this is NOMINALLY 57
-    # minutes behind it. That is ordering by convention, not a guarantee: a
-    # scheduled GitHub run is routinely delayed, the producer can slip or stop,
-    # and this job cannot tell either from the file it reads. Nothing here makes
-    # the state file fresh. What actually catches a stale one is the generator's
-    # own check of the file's `lastScan` against MAX_STATE_AGE_DAYS; if that
-    # ever goes away, this job goes back to reporting a frozen wall as healthy.
+    # Mondays 17:00 UTC. THIS JOB IS THE PRODUCER of adopters.json as well as its
+    # consumer: the generator resolves the whole adopter list against the GitHub
+    # API and, when that resolution was conclusive, writes the refreshed state
+    # back, which the "Persist adopter state" step below commits to the orphan
+    # adoption-data branch. There is no separate upstream routine to be behind.
+    #
+    # That is what keeps MAX_STATE_AGE_DAYS honest rather than decorative. The
+    # stamp is withheld whenever the run could not resolve the list, so a state
+    # file that stops advancing means the scan stopped working — which is
+    # exactly what the generator's staleness check is there to catch. It is
+    # still the thing that catches a frozen wall; if it ever goes away, this job
+    # goes back to reporting a frozen wall as healthy.
     - cron: "0 17 * * 1"
   workflow_dispatch:
 
@@ -83,6 +87,10 @@ jobs:
           echo "Branch name '${STATE_BRANCH}' agrees across workflow, script and .gitignore."
 
       # The adopter state, from the ORPHAN `adoption-data` branch of this repo.
+      # This checkout is ALSO where the refreshed state is committed from — see
+      # "Persist adopter state to the orphan branch" below. It stays a checkout
+      # of the orphan branch in its own directory, so committing into it can
+      # never mix repo history or repo files into that branch.
       #
       # ORPHAN MEANS ORPHAN: that branch shares no history with main, holds
       # nothing but adopters.json, and MUST NEVER BE MERGED INTO main. If a
@@ -211,12 +219,69 @@ jobs:
               | grep -v '^ADOPTION_WALL_REASON_EOF$' || true
             echo "ADOPTION_WALL_REASON_EOF"
           } >> "$GITHUB_OUTPUT"
+          # Whether the generator rewrote the state file. It is a property of the
+          # SCAN, not of the verdict — a NEEDS-REVIEW run that resolved the whole
+          # list still refreshes state — so it is read separately from $CODE.
+          if grep -qx 'ADOPTION_STATE_WRITTEN=true' "${RUNNER_TEMP}/adoption-wall.log"; then
+            echo "state_written=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "state_written=false" >> "$GITHUB_OUTPUT"
+          fi
           case "$CODE" in
             0)  echo "status=clean" >> "$GITHUB_OUTPUT" ;;
             10) echo "status=safe" >> "$GITHUB_OUTPUT" ;;
             20) echo "status=needs-review" >> "$GITHUB_OUTPUT" ;;
             *)  echo "Adoption wall script failed with exit ${CODE}"; exit "$CODE" ;;
           esac
+
+      # THE PRODUCER'S OTHER HALF. The generator rewrote adoption-data/adopters.json
+      # in place; this lands it on the orphan branch. Without it `lastScan` never
+      # moves, and MAX_STATE_AGE_DAYS turns from a guard into a fuse: three weeks
+      # after the branch was seeded EVERY run would report NEEDS-REVIEW and open a
+      # PR, weekly and forever, over a wall nothing had changed.
+      #
+      # Deliberately placed BEFORE the docs/ steps, and gated on the generator's
+      # own state_written flag rather than on the verdict. If this push fails the
+      # job stops here: the wall is not refreshed either, so nothing lands
+      # half-done, and the next run simply retries with three weeks of
+      # MAX_STATE_AGE_DAYS budget still in hand.
+      #
+      # This pushes to refs/heads/adoption-data and NOTHING ELSE. It cannot reach
+      # the default branch: it runs inside the orphan-branch checkout, stages one
+      # named file, and names the destination ref in full.
+      - name: Persist adopter state to the orphan branch
+        if: >-
+          steps.state_branch.outputs.exists == 'true' &&
+          steps.wall.outputs.state_written == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::${AUTH}"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${AUTH}"
+          cd "${STATE_BRANCH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # ONE NAMED FILE, never `git add -A`. The orphan branch holds nothing
+          # but adopters.json, and an `-A` here would push whatever else ever
+          # appeared in this directory onto it — which is the single thing the
+          # orphan-branch design exists to prevent.
+          git add -- "${STATE_FILE}"
+          if git diff --cached --quiet; then
+            echo "Refreshed state is byte-identical to what the branch holds; nothing to commit."
+            exit 0
+          fi
+          # --no-verify: see the HUSKY note in the workflow env block.
+          git commit --no-verify -m "chore(adoption): refresh adopter state"
+          # NO retry, NO rebase, NO force. This job is the branch's only writer
+          # and `concurrency` serialises it against itself, so a rejected push
+          # means something else wrote to adoption-data — and re-applying our
+          # file over it would delete whatever that was. Fail loudly instead:
+          # lastScan simply does not advance this week, which is the safe
+          # direction and is exactly what the staleness guard is for.
+          git push origin "HEAD:refs/heads/${STATE_BRANCH}"
 
       - name: Check for changes
         id: changes
@@ -424,6 +489,7 @@ jobs:
           CHANGED: ${{ steps.changes.outputs.changed }}
           CONFINED: ${{ steps.confine.outputs.confined }}
           EXISTS: ${{ steps.state_branch.outputs.exists }}
+          STATE_WRITTEN: ${{ steps.wall.outputs.state_written }}
           REASON: ${{ steps.wall.outputs.reason }}
           JOB_STATUS: ${{ job.status }}
           RUN_ID: ${{ github.run_id }}
@@ -487,6 +553,13 @@ jobs:
               EMOJI="⚠️"
               MSG="*No \`${STATE_BRANCH}\` branch on the remote, yet this run did not report a clean, unchanged wall. Nothing was committed, pushed or opened as a PR — the mutating steps are gated on the branch existing. Treat the rest as unverified.* ${MSG}"
             fi
+          fi
+          # A run that could not vouch for its own scan does not refresh the state,
+          # and that is otherwise invisible: the verdict, the diff and the logo
+          # count can all look ordinary while `lastScan` quietly stops moving. Say
+          # so, because three weeks of this is a weekly review PR nobody asked for.
+          if [ "$JOB_STATUS" = "success" ] && [ "$EXISTS" = "true" ] && [ "$STATE_WRITTEN" != "true" ]; then
+            MSG="${MSG} _Adopter state was NOT refreshed — the scan reached no verdict, so \`lastScan\` did not advance._"
           fi
           PAYLOAD=$(jq -n --arg text "${EMOJI} ${MSG}" '{text: $text}')
           # --fail-with-body + timeouts: a revoked or dead webhook returns 403
