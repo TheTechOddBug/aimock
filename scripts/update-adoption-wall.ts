@@ -21,12 +21,21 @@
  * state before the routine's first push: the run says so, leaves docs/ exactly
  * as it found it, renders no wall, and still reports on logo health. A file
  * that IS there but does not parse is a broken producer, not a first run, and
- * that is NEEDS-REVIEW.
+ * that is NEEDS-REVIEW. So is a THIRD case the missing/corrupt pair has no name
+ * for: a file that is there, parses, and is weeks old. That is a producer that
+ * stopped, and left unchecked it reads as a quiet week forever — the run finds no
+ * data change and reports "logos healthy, no changes" over a frozen wall. The
+ * file's own `lastScan` is what catches it; see MAX_STATE_AGE_DAYS.
  *
  * Two independent jobs run on EVERY invocation:
  *
- *   1. LOGO HEALTH — every avatar URL in the currently-rendered wall is probed
- *      for a 2xx. This is deliberately NOT gated on the adopter data changing:
+ *   1. LOGO HEALTH — the avatar URLs this run will LEAVE on the page are probed
+ *      for a 2xx: the live wall, minus the tiles this run is dropping, plus the
+ *      tiles it is about to render (see probeTargets). A departing tile's dead
+ *      avatar must not block the very change that removes it. When no candidate
+ *      list was built — --verify-only, or no state file — nothing is departing,
+ *      so the whole live wall is probed. This is deliberately NOT gated on the
+ *      adopter data changing:
  *      an org can rotate its avatar or go private long after the wall was last
  *      written, and a broken image in a credibility section is worse than no
  *      section. A 2xx alone does not count, and neither does an image.
@@ -49,9 +58,11 @@
  *      Silence from either check (timeout / rate-limit / 5xx) is INCONCLUSIVE
  *      and resolves to NEEDS-REVIEW, never SAFE.
  *   2. DATA REFRESH — forks and adopters missing from the latest scan are
- *      dropped and the rest are ranked by stargazers. EVERY survivor renders:
- *      the wall is uncapped and grows with adoption, which is what makes a new
- *      adopter a pure insertion and therefore auto-landable.
+ *      dropped and the rest are ranked by stargazers. Every survivor of the
+ *      filters in rankSelectable renders, ONE TILE PER ORG (see selectAdopters,
+ *      which is what holds `cacheplane` to a single tile): the wall is uncapped
+ *      and grows with adoption, so a new adopter from a new org is a pure
+ *      insertion and therefore auto-landable.
  *
  * TRUST MODEL — the state file is a candidate LIST, not a source of truth about
  * any repo's properties. It once marked `openclaw/openclaw` (388k stars, the
@@ -82,7 +93,13 @@
  * Exit codes (the workflow branches on these, not on prose):
  *   0  CLEAN         — logos healthy, no data change. Nothing to commit.
  *   10 CHANGED_SAFE  — logos healthy, wall changed additively. Safe to push.
- *   20 NEEDS_REVIEW  — a logo is dead/inconclusive, or the wall shrank. Human.
+ *   20 NEEDS_REVIEW  — human. Any of: a logo is dead or unverifiable; the wall
+ *                      shrank past its explained removals; it would render fewer
+ *                      than MIN_WALL_SIZE tiles; the highest-starred candidate the
+ *                      wall was allowed to render was excluded; a tile on the page
+ *                      today is absent from the new list with no explanation; or
+ *                      adopter state was present and unusable, or weeks stale.
+ *                      See classify.
  *   1  ERROR         — the run itself failed.
  *
  * --dry-run and --verify-only write nothing, so they never return 10: with
@@ -164,9 +181,17 @@ export interface CheckResult {
   /** HTTP status, or null when the request never produced one. */
   status: number | null;
   /**
-   * "ok" | "http" (definite non-2xx, or a 2xx that was not an image)
-   * | "identity" (the image is alive but belongs to the WRONG GitHub account)
-   * | "inconclusive" (timeout / network / rate-limit — we could not tell)
+   * "ok"           — 2xx AND an image/* body.
+   * "http"         — the server answered and the answer is not a live image. That
+   *                  covers a definite non-2xx AND a 2xx whose content-type is not
+   *                  image/*, which is the CDN's answer for an unresolvable owner
+   *                  id and the single most important case this probe exists to
+   *                  catch. `status` is 200 in that case; `ok` is what decides.
+   * "identity"     — the image is alive but belongs to the WRONG GitHub account:
+   *                  the avatar's numeric owner id does not resolve to the repo's
+   *                  owner, so the tile would show someone else's logo.
+   * "inconclusive" — no verdict was reached: timeout, network error, 429, 403 or
+   *                  5xx. Never SAFE, never "dead".
    */
   kind: "ok" | "http" | "identity" | "inconclusive";
   detail: string;
@@ -332,8 +357,13 @@ export const STAR_FLOOR = 40;
 
 /**
  * Explicit deny-list, applied AFTER the star floor. One entry per line,
- * `"owner/repo": "reason"`, alphabetical. A human edits this by hand — keep it
- * greppable and keep the reason specific enough to audit and reverse.
+ * `"owner/repo": "reason"`, alphabetical (case-insensitively) BY KEY. A human
+ * edits this by hand — keep it greppable and keep the reason specific enough to
+ * audit and reverse. The order is not decoration: a hand-edited list only stays
+ * auditable while an entry is findable, and the natural edit is to file a new
+ * entry beside the repo it is a copy of rather than in its sorted place, which is
+ * how `rivet-dev/agentos` ended up under `CrimsonSithria`. A test asserts the
+ * order, so a misfiled entry fails the suite instead of quietly accumulating.
  *
  * This exists because a star count cannot tell a real product from a popular
  * copy. The dominant junk class is verbatim re-pushes of openclaw: a fresh repo
@@ -351,7 +381,8 @@ export const STAR_FLOOR = 40;
  *
  * Bias when adding: a wrongly-excluded real adopter is invisible and never gets
  * noticed, while a wrongly-included one is visible on the homepage and gets
- * fixed. If unsure, leave it in.
+ * fixed. So the uncertain case does NOT get an entry — if unsure, add nothing and
+ * leave the repo on the wall.
  *
  * Entries currently below STAR_FLOOR are kept deliberately: they act as a ratchet
  * if the repo ever gains stars. The run summary reports how many entries actually
@@ -362,10 +393,10 @@ export const EXCLUDED_ADOPTERS: Record<string, string> = {
     'Self-described derivative: README opens "A hands-on learning template derived from the MIT-licensed OpenStory project". openstory-so/openstory is the original and is already on the wall.',
   "CrimsonSithria/agentos":
     "Copy of rivet-dev/agentos: same README banner and same homepage (agentos-sdk.dev) as the original, on a personal account with 2 followers. Not a GitHub fork, so the fork filter cannot see it.",
-  "rivet-dev/agentos":
-    "Not an aimock user: the ONLY two occurrences in the repo are pnpm-lock.yaml entries, and they are TRANSITIVE (@copilotkit/llmock@1.7.1 depends on @copilotkit/aimock@1.7.0). No package.json declares it and no source, test, config or doc references it. A lockfile mention is not usage.",
   "podhmo/llm-wiki-compiler":
     'Self-declared copy: README\'s first line is "Personal fork of https://github.com/atomicstrata/llm-wiki-compiler — do not merge". atomicstrata/llm-wiki-compiler is the original and is already on the wall.',
+  "rivet-dev/agentos":
+    "Not an aimock user: the ONLY two occurrences in the repo are pnpm-lock.yaml entries, and they are TRANSITIVE (@copilotkit/llmock@1.7.1 depends on @copilotkit/aimock@1.7.0). No package.json declares it and no source, test, config or doc references it. A lockfile mention is not usage.",
   "seek4coherence/Zoo-Code":
     'Self-declared copy: repo description is "Fork of Zoo-Code for PR: Remote Access WebUI + Discord Bot". Zoo-Code-Org/Zoo-Code is the original and is already on the wall.',
   "tylaujjapan0/openclaw":
@@ -418,10 +449,69 @@ const HEADERS: Record<string, string> = {
   ...(GITHUB_TOKEN ? { Authorization: `Bearer ${GITHUB_TOKEN}` } : {}),
 };
 
+/**
+ * How stale `lastScan` may be before the state file stops counting as current.
+ *
+ * The producing routine runs weekly, so 21 days is three scans: past any single
+ * delayed or skipped run, and not reachable by a schedule that is merely late.
+ * Without this check the file's own freshness field was declared and never read,
+ * and a frozen producer reported CLEAN forever — the run sees last month's
+ * `adopters.json`, finds no data change, and Slack says "logos healthy, no
+ * changes" while the wall is silently frozen. That is precisely the failure the
+ * corrupt-state branch exists to prevent, arriving through the one door the
+ * taxonomy (missing vs corrupt) had no name for: present, parses, weeks old.
+ */
+export const MAX_STATE_AGE_DAYS = 21;
+
+/**
+ * What the state file's `lastScan` says about its own freshness.
+ *
+ * An ABSENT `lastScan` is reported and does not gate: the field is optional in
+ * AdoptersState, so a producer that has never written it would otherwise wedge
+ * every run at NEEDS-REVIEW over a field nobody promised. An UNPARSEABLE one
+ * does gate — that is a producer writing garbage, which is the corrupt case.
+ */
+export function stateFreshness(
+  lastScan: string | undefined,
+  now: Date = new Date(),
+): { kind: "fresh" | "stale" | "unusable" | "absent"; detail: string } {
+  if (lastScan === undefined) {
+    return {
+      kind: "absent",
+      detail: `Adopter state carries no \`lastScan\`, so its age cannot be checked.`,
+    };
+  }
+  const scanned = new Date(lastScan);
+  if (Number.isNaN(scanned.getTime())) {
+    return {
+      kind: "unusable",
+      detail: `Adopter state has a \`lastScan\` of "${lastScan}", which is not a date.`,
+    };
+  }
+  const days = Math.floor((now.getTime() - scanned.getTime()) / 86_400_000);
+  if (days > MAX_STATE_AGE_DAYS) {
+    return {
+      kind: "stale",
+      detail:
+        `Adopter state was last scanned ${days} day(s) ago (${lastScan}), past the ` +
+        `${MAX_STATE_AGE_DAYS}-day limit: the routine that writes \`${STATE_FILE}\` on the ` +
+        `orphan \`${STATE_BRANCH}\` branch has stopped, so the wall is frozen on stale data.`,
+    };
+  }
+  return { kind: "fresh", detail: `Adopter state last scanned ${days} day(s) ago (${lastScan}).` };
+}
+
 /** Per-request budget for an avatar probe. Kept short: this is a health ping. */
 const CHECK_TIMEOUT_MS = 8000;
-/** One retry on a transient (inconclusive / 5xx / 429) result before giving up. */
-const CHECK_RETRIES = 1;
+/**
+ * Retries on a transient (inconclusive: timeout / network / 403 / 429 / 5xx)
+ * result before giving up. TWO, not one: with one retry `retryDelayMs`'s
+ * exponential never ran, so the exported signature and the note below described a
+ * backoff curve that in practice was a single flat second — and one second is
+ * thin for the rate-limit the retry exists for. An inconclusive probe forces
+ * NEEDS-REVIEW, so a retry that gives up too early costs a human a Monday.
+ */
+const CHECK_RETRIES = 2;
 /**
  * Wait between a transient failure and the retry. An immediate re-request is
  * the one thing that cannot help the case the retry exists for: a 429 is the
@@ -443,6 +533,19 @@ const CHECK_CONCURRENCY = 4;
  * Everything interpolated into the wall originates in an external JSON file or
  * the GitHub API, so every value is treated as untrusted.
  */
+/**
+ * One value going into a `|`-delimited markdown table cell. Same reasoning as
+ * escapeHtml, different sink: a repo name arrives from the state file and an
+ * exclusion reason is hand-written prose, and either one containing a pipe or a
+ * newline silently breaks the row it sits in — including inside backticks, which
+ * GitHub does NOT treat as escaping a cell separator. The break is silent: the
+ * PR body still renders, just with the columns shifted, which is exactly the
+ * class of quiet lie the rest of this file is written against.
+ */
+export function escapeCell(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+}
+
 export function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -756,8 +859,10 @@ export function clearsWallFilters(a: AdopterState, meta: Map<string, RepoMeta>):
 }
 
 /**
- * Four filters, in order: the latest scan must still see the repo, the GitHub
- * API must say it is not a fork, it must clear STAR_FLOOR, and it must not be on
+ * Five filters, in order: the latest scan must still see the repo (missedRuns),
+ * the API must have RESOLVED it at all — an unresolved repo has no stars and no
+ * owner id, so there is nothing to rank or render — it must not be a fork by the
+ * API's answer, it must clear STAR_FLOOR, and it must not be on
  * EXCLUDED_ADOPTERS. Survivors rank by stars, ties broken by repo name so the
  * output is stable run to run.
  *
@@ -1039,28 +1144,43 @@ async function probeOnce(url: string, method: "HEAD" | "GET"): Promise<CheckResu
       headers: method === "GET" ? { Range: "bytes=0-0" } : {},
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });
-    if (res.ok || res.status === 206) {
-      // A 2xx is NOT sufficient. When the PATH IS NOT NUMERIC — `u/undefined`,
-      // `u/NaN`, an interpolation that produced an empty string — the CDN 302s
-      // to github.com and returns 200 text/html, which a browser renders as a
-      // broken image. That template-bug class is precisely what this check
-      // catches, and it is all it catches: a wrong-but-numeric id still returns
-      // a perfectly valid image/* 200 and passes here. checkOwnerIdentity is
-      // what covers that; do not read this check as proof the id resolves.
-      const ctype = res.headers.get("content-type") ?? "";
-      if (!ctype.toLowerCase().startsWith("image/")) {
-        return {
-          ...base,
-          status: res.status,
-          kind: "http",
-          detail: `HTTP ${res.status} but content-type was "${ctype || "(none)"}", not an image`,
-        };
+    try {
+      if (res.ok || res.status === 206) {
+        // A 2xx is NOT sufficient. When the PATH IS NOT NUMERIC — `u/undefined`,
+        // `u/NaN`, an interpolation that produced an empty string — the CDN 302s
+        // to github.com and returns 200 text/html, which a browser renders as a
+        // broken image. That template-bug class is precisely what this check
+        // catches, and it is all it catches: a wrong-but-numeric id still returns
+        // a perfectly valid image/* 200 and passes here. checkOwnerIdentity is
+        // what covers that; do not read this check as proof the id resolves.
+        const ctype = res.headers.get("content-type") ?? "";
+        if (!ctype.toLowerCase().startsWith("image/")) {
+          return {
+            ...base,
+            status: res.status,
+            kind: "http",
+            detail: `HTTP ${res.status} but content-type was "${ctype || "(none)"}", not an image`,
+          };
+        }
+        return { ...base, ok: true, status: res.status, kind: "ok", detail: `HTTP ${res.status}` };
       }
-      return { ...base, ok: true, status: res.status, kind: "ok", detail: `HTTP ${res.status}` };
+      // Not evidence the image is dead: a rate-limit, a server-side wobble, or a
+      // 403. 403 is what a CDN answers when it is shedding load or refusing the
+      // method, NOT what it answers for an avatar that does not exist — that
+      // answer is the 200 text/html above. Calling a 403 dead put "Logo for X
+      // returned HTTP 403" into Slack, which is the one line a human reads,
+      // naming a live logo as dead; it also broke out of the retry loop below
+      // without ever spending the backoff the 403 is asking for.
+      const kind =
+        res.status === 403 || res.status === 429 || res.status >= 500 ? "inconclusive" : "http";
+      return { ...base, status: res.status, kind, detail: `HTTP ${res.status}` };
+    } finally {
+      // The ranged GET's body is never read. Under undici an unread body holds
+      // its socket checked out of the pool until GC, so a run where many avatars
+      // refuse HEAD sits on CHECK_CONCURRENCY sockets against one CDN for the
+      // rest of the process. Cancelling releases it now.
+      await res.body?.cancel().catch(() => {});
     }
-    // A rate-limit or a server-side wobble is not evidence the image is dead.
-    const kind = res.status === 429 || res.status >= 500 ? "inconclusive" : "http";
-    return { ...base, status: res.status, kind, detail: `HTTP ${res.status}` };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return { ...base, kind: "inconclusive", detail: `request failed: ${msg}` };
@@ -1186,9 +1306,11 @@ export async function checkOwnerIdentity(url: string, repo: string): Promise<Che
 
 /**
  * HEAD first; some CDNs refuse HEAD, so a 403/405 is re-tried as a one-byte
- * ranged GET before being believed. Retries once on anything transient, after
- * backing off — see CHECK_RETRY_BASE_MS. `wait` is injectable so a test can
- * observe the backoff without spending it.
+ * ranged GET before being believed. Retries CHECK_RETRIES times on anything
+ * transient, backing off exponentially between attempts — see retryDelayMs.
+ * `wait` is injectable so a test can observe the backoff without spending it.
+ * Only a verdict — 2xx-with-an-image, or a definite non-image answer — stops the
+ * loop early; an inconclusive result spends every attempt it is given.
  */
 export async function checkLogo(
   url: string,
@@ -1233,7 +1355,19 @@ export async function checkLogos(
     }
   });
   await Promise.all(workers);
-  return out;
+  // Rebuilt in the order the targets arrived. `out` is written as each probe
+  // RESOLVES, so under bounded concurrency its order is whichever CDN answered
+  // first: two byte-identical runs against the same wall emitted the `  ! `
+  // lines, the ADOPTION_WALL_REASON lines and the summary's "Why this needs
+  // review" list in different orders, and the workflow puts the FIRST one in
+  // Slack. rankCandidates, forkDisagreements, missingFromState and floorDrops
+  // all sort deliberately; this is the one place that did not.
+  const ordered = new Map<string, CheckResult>();
+  for (const t of targets) {
+    const res = out.get(t.url);
+    if (res && !ordered.has(t.url)) ordered.set(t.url, res);
+  }
+  return ordered;
 }
 
 // ── Classification ───────────────────────────────────────────────────────────
@@ -1378,6 +1512,8 @@ export function buildSummary(opts: {
   suppressed?: { repo: string; stars: number; reason: string }[];
   /** Exclude-list entries the incoming scan no longer mentions at all. */
   staleExclusions?: string[];
+  /** State entries that are not `owner/name`, so nothing could be asked about them. */
+  malformedRepos?: string[];
   /** Why no adopter data was read this run, when that is the case. */
   stateNote?: string | null;
 }): string {
@@ -1461,7 +1597,7 @@ export function buildSummary(opts: {
     lines.push("| Repo | Stars | Slot held by |");
     lines.push("| --- | --- | --- |");
     for (const r of runnersUp) {
-      lines.push(`| \`${r.repo}\` | ${r.stars} | \`${r.winner}\` |`);
+      lines.push(`| \`${escapeCell(r.repo)}\` | ${r.stars} | \`${escapeCell(r.winner)}\` |`);
     }
     lines.push("");
   }
@@ -1477,7 +1613,9 @@ export function buildSummary(opts: {
   if (suppressed.length > 0) {
     lines.push("| Repo | Stars | Why it is excluded |");
     lines.push("| --- | --- | --- |");
-    for (const e of suppressed) lines.push(`| \`${e.repo}\` | ${e.stars} | ${e.reason} |`);
+    for (const e of suppressed) {
+      lines.push(`| \`${escapeCell(e.repo)}\` | ${e.stars} | ${escapeCell(e.reason)} |`);
+    }
     lines.push("");
   }
   const stale = opts.staleExclusions ?? [];
@@ -1486,6 +1624,23 @@ export function buildSummary(opts: {
       `${stale.length} exclude-list entr(y/ies) no longer appear in the scan at all and could be retired: ` +
         stale.map((r) => `\`${r}\``).join(", "),
     );
+    lines.push("");
+  }
+
+  // Rendered as its own section rather than folded into the drop notes: this is
+  // not the wall's decision taking effect, it is the producer writing something
+  // this script cannot use, and the fix is upstream.
+  const malformed = opts.malformedRepos ?? [];
+  if (malformed.length > 0) {
+    lines.push(`### ${malformed.length} state entr(y/ies) are not \`owner/name\``);
+    lines.push("");
+    lines.push(
+      "The GitHub API is asked about repos by owner and name, so these entries could not be " +
+        "resolved and were not ranked or rendered. They are a bug in the routine that writes " +
+        `\`${STATE_FILE}\`, not in this script:`,
+    );
+    lines.push("");
+    for (const repo of malformed) lines.push(`- \`${escapeCell(repo)}\``);
     lines.push("");
   }
 
@@ -1504,7 +1659,7 @@ export function buildSummary(opts: {
     lines.push("| --- | --- | --- |");
     for (const d of disagreements) {
       lines.push(
-        `| \`${d.repo}\` | ${d.stateSaysFork ? "fork" : "not a fork"} | ${d.apiSaysFork ? "fork" : "**not a fork**"} |`,
+        `| \`${escapeCell(d.repo)}\` | ${d.stateSaysFork ? "fork" : "not a fork"} | ${d.apiSaysFork ? "fork" : "**not a fork**"} |`,
       );
     }
     lines.push("");
@@ -1540,7 +1695,7 @@ export function buildSummary(opts: {
   // Promoted above the wall table on purpose. With an uncapped wall this list is
   // the maintenance queue, not a footnote: every entry is a tile currently on a
   // public page showing a raw GitHub org login instead of the company's name.
-  const unmapped = (opts.next ?? []).filter((e) => !e.mapped);
+  const unmapped = opts.next.filter((e) => !e.mapped);
   if (unmapped.length > 0) {
     lines.push(`### ⚠ ${unmapped.length} tile(s) need a display name and homepage`);
     lines.push("");
@@ -1552,32 +1707,55 @@ export function buildSummary(opts: {
     lines.push("");
     lines.push("| Repo | Rendering as | Stars |");
     lines.push("| --- | --- | --- |");
-    for (const e of unmapped) lines.push(`| \`${e.repo}\` | ${e.name} | ${e.stars} |`);
+    for (const e of unmapped) {
+      lines.push(`| \`${escapeCell(e.repo)}\` | ${escapeCell(e.name)} | ${e.stars} |`);
+    }
     lines.push("");
   }
 
-  if (opts.next) {
-    lines.push(`### Wall contents (${opts.next.length} tiles)`);
-    lines.push("");
-    lines.push("| # | Adopter | Repo | Stars | Mapped |");
-    lines.push("| --- | --- | --- | --- | --- |");
-    opts.next.forEach((e, i) => {
-      lines.push(
-        `| ${i + 1} | ${e.name} | ${e.repo} | ${e.stars} | ${e.mapped ? "yes" : "**no**"} |`,
-      );
-    });
-    lines.push("");
-  }
+  lines.push(`### Wall contents (${opts.next.length} tiles)`);
+  lines.push("");
+  lines.push("| # | Adopter | Repo | Stars | Mapped |");
+  lines.push("| --- | --- | --- | --- | --- |");
+  opts.next.forEach((e, i) => {
+    lines.push(
+      `| ${i + 1} | ${escapeCell(e.name)} | ${escapeCell(e.repo)} | ${e.stars} | ${e.mapped ? "yes" : "**no**"} |`,
+    );
+  });
+  lines.push("");
 
   return lines.join("\n") + "\n";
 }
 
 // ── Data loading ─────────────────────────────────────────────────────────────
 
+/**
+ * The value of `flag`, or null when the flag was not passed AT ALL.
+ *
+ * "Passed with no value" is NOT null, it is a malformed command line, and it
+ * throws. Taking the next token unconditionally made a typo look like a
+ * successful run: `--summary --dry-run` wrote the PR summary to a file literally
+ * named `--dry-run`, and `--state --verify-only` resolved a nonsense path that
+ * loadAdopterState reported as `missing`, so the run exited 0 saying "no adopter
+ * state yet, docs/ left alone" — a green run that checked nothing. A trailing
+ * `--summary` with nothing after it silently wrote no summary at all, and the
+ * workflow's `gh pr create --body-file` then failed pointing nowhere near the
+ * cause. A leading `-` is the test because every value this script takes is a
+ * path, and no flag of ours is a legitimate one.
+ */
+export function flagValue(argv: readonly string[], flag: string): string | null {
+  const idx = argv.indexOf(flag);
+  if (idx === -1) return null;
+  const value = argv[idx + 1];
+  if (value === undefined) throw new Error(`${flag} needs a value; nothing followed it.`);
+  if (value.startsWith("-")) {
+    throw new Error(`${flag} needs a value; the next argument was the flag "${value}".`);
+  }
+  return value;
+}
+
 function argValue(flag: string): string | null {
-  const idx = process.argv.indexOf(flag);
-  if (idx === -1 || idx + 1 >= process.argv.length) return null;
-  return process.argv[idx + 1];
+  return flagValue(process.argv, flag);
 }
 
 /**
@@ -1954,6 +2132,7 @@ async function main(): Promise<number> {
   let suppressed: { repo: string; stars: number; reason: string }[] = [];
   let runnersUp: OrgRunnerUp[] = [];
   let staleExclusions: string[] = [];
+  let malformed: string[] = [];
   let stateNote: string | null = null;
   const extraReasons: string[] = [];
 
@@ -1988,6 +2167,19 @@ async function main(): Promise<number> {
   if (load?.kind === "ok") {
     const state = load.state;
     const adopters = state.adopters ?? [];
+
+    // Before anything is ranked: is this file still being written? A frozen
+    // producer looks exactly like a quiet week from every other angle.
+    const freshness = stateFreshness(state.lastScan);
+    if (freshness.kind === "stale" || freshness.kind === "unusable") {
+      extraReasons.push(freshness.detail);
+      console.error(`\n! ${freshness.detail}`);
+    } else if (freshness.kind === "absent") {
+      console.warn(`\n⚠ ${freshness.detail}`);
+    } else {
+      console.log(`  ${freshness.detail}`);
+    }
+
     // Note what is NOT filtered here: the state file's `isFork`. Fork status is
     // resolved from the API below and the file's claim is never consulted.
     const candidates = adopters.filter(
@@ -1996,6 +2188,22 @@ async function main(): Promise<number> {
     console.log(
       `Adopter state: ${adopters.length} entries, ${candidates.length} still seen by the latest scan.`,
     );
+
+    // fetchRepoMeta cannot ask the API about a repo that is not `owner/name`, so
+    // it drops these — and it used to drop them in silence, which is the worst of
+    // the three options. The entry passes parseAdopterState (any non-empty string
+    // is a valid `repo`), is never resolved, is filtered out before `requested`
+    // is formed, and so gets no ⚠, no summary row, and no explainDrop note: a
+    // producer that starts writing repo URLs degrades the wall while a tile that
+    // WAS on the page resurfaces as a bare "absent from the new list" alarm whose
+    // stated cause is false. It is named here instead.
+    malformed = candidates.map((a) => a.repo).filter((r) => r.split("/").length !== 2);
+    if (malformed.length > 0) {
+      console.warn(
+        `\n⚠ ${malformed.length} state entr(y/ies) are not "owner/name" and cannot be resolved or ranked:`,
+      );
+      for (const repo of malformed) console.warn(`    ${repo}`);
+    }
 
     const meta = await fetchRepoMeta(candidates.map((a) => a.repo));
 
@@ -2139,6 +2347,7 @@ async function main(): Promise<number> {
       orgRunnersUp: runnersUp,
       suppressed,
       staleExclusions,
+      malformedRepos: malformed,
       stateNote,
     });
     writeFileSync(resolve(summaryPath), md, "utf-8");

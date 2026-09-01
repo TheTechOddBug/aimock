@@ -30,8 +30,12 @@ import {
   MARQUEE_MIN_SECONDS,
   STATE_BRANCH,
   STATE_FILE,
+  escapeCell,
   excludeReason,
   explainDrop,
+  flagValue,
+  stateFreshness,
+  MAX_STATE_AGE_DAYS,
   forkDisagreements,
   metaFor,
   partitionDrops,
@@ -2444,6 +2448,195 @@ describe("a live image is not evidence it is the RIGHT account's image", () => {
         expect(exitCodeFor(status)).toBe(EXIT_NEEDS_REVIEW);
         expect(reasons.join(" ")).toContain("WRONG GitHub account");
         expect(reasons.join(" ")).toContain("govnojuy");
+      },
+    );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Round-2 code review: the run must tell the truth about what it did
+//
+// Every block below was written against the pre-fix code and observed to FAIL
+// there, then observed to pass with the fix.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("a malformed command line is an error, not a plausible-looking run", () => {
+  it("refuses to take the next FLAG as a value", () => {
+    // `--summary --dry-run` used to write the PR summary to a file named
+    // "--dry-run", and the workflow's `gh pr create --body-file` then failed
+    // pointing nowhere near the cause.
+    expect(() => flagValue(["node", "s.ts", "--summary", "--dry-run"], "--summary")).toThrow(
+      /--summary needs a value/,
+    );
+  });
+
+  it("tells a trailing flag with no value from a flag that was never passed", () => {
+    expect(flagValue(["node", "s.ts"], "--state")).toBeNull();
+    expect(() => flagValue(["node", "s.ts", "--state"], "--state")).toThrow(/nothing followed it/);
+  });
+
+  it("still returns an ordinary value", () => {
+    expect(flagValue(["node", "s.ts", "--state", "a.json"], "--state")).toBe("a.json");
+  });
+});
+
+describe("a frozen producer cannot report green forever", () => {
+  const now = new Date("2026-03-01T00:00:00Z");
+
+  it("gates on a lastScan older than the limit", () => {
+    const old = new Date(now.getTime() - (MAX_STATE_AGE_DAYS + 1) * 86_400_000).toISOString();
+    const f = stateFreshness(old, now);
+    expect(f.kind).toBe("stale");
+    expect(f.detail).toContain("day(s) ago");
+  });
+
+  it("does not gate on a file that was scanned inside the limit", () => {
+    const recent = new Date(now.getTime() - 3 * 86_400_000).toISOString();
+    expect(stateFreshness(recent, now).kind).toBe("fresh");
+  });
+
+  it("reports an absent lastScan without wedging the run on an optional field", () => {
+    expect(stateFreshness(undefined, now).kind).toBe("absent");
+  });
+
+  it("treats a lastScan that is not a date as a broken producer", () => {
+    expect(stateFreshness("last tuesday", now).kind).toBe("unusable");
+  });
+});
+
+describe("markdown table cells survive the text that goes into them", () => {
+  it("escapes a pipe so a row keeps its column count", () => {
+    expect(escapeCell("a|b")).toBe("a\\|b");
+    expect(escapeCell("one\ntwo")).toBe("one two");
+  });
+
+  it("keeps the suppressed table's columns when a reason contains a pipe", () => {
+    const md = buildSummary({
+      status: "SAFE",
+      reasons: [],
+      current: [],
+      next: [],
+      checks: [],
+      verifyOnly: false,
+      suppressed: [{ repo: "junk/copy", stars: 50, reason: "grep -ril aimock | only lockfiles" }],
+    });
+    const row = md.split("\n").find((l) => l.includes("junk/copy"))!;
+    // Three declared columns, so four unescaped separators and no more.
+    expect(row.split(/(?<!\\)\|/)).toHaveLength(5);
+  });
+
+  it("keeps the wall table's columns when a repo name contains a pipe", () => {
+    const md = buildSummary({
+      status: "SAFE",
+      reasons: [],
+      current: [],
+      next: [{ ...entry("acme/pipe|repo"), name: "A|B Inc" }],
+      checks: [],
+      verifyOnly: false,
+    });
+    const row = md.split("\n").find((l) => l.includes("acme/pipe"))!;
+    expect(row.split(/(?<!\\)\|/)).toHaveLength(7);
+  });
+});
+
+describe("state entries that are not owner/name are named, not dropped in silence", () => {
+  it("gives them their own summary section", () => {
+    const md = buildSummary({
+      status: "SAFE",
+      reasons: [],
+      current: [],
+      next: [],
+      checks: [],
+      verifyOnly: false,
+      malformedRepos: ["https://github.com/acme/one"],
+    });
+    expect(md).toContain("not `owner/name`");
+    expect(md).toContain("https://github.com/acme/one");
+  });
+});
+
+describe("the deny list stays auditable by hand", () => {
+  it("is stored in the alphabetical order its own docblock asks for", () => {
+    const keys = Object.keys(EXCLUDED_ADOPTERS);
+    const sorted = [...keys].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    expect(keys).toEqual(sorted);
+  });
+
+  it("has no two ADOPTER_DISPLAY keys that collapse to the same lowercase form", () => {
+    const lower = Object.keys(ADOPTER_DISPLAY).map((k) => k.toLowerCase());
+    // DISPLAY_BY_LOWER is a Map built from these, so a collision would silently
+    // drop one curated name and render a raw org login on a public page.
+    expect(new Set(lower).size).toBe(lower.length);
+  });
+});
+
+describe("the probe releases what it opened, and does not overstate what it saw", () => {
+  it("cancels the response body instead of leaving its socket checked out", async () => {
+    let cancelled = 0;
+    const body = () =>
+      new ReadableStream({
+        start(c) {
+          c.enqueue(new Uint8Array([1]));
+        },
+        cancel() {
+          cancelled++;
+        },
+      });
+    await withFetch(
+      async () => new Response(body(), { status: 200, headers: { "content-type": "image/png" } }),
+      async () => {
+        expect((await checkLogo("https://x/u/1", "a/one")).ok).toBe(true);
+      },
+    );
+    expect(cancelled).toBe(1);
+  });
+
+  it("calls a 403 INCONCLUSIVE, not a definite dead logo", async () => {
+    // The one line a human reads is the Slack message. A CDN shedding load
+    // answers 403; an avatar that does not exist does not.
+    await withFetch(
+      async () => new Response(null, { status: 403 }),
+      async () => {
+        const res = await checkLogo("https://x/u/1", "a/one", async () => {});
+        expect(res.kind).toBe("inconclusive");
+        const { reasons } = classify({
+          current: [],
+          next: null,
+          changed: false,
+          checks: [res],
+        });
+        expect(reasons[0]).toContain("could not be verified");
+        expect(reasons[0]).not.toContain("returned HTTP 403");
+      },
+    );
+  });
+
+  it("actually spends the exponential backoff it documents", async () => {
+    const slept: number[] = [];
+    await withFetch(
+      async () => new Response(null, { status: 429 }),
+      async () => {
+        await checkLogo("https://x/u/1", "a/one", async (ms) => {
+          slept.push(ms);
+        });
+      },
+    );
+    expect(slept.length).toBeGreaterThan(1);
+    expect(slept[1]).toBeGreaterThan(slept[0]);
+  });
+
+  it("returns results in target order, not in whichever order the CDN answered", async () => {
+    await withFetch(
+      async (url) => {
+        if (url.endsWith("/1")) await new Promise((r) => setTimeout(r, 60));
+        return new Response("<html>", { status: 200, headers: { "content-type": "text/html" } });
+      },
+      async () => {
+        const out = await checkLogos([
+          { url: "https://x/u/1", repo: "a/one" },
+          { url: "https://x/u/2", repo: "b/two" },
+        ]);
+        expect([...out.keys()]).toEqual(["https://x/u/1", "https://x/u/2"]);
       },
     );
   });
