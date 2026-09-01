@@ -29,10 +29,25 @@
  *      for a 2xx. This is deliberately NOT gated on the adopter data changing:
  *      an org can rotate its avatar or go private long after the wall was last
  *      written, and a broken image in a credibility section is worse than no
- *      section. A 2xx alone does not count: the avatar CDN answers an
- *      unresolvable id with a 302 to github.com and a 200 text/html body, so
- *      the probe also requires an image/* content-type. Silence (timeout /
- *      rate-limit) is INCONCLUSIVE and resolves to NEEDS-REVIEW, never SAFE.
+ *      section. A 2xx alone does not count, and neither does an image.
+ *
+ *      TWO SEPARATE FAILURE CLASSES, TWO SEPARATE CHECKS, because one cannot
+ *      see the other:
+ *        · A NON-NUMERIC path — `u/undefined`, `u/NaN`, an interpolation that
+ *          produced an empty string — makes the CDN 302 to github.com and
+ *          answer 200 `text/html`, which a browser paints as a broken image.
+ *          The content-type check catches exactly and only that class.
+ *        · A WRONG-BUT-NUMERIC owner id is invisible to the content-type
+ *          check: EVERY numeric id returns a valid `image/*` 200. An
+ *          out-of-range id gets a constant 5065-byte placeholder PNG; an
+ *          in-range unassigned id gets a generated identicon; and a
+ *          one-digit typo lands on a REAL DIFFERENT ACCOUNT whose avatar
+ *          would be published on this page as though they were an adopter.
+ *          So the id is separately resolved through `api.github.com/user/<id>`
+ *          and its `login` must equal the repo's owner. See checkOwnerIdentity.
+ *
+ *      Silence from either check (timeout / rate-limit / 5xx) is INCONCLUSIVE
+ *      and resolves to NEEDS-REVIEW, never SAFE.
  *   2. DATA REFRESH — forks and adopters missing from the latest scan are
  *      dropped and the rest are ranked by stargazers. EVERY survivor renders:
  *      the wall is uncapped and grows with adoption, which is what makes a new
@@ -148,8 +163,12 @@ export interface CheckResult {
   ok: boolean;
   /** HTTP status, or null when the request never produced one. */
   status: number | null;
-  /** "ok" | "http" (definite non-2xx) | "inconclusive" (timeout / network / 429) */
-  kind: "ok" | "http" | "inconclusive";
+  /**
+   * "ok" | "http" (definite non-2xx, or a 2xx that was not an image)
+   * | "identity" (the image is alive but belongs to the WRONG GitHub account)
+   * | "inconclusive" (timeout / network / rate-limit — we could not tell)
+   */
+  kind: "ok" | "http" | "identity" | "inconclusive";
   detail: string;
 }
 
@@ -1021,10 +1040,13 @@ async function probeOnce(url: string, method: "HEAD" | "GET"): Promise<CheckResu
       signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
     });
     if (res.ok || res.status === 206) {
-      // A 2xx is NOT sufficient. The GitHub avatar CDN never 404s on an
-      // unresolvable id: it 302s to github.com and returns 200 text/html,
-      // which a browser renders as a broken image. Only an image/* body is
-      // evidence the logo is actually alive.
+      // A 2xx is NOT sufficient. When the PATH IS NOT NUMERIC — `u/undefined`,
+      // `u/NaN`, an interpolation that produced an empty string — the CDN 302s
+      // to github.com and returns 200 text/html, which a browser renders as a
+      // broken image. That template-bug class is precisely what this check
+      // catches, and it is all it catches: a wrong-but-numeric id still returns
+      // a perfectly valid image/* 200 and passes here. checkOwnerIdentity is
+      // what covers that; do not read this check as proof the id resolves.
       const ctype = res.headers.get("content-type") ?? "";
       if (!ctype.toLowerCase().startsWith("image/")) {
         return {
@@ -1046,6 +1068,123 @@ async function probeOnce(url: string, method: "HEAD" | "GET"): Promise<CheckResu
 }
 
 /**
+ * The host `avatarUrl` hot-links from. Owner-identity verification is scoped to
+ * it because `api.github.com/user/<id>` is only meaningful for an id minted by
+ * GitHub; a URL on any other host is not a GitHub avatar. A test pins
+ * `avatarUrl` to this constant so the scoping can never silently disable the
+ * check by the host drifting.
+ */
+export const AVATAR_HOST = "avatars.githubusercontent.com";
+
+/** The numeric owner id in an `avatars.githubusercontent.com/u/<id>` URL, or null. */
+export function ownerIdFromAvatarUrl(url: string): number | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.hostname.toLowerCase() !== AVATAR_HOST) return null;
+  const m = /^\/u\/(\d+)$/.exec(parsed.pathname);
+  if (!m) return null;
+  const id = Number(m[1]);
+  return Number.isSafeInteger(id) ? id : null;
+}
+
+/**
+ * Resolves the rendered owner id back to a GitHub login and requires it to be
+ * the repo's owner.
+ *
+ * WHY THIS EXISTS AND WHY THE CONTENT-TYPE CHECK CANNOT REPLACE IT: every
+ * numeric id returns a valid `image/*` 200 from the CDN. A one-digit typo does
+ * not 404 — it resolves to somebody else's real account (`128464814` is
+ * `govnojuy`, `68255` is `jco`), and the probe would happily publish a stranger's
+ * avatar on the homepage under an adopter's name. The id is the ONLY thing in a
+ * tile that is not human-readable, so it is the one field a reviewer cannot
+ * eyeball; it therefore has to be machine-checked.
+ *
+ * Case-insensitively, because GitHub logins are case-PRESERVING but
+ * case-INSENSITIVE: the API may answer `ComposioHQ` where the repo string says
+ * `composiohq`, and treating that as a mismatch would wedge the run.
+ *
+ * CLASSIFICATION IS THE POINT. A 404 (unassigned id) or a login mismatch is a
+ * DEFINITE failure. A rate-limit or a 5xx means we could not ask, and "could not
+ * ask" must never read as "verified" — it is inconclusive, which resolves to
+ * NEEDS-REVIEW. Getting that backwards would turn a transient API blip into an
+ * unreviewed push to a public page.
+ *
+ * Reuses HEADERS — the same token, User-Agent and rate-limit budget as every
+ * other GitHub call in this script — rather than opening a second HTTP path.
+ */
+export async function checkOwnerIdentity(url: string, repo: string): Promise<CheckResult | null> {
+  const id = ownerIdFromAvatarUrl(url);
+  if (id === null) return null;
+  const expected = orgOf(repo);
+  const base = { url, repo, ok: false, status: null as number | null };
+  let res: Response;
+  try {
+    res = await fetch(`https://api.github.com/user/${id}`, {
+      headers: HEADERS,
+      signal: AbortSignal.timeout(CHECK_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      ...base,
+      kind: "inconclusive",
+      detail: `owner id ${id} could not be resolved: ${msg}`,
+    };
+  }
+  if (res.status === 404) {
+    return {
+      ...base,
+      status: 404,
+      kind: "identity",
+      detail: `owner id ${id} is not a GitHub account (api.github.com/user/${id} -> 404), so the avatar is a generated placeholder, not ${expected}`,
+    };
+  }
+  if (!res.ok) {
+    // 403/429 (rate-limited) and 5xx are the documented inconclusive shapes;
+    // anything else non-2xx is equally a "could not ask", so it lands here too.
+    return {
+      ...base,
+      status: res.status,
+      kind: "inconclusive",
+      detail: `owner id ${id} could not be resolved: api.github.com/user/${id} returned HTTP ${res.status}`,
+    };
+  }
+  let login: unknown;
+  try {
+    login = ((await res.json()) as { login?: unknown }).login;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      ...base,
+      status: res.status,
+      kind: "inconclusive",
+      detail: `owner id ${id} could not be resolved: unreadable API response (${msg})`,
+    };
+  }
+  if (typeof login !== "string" || login === "") {
+    return {
+      ...base,
+      status: res.status,
+      kind: "inconclusive",
+      detail: `owner id ${id} could not be resolved: the API returned no login`,
+    };
+  }
+  if (login.toLowerCase() !== expected.toLowerCase()) {
+    return {
+      ...base,
+      status: res.status,
+      kind: "identity",
+      detail: `owner id ${id} belongs to \`${login}\`, not \`${expected}\` — the wrong account's avatar would be published for ${repo}`,
+    };
+  }
+  return null;
+}
+
+/**
  * HEAD first; some CDNs refuse HEAD, so a 403/405 is re-tried as a one-byte
  * ranged GET before being believed. Retries once on anything transient, after
  * backing off — see CHECK_RETRY_BASE_MS. `wait` is injectable so a test can
@@ -1063,8 +1202,12 @@ export async function checkLogo(
     if (!res.ok && (res.status === 403 || res.status === 405)) {
       res = await probeOnce(url, "GET");
     }
+    // A live image is a necessary condition, not a sufficient one. Only once the
+    // CDN says the logo renders is it worth asking WHOSE logo it is.
+    if (res.ok) res = (await checkOwnerIdentity(url, repo)) ?? res;
     last = res;
-    if (res.ok || res.kind === "http") break;
+    // "identity" is as definite as "http": re-asking gets the same wrong login.
+    if (res.ok || res.kind === "http" || res.kind === "identity") break;
   }
   return { ...(last as CheckResult), repo };
 }
@@ -1148,7 +1291,9 @@ export function classify(input: ClassifyInput): {
     reasons.push(
       c.kind === "http"
         ? `Logo for ${who} returned ${c.detail} — ${c.url}`
-        : `Logo for ${who} could not be verified (${c.detail}) — ${c.url}`,
+        : c.kind === "identity"
+          ? `Logo for ${who} resolves to the WRONG GitHub account: ${c.detail} — ${c.url}`
+          : `Logo for ${who} could not be verified (${c.detail}) — ${c.url}`,
     );
   }
 

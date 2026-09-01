@@ -8,8 +8,11 @@ import {
   EXIT_CLEAN,
   EXIT_CHANGED_SAFE,
   EXIT_NEEDS_REVIEW,
+  AVATAR_HOST,
   avatarUrl,
   checkLogo,
+  checkOwnerIdentity,
+  ownerIdFromAvatarUrl,
   checkLogos,
   classify,
   decodeHtml,
@@ -2252,5 +2255,196 @@ describe("the REST fallback bounds nothing away: every repo is asked for", () =>
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OWNER IDENTITY. The content-type check above cannot see this class at all:
+// EVERY numeric owner id returns a valid image/* 200 from the CDN. Probed live
+// on 2026-08-31 — u/999999999, u/0 and u/200000000 all answer 200 image/png
+// with the same constant 5065-byte placeholder, and a one-digit typo lands on a
+// real stranger (128464814 -> govnojuy, 68255 -> jco). So the rendered id is
+// resolved back through api.github.com/user/<id> and required to be the repo's
+// owner. Each test below was observed failing against the pre-fix code.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const AVATAR = (id: string | number) => `https://${AVATAR_HOST}/u/${id}?s=128&v=4`;
+const userRes = (login: string) =>
+  new Response(JSON.stringify({ login }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+
+/** An avatar CDN that always says "alive image", plus a scripted user API. */
+function cdnAndApi(api: (id: string) => Response): (url: string) => Promise<Response> {
+  return async (url: string) => {
+    const m = /api\.github\.com\/user\/(\d+)/.exec(url);
+    if (m) return api(m[1]);
+    return imageRes(200, "image/png");
+  };
+}
+
+describe("a live image is not evidence it is the RIGHT account's image", () => {
+  it("extracts the owner id only from the real avatar host", () => {
+    expect(ownerIdFromAvatarUrl(AVATAR(128464815))).toBe(128464815);
+    expect(ownerIdFromAvatarUrl(`https://${AVATAR_HOST}/u/7`)).toBe(7);
+    expect(ownerIdFromAvatarUrl("https://evil.example/u/7")).toBeNull();
+    expect(ownerIdFromAvatarUrl(`https://${AVATAR_HOST}/u/undefined`)).toBeNull();
+    expect(ownerIdFromAvatarUrl("not a url")).toBeNull();
+  });
+
+  // The scoping in ownerIdFromAvatarUrl is only safe while avatarUrl actually
+  // emits that host. If the generator's host ever drifts, the guard would go
+  // silently dead rather than loudly wrong, so pin the two together.
+  it("pins avatarUrl to the host the identity check is scoped to", () => {
+    expect(new URL(avatarUrl(123)).hostname).toBe(AVATAR_HOST);
+  });
+
+  it("FAILS a one-digit typo that resolves to a real DIFFERENT account", async () => {
+    await withFetch(
+      cdnAndApi(() => userRes("govnojuy")),
+      async () => {
+        const res = await checkLogo(AVATAR(128464814), "ComposioHQ/composio");
+        expect(res.ok).toBe(false);
+        expect(res.kind).toBe("identity");
+        expect(res.detail).toContain("govnojuy");
+        expect(res.detail).toContain("ComposioHQ");
+      },
+    );
+  });
+
+  it("FAILS an unassigned id serving the CDN's placeholder PNG", async () => {
+    await withFetch(
+      cdnAndApi(() => new Response("{}", { status: 404 })),
+      async () => {
+        const res = await checkLogo(AVATAR(999999999), "openclaw/openclaw");
+        expect(res.ok).toBe(false);
+        expect(res.kind).toBe("identity");
+        expect(res.status).toBe(404);
+      },
+    );
+  });
+
+  it("PASSES the correct id", async () => {
+    await withFetch(
+      cdnAndApi(() => userRes("ComposioHQ")),
+      async () => {
+        const res = await checkLogo(AVATAR(128464815), "ComposioHQ/composio");
+        expect(res.ok).toBe(true);
+        expect(res.kind).toBe("ok");
+      },
+    );
+  });
+
+  // GitHub logins are case-PRESERVING but case-INSENSITIVE. Comparing them
+  // case-sensitively would wedge every run on a repo string whose casing does
+  // not match the API's — a false alarm indistinguishable from a real one.
+  it("compares the login case-INSENSITIVELY", async () => {
+    await withFetch(
+      cdnAndApi(() => userRes("ComposioHQ")),
+      async () => {
+        expect((await checkLogo(AVATAR(128464815), "composiohq/composio")).ok).toBe(true);
+      },
+    );
+    await withFetch(
+      cdnAndApi(() => userRes("thushan")),
+      async () => {
+        expect((await checkLogo(AVATAR(68254), "THUSHAN/olla")).ok).toBe(true);
+      },
+    );
+  });
+
+  // THE ONE THAT MATTERS MOST. "We could not ask" must never read as "verified".
+  // If a rate-limited API call fell through to ok, a transient blip would push
+  // an unreviewed wall to a public page — the exact failure the guard exists for.
+  it.each([403, 429, 500, 502, 401])(
+    "treats HTTP %i from the user API as INCONCLUSIVE, never a pass",
+    async (status) => {
+      await withFetch(
+        cdnAndApi(() => new Response("{}", { status })),
+        async () => {
+          const res = await checkLogo(AVATAR(128464815), "ComposioHQ/composio", async () => {});
+          expect(res.ok).toBe(false);
+          expect(res.kind).toBe("inconclusive");
+          expect(res.detail).toContain("could not be resolved");
+        },
+      );
+    },
+  );
+
+  it("treats a network failure asking the user API as INCONCLUSIVE", async () => {
+    await withFetch(
+      async (url) => {
+        if (url.includes("api.github.com")) throw new Error("socket hang up");
+        return imageRes(200, "image/png");
+      },
+      async () => {
+        const res = await checkLogo(AVATAR(128464815), "ComposioHQ/composio", async () => {});
+        expect(res.ok).toBe(false);
+        expect(res.kind).toBe("inconclusive");
+      },
+    );
+  });
+
+  it("treats an API body with no usable login as INCONCLUSIVE", async () => {
+    await withFetch(
+      cdnAndApi(() => new Response("{}", { status: 200 })),
+      async () => {
+        const res = await checkLogo(AVATAR(1), "a/one", async () => {});
+        expect(res.kind).toBe("inconclusive");
+      },
+    );
+  });
+
+  it("never asks the user API when the image itself is already dead", async () => {
+    const asked: string[] = [];
+    await withFetch(
+      async (url) => {
+        asked.push(url);
+        return new Response("<!doctype html>", {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        });
+      },
+      async () => {
+        expect((await checkLogo(AVATAR(1), "a/one")).kind).toBe("http");
+      },
+    );
+    expect(asked.some((u) => u.includes("api.github.com"))).toBe(false);
+  });
+
+  it("returns null — i.e. does not gate — for a URL that is not a GitHub avatar", async () => {
+    await withFetch(
+      async () => {
+        throw new Error("must not be called");
+      },
+      async () => {
+        await expect(
+          checkOwnerIdentity("https://avatars.example/u/1", "a/one"),
+        ).resolves.toBeNull();
+      },
+    );
+  });
+
+  // The verdict has to survive all the way to the exit code, or the guard is
+  // decorative: a wrong logo on an otherwise byte-identical wall is exactly the
+  // run nobody would look at twice.
+  it("forces NEEDS-REVIEW through classify on a byte-identical wall", async () => {
+    await withFetch(
+      cdnAndApi(() => userRes("govnojuy")),
+      async () => {
+        const check = await checkLogo(AVATAR(128464814), "ComposioHQ/composio");
+        const { status, reasons } = classify({
+          current: [],
+          next: null,
+          changed: false,
+          checks: [check],
+        });
+        expect(status).toBe("NEEDS-REVIEW");
+        expect(exitCodeFor(status)).toBe(EXIT_NEEDS_REVIEW);
+        expect(reasons.join(" ")).toContain("WRONG GitHub account");
+        expect(reasons.join(" ")).toContain("govnojuy");
+      },
+    );
   });
 });
