@@ -1520,6 +1520,13 @@ export function buildSummary(opts: {
   malformedRepos?: string[];
   /** Why no adopter data was read this run, when that is the case. */
   stateNote?: string | null;
+  /**
+   * What this run did to the state file on the orphan branch, and why. Rendered
+   * because a reviewer reading a NEEDS-REVIEW PR needs to know whether the run
+   * also refreshed `lastScan` — a run that did NOT is on a clock, and that fact
+   * is invisible anywhere else in this document.
+   */
+  stateWriteNote?: string | null;
 }): string {
   const lines: string[] = [];
   lines.push("## Adoption wall");
@@ -1544,6 +1551,11 @@ export function buildSummary(opts: {
     `Logo health: ${opts.checks.length - failed.length}/${opts.checks.length} avatar URLs resolved.`,
   );
   lines.push("");
+
+  if (opts.stateWriteNote) {
+    lines.push(opts.stateWriteNote);
+    lines.push("");
+  }
 
   const notes = opts.notes ?? [];
   if (notes.length > 0) {
@@ -1840,6 +1852,164 @@ export function loadAdopterState(path: string): StateLoad {
   return parseAdopterState(raw, path);
 }
 
+// ── State write-back ─────────────────────────────────────────────────────────
+//
+// THIS SCRIPT IS THE PRODUCER OF `adopters.json`, not only its reader. It used
+// to be only the reader, and there was no writer anywhere: `lastScan` was
+// stamped once by hand when the orphan branch was seeded and then never moved
+// again, so MAX_STATE_AGE_DAYS was a fuse rather than a guard — every run stayed
+// green until the seed aged out, and every run after that reported NEEDS-REVIEW
+// forever over a wall nothing had actually changed. The functions below are the
+// missing producer.
+//
+// THE ONE PROPERTY THAT MATTERS: a fresh `lastScan` is a CLAIM that this run
+// resolved the whole adopter list. If a run that could not resolve it stamps one
+// anyway, the staleness guard becomes decorative — it would then be measuring
+// how recently the job RAN, which it can already tell, instead of how recently
+// the data was actually confirmed. So the stamp is gated on scanIsConclusive and
+// on nothing else, and every "we could not tell" answer anywhere in the run
+// withholds it.
+
+/**
+ * The scan's universe: everything the incoming state file lists, PLUS every
+ * repo with a curated `ADOPTER_DISPLAY` entry that the file does not mention.
+ *
+ * The orphan branch was seeded by PARSING THE LIVE WALL, which can only ever
+ * contain repos that were already rendering. `cacheplane/dawnai` is a real,
+ * curated adopter sitting below the wall's cut, so the parse could not see it
+ * and the seeded file did not list it — and because the file is also the
+ * candidate list, a repo missing from it can never climb back onto the wall. The
+ * gap was reported by missingFromState every week and nothing could close it.
+ *
+ * Seeding the curated names into the scan closes it: they are resolved from the
+ * API like every other candidate, ranked on their real numbers, and written back
+ * with whatever the scan actually found. `missedRuns: 0` here is an INPUT, not
+ * an assertion — it only means "ask about this one"; buildNextState overwrites
+ * it with the scan's answer before anything is persisted, and if the scan was
+ * not conclusive nothing is persisted at all.
+ */
+export function withKnownAdopters(
+  adopters: readonly AdopterState[],
+  now: string,
+  mapping: Record<string, AdopterDisplay> = ADOPTER_DISPLAY,
+): AdopterState[] {
+  const seen = new Set(adopters.map((a) => a.repo.toLowerCase()));
+  const added = Object.keys(mapping)
+    .filter((repo) => !seen.has(repo.toLowerCase()))
+    .sort((x, y) => x.localeCompare(y))
+    .map((repo) => ({ repo, channels: ["adopter-display"], missedRuns: 0, firstSeen: now }));
+  return [...adopters, ...added];
+}
+
+/**
+ * Whether this run is allowed to claim it scanned the adopter list.
+ *
+ * Two ways to fail, both meaning "no verdict was reached", never "the answer was
+ * no":
+ *
+ *   · a repo the API was asked about came back unusable (see MetaResolution); or
+ *   · a logo probe was INCONCLUSIVE — a timeout, a 429, a 5xx. That check runs
+ *     against the same GitHub estate over the same network in the same seconds,
+ *     so it is the run's own report that its answers this minute cannot be
+ *     trusted. A dead logo (`http`) or a wrong-account logo (`identity`) is the
+ *     opposite: a definite finding, and a run that established one scanned fine.
+ *
+ * A rate-limited or throttled METADATA pass does not reach here at all — both
+ * fetch paths throw on 403/429/5xx, main() exits EXIT_ERROR, and nothing is
+ * written. That is the loudest form of the same rule.
+ */
+export function scanIsConclusive(opts: {
+  indeterminate: readonly string[];
+  checks: readonly CheckResult[];
+}): { ok: true } | { ok: false; detail: string } {
+  if (opts.indeterminate.length > 0) {
+    const shown = [...opts.indeterminate].sort((x, y) => x.localeCompare(y)).slice(0, 5);
+    return {
+      ok: false,
+      detail:
+        `${opts.indeterminate.length} repo(s) returned no usable metadata, so this run did not ` +
+        `resolve the whole adopter list: ${shown.join(", ")}` +
+        (opts.indeterminate.length > shown.length
+          ? `, and ${opts.indeterminate.length - shown.length} more`
+          : ""),
+    };
+  }
+  const unverified = opts.checks.filter((c) => c.kind === "inconclusive");
+  if (unverified.length > 0) {
+    return {
+      ok: false,
+      detail:
+        `${unverified.length} avatar probe(s) reached no verdict (timeout, 429 or 5xx), so this ` +
+        `run cannot vouch for what it saw: ${unverified[0].repo || unverified[0].url}`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * The state file this run should leave behind, given what it resolved.
+ *
+ * `lastScan` is the caller's `scannedAt` — the caller only gets here after
+ * scanIsConclusive said yes, so the field means what it has always claimed to
+ * mean.
+ *
+ * `missedRuns` keeps the semantics the reader already relies on (`> 0` means the
+ * latest scan did not see the repo, and the repo is not a wall candidate):
+ *
+ *   resolved by this scan   -> 0, unconditionally. A repo that comes back is
+ *                              back; carrying an old count forward would keep it
+ *                              off the wall after it returned.
+ *   definitively absent     -> previous + 1. One scan's silence is not a
+ *                              removal, and the counter is what makes that
+ *                              distinction possible.
+ *   NEITHER                 -> carried through UNCHANGED. Two populations land
+ *                              here and both must be left alone: entries already
+ *                              at missedRuns > 0, which are filtered out before
+ *                              the API is asked and so were never looked at this
+ *                              run; and entries whose `repo` is not `owner/name`
+ *                              and cannot be asked about at all. Incrementing a
+ *                              repo nobody looked at manufactures evidence.
+ *
+ * NOTHING IS EVER DELETED. An adopter that drops out of the scan keeps its row,
+ * its `firstSeen` and its rising counter, so a repo that reappears is recognised
+ * as the same repo rather than as a brand-new discovery — and the record that it
+ * was ever an adopter survives the week it went quiet.
+ *
+ * `isFork`, `channels` and `firstSeen` are carried through VERBATIM. `isFork`
+ * especially: the TRUST MODEL note at the top of this file says the reader uses
+ * the file's fork claim for nothing and reports every disagreement with the API,
+ * and overwriting the claim with the API's answer would make that report
+ * self-cancelling — the producer would erase the evidence the reader exists to
+ * surface.
+ *
+ * Entries are sorted by repo so the orphan branch's diff each week is the delta
+ * and not a reshuffle.
+ */
+export function buildNextState(opts: {
+  adopters: readonly AdopterState[];
+  resolved: ReadonlySet<string>;
+  absent: ReadonlySet<string>;
+  scannedAt: string;
+}): AdoptersState {
+  const adopters = [...opts.adopters]
+    .sort(
+      (x, y) =>
+        x.repo.toLowerCase().localeCompare(y.repo.toLowerCase()) || x.repo.localeCompare(y.repo),
+    )
+    .map((a) => {
+      const next: AdopterState = { ...a };
+      if (opts.resolved.has(a.repo)) next.missedRuns = 0;
+      else if (opts.absent.has(a.repo)) next.missedRuns = (a.missedRuns ?? 0) + 1;
+      return next;
+    });
+  return { lastScan: opts.scannedAt, adopters };
+}
+
+/** Exactly the on-disk form the seeded branch already uses: 2-space JSON, trailing newline. */
+export function serializeState(state: AdoptersState): string {
+  return JSON.stringify(state, null, 2) + "\n";
+}
+
 /**
  * One REST call per repo. Correct, but 182 calls for a 182-entry state file, so
  * it is the fallback rather than the default.
@@ -1847,6 +2017,7 @@ export function loadAdopterState(path: string): StateLoad {
 export async function fetchRepoMetaRest(
   repos: string[],
   meta: Map<string, RepoMeta>,
+  indeterminate?: Set<string>,
 ): Promise<void> {
   for (const repo of repos) {
     const res = await fetch(`https://api.github.com/repos/${repo}`, { headers: HEADERS });
@@ -1856,6 +2027,9 @@ export async function fetchRepoMetaRest(
     // once: ~170 repos reading as a mass disappearance and gutting the wall.
     // The GraphQL path throws here for exactly this reason; so does this one.
     if (res.status === 404 || res.status === 451) {
+      // A DEFINITIVE answer: the repo is gone, private or taken down. It yields
+      // no meta, and it is not added to `indeterminate` — the scan learned
+      // something here, and buildNextState is entitled to count it as a miss.
       console.warn(`  ⚠ Skipping ${repo}: ${res.status} ${res.statusText}`);
       continue;
     }
@@ -1877,7 +2051,11 @@ export async function fetchRepoMetaRest(
       typeof json.owner?.id !== "number" ||
       typeof json.fork !== "boolean"
     ) {
+      // NOT a definitive answer: the API replied, but not with the three facts
+      // this script needs. "We could not tell" must never be recorded as "the
+      // scan did not see it" — see buildNextState and scanIsConclusive.
       console.warn(`  ⚠ Skipping ${repo}: incomplete repo metadata`);
+      indeterminate?.add(repo);
       continue;
     }
     meta.set(repo, { stars: json.stargazers_count, ownerId: json.owner.id, isFork: json.fork });
@@ -1925,6 +2103,7 @@ export function buildRepoMetaQuery(repos: string[]): string {
 export async function fetchRepoMetaGraphQL(
   repos: string[],
   meta: Map<string, RepoMeta>,
+  indeterminate?: Set<string>,
 ): Promise<number> {
   let requests = 0;
   for (let i = 0; i < repos.length; i += GRAPHQL_BATCH) {
@@ -1972,7 +2151,11 @@ export async function fetchRepoMetaGraphQL(
         typeof node.isFork !== "boolean" ||
         typeof node.owner?.databaseId !== "number"
       ) {
+        // The node came back but is missing a field this script needs. That is
+        // "we could not tell", NOT "the repo is gone" — a null node (NOT_FOUND)
+        // is the definitive case and is skipped above without landing here.
         console.warn(`  ⚠ Skipping ${requested ?? alias}: incomplete repo metadata`);
+        if (requested !== undefined) indeterminate?.add(requested);
         continue;
       }
       meta.set(requested, {
@@ -1985,8 +2168,30 @@ export async function fetchRepoMetaGraphQL(
   return requests;
 }
 
-async function fetchRepoMeta(repos: string[]): Promise<Map<string, RepoMeta>> {
+/**
+ * What one resolution pass learned, split into the two answers that are NOT
+ * interchangeable.
+ *
+ * `meta` is what resolved. `indeterminate` is every repo the API was asked
+ * about and gave no usable answer for — the reply arrived but was missing a
+ * field. It is deliberately NOT the same set as "asked about and not in
+ * `meta`": a GraphQL NOT_FOUND, a REST 404 and a REST 451 are DEFINITIVE
+ * answers ("this repo is gone or private") and belong to neither set, because
+ * the scan genuinely learned something about those repos.
+ *
+ * The distinction exists for exactly one consumer: the state write-back. A repo
+ * we could not resolve must never be recorded as a repo the scan did not see —
+ * that is how a flaky API turns into a fabricated `missedRuns` and, one run
+ * later, into an adopter silently dropped off a public page.
+ */
+interface MetaResolution {
+  meta: Map<string, RepoMeta>;
+  indeterminate: Set<string>;
+}
+
+async function fetchRepoMeta(repos: string[]): Promise<MetaResolution> {
   const meta = new Map<string, RepoMeta>();
+  const indeterminate = new Set<string>();
 
   const local = argValue("--meta-file");
   if (local) {
@@ -1996,17 +2201,17 @@ async function fetchRepoMeta(repos: string[]): Promise<Map<string, RepoMeta>> {
   }
 
   const missing = repos.filter((r) => !meta.has(r) && r.split("/").length === 2);
-  if (missing.length === 0) return meta;
+  if (missing.length === 0) return { meta, indeterminate };
 
   if (GITHUB_TOKEN) {
-    const requests = await fetchRepoMetaGraphQL(missing, meta);
+    const requests = await fetchRepoMetaGraphQL(missing, meta, indeterminate);
     console.log(resolutionLine(missing, meta, requests));
   } else {
     console.log(`  No GITHUB_TOKEN; falling back to ${missing.length} REST request(s).`);
-    await fetchRepoMetaRest(missing, meta);
+    await fetchRepoMetaRest(missing, meta, indeterminate);
     console.log(resolutionLine(missing, meta, missing.length));
   }
-  return meta;
+  return { meta, indeterminate };
 }
 
 /** Formats through the repo's own prettier config so `format:check` stays green. */
@@ -2117,6 +2322,9 @@ async function main(): Promise<number> {
   const verifyOnly = process.argv.includes("--verify-only");
   const summaryPath = argValue("--summary");
   const statePath = resolve(argValue("--state") ?? DEFAULT_STATE_PATH);
+  // Taken ONCE, at the top, and used for both `lastScan` and any `firstSeen`
+  // this run mints, so every timestamp the run writes names the same run.
+  const scannedAt = new Date().toISOString();
 
   console.log("=== Adoption Wall Updater ===\n");
   if (dryRun) console.log("  [DRY RUN] No files will be modified.\n");
@@ -2139,6 +2347,18 @@ async function main(): Promise<number> {
   let malformed: string[] = [];
   let stateNote: string | null = null;
   const extraReasons: string[] = [];
+  /**
+   * What the scan resolved, kept for the write-back below. Null until a state
+   * file has actually been read and scanned, which is what makes "there is
+   * nothing honest to write" and "the scan said nothing changed" different
+   * things rather than the same silence.
+   */
+  let scan: {
+    list: AdopterState[];
+    resolved: Set<string>;
+    absent: Set<string>;
+    indeterminate: Set<string>;
+  } | null = null;
 
   // Job 2: refresh the list, if there is anything to refresh it from.
   const load = verifyOnly ? null : loadAdopterState(statePath);
@@ -2170,7 +2390,17 @@ async function main(): Promise<number> {
 
   if (load?.kind === "ok") {
     const state = load.state;
-    const adopters = state.adopters ?? [];
+    const incoming = state.adopters ?? [];
+    // The curated names the incoming file does not mention are scanned too, so a
+    // real adopter that never made it into the file can climb onto the wall
+    // instead of being reported as missing forever. See withKnownAdopters.
+    const adopters = withKnownAdopters(incoming, scannedAt);
+    if (adopters.length > incoming.length) {
+      console.log(
+        `\n  ${adopters.length - incoming.length} curated adopter(s) absent from the state file ` +
+          "were added to this scan; they are resolved and ranked like any other candidate.",
+      );
+    }
 
     // Before anything is ranked: is this file still being written? A frozen
     // producer looks exactly like a quiet week from every other angle.
@@ -2209,7 +2439,17 @@ async function main(): Promise<number> {
       for (const repo of malformed) console.warn(`    ${repo}`);
     }
 
-    const meta = await fetchRepoMeta(candidates.map((a) => a.repo));
+    const asked = candidates.map((a) => a.repo).filter((r) => r.split("/").length === 2);
+    const { meta, indeterminate } = await fetchRepoMeta(candidates.map((a) => a.repo));
+    // Three populations, and the middle one is the whole point: resolved,
+    // DEFINITIVELY absent (404 / 451 / NOT_FOUND), and "we could not tell".
+    // Only the first two are facts the write-back may act on.
+    scan = {
+      list: adopters,
+      resolved: new Set(asked.filter((r) => meta.has(r))),
+      absent: new Set(asked.filter((r) => !meta.has(r) && !indeterminate.has(r))),
+      indeterminate,
+    };
 
     disagreements = forkDisagreements(adopters, meta);
     if (disagreements.length > 0) {
@@ -2223,7 +2463,10 @@ async function main(): Promise<number> {
       }
     }
 
-    missing = missingFromState(adopters);
+    // The INCOMING file, deliberately: this line reports what the producer that
+    // wrote the file failed to discover. Running it over the seeded list would
+    // answer "none" every time and report the gap out of existence.
+    missing = missingFromState(incoming);
     if (missing.length > 0) {
       console.warn(`\n⚠ ${missing.length} known adopter(s) absent from the incoming state file:`);
       for (const repo of missing) console.warn(`    ${repo}`);
@@ -2337,6 +2580,64 @@ async function main(): Promise<number> {
   // keeps the run log greppable for a human.
   console.log(`\nADOPTION_WALL_STATUS=${status}`);
 
+  // ── State write-back ──────────────────────────────────────────────────────
+  //
+  // ON ALL THREE VERDICTS, gated on the SCAN and never on the status. `lastScan`
+  // records that the adopter list was resolved, which is a different question
+  // from whether a human needs to look at the result: a dead avatar, an adopter
+  // that genuinely vanished, or a wall below its floor are all things this run
+  // FOUND OUT, and a run that found something out scanned fine. Withholding the
+  // stamp on NEEDS-REVIEW would be actively harmful — the first dead logo would
+  // freeze `lastScan`, and three weeks later every run would carry a SECOND,
+  // invented staleness reason on top of the real one, displacing it from the
+  // three reasons that reach Slack. The failures that must not stamp are the
+  // ones where the run did not learn the answer, and those are exactly what
+  // scanIsConclusive tests.
+  //
+  // A corrupt or missing state file never reaches here: `scan` is still null,
+  // so there is no scanned list to write and last week's file is left alone.
+  let stateWritten = false;
+  let stateWriteNote: string | null = null;
+  if (scan !== null) {
+    const verdict = scanIsConclusive({ indeterminate: [...scan.indeterminate], checks });
+    if (!verdict.ok) {
+      stateWriteNote =
+        `Adopter state was NOT refreshed and \`lastScan\` did not advance: ${verdict.detail}. ` +
+        "A run that could not resolve the list must not stamp it fresh, or the staleness guard " +
+        "stops measuring anything.";
+      console.warn(`\n⚠ ${stateWriteNote}`);
+    } else if (dryRun || verifyOnly) {
+      stateWriteNote = `[DRY RUN] Adopter state would have been refreshed at \`${statePath}\`.`;
+      console.log(`\n[DRY RUN] Would refresh adopter state at ${statePath}.`);
+    } else {
+      const nextState = buildNextState({
+        adopters: scan.list,
+        resolved: scan.resolved,
+        absent: scan.absent,
+        scannedAt,
+      });
+      writeFileSync(statePath, serializeState(nextState), "utf-8");
+      stateWritten = true;
+      const missed = (nextState.adopters ?? []).filter(
+        (a) => typeof a.missedRuns === "number" && a.missedRuns > 0,
+      ).length;
+      stateWriteNote =
+        `Adopter state refreshed: \`lastScan\` is now ${scannedAt}, ` +
+        `${nextState.adopters?.length ?? 0} entr(y/ies), ${scan.resolved.size} seen by this scan, ` +
+        `${missed} carrying a missed run.`;
+      console.log(
+        `\nRefreshed adopter state at ${statePath}: lastScan=${scannedAt}, ` +
+          `${nextState.adopters?.length ?? 0} entr(y/ies), ${scan.resolved.size} resolved, ` +
+          `${scan.absent.size} not found by this scan.`,
+      );
+    }
+  }
+  // Machine-readable, like ADOPTION_WALL_STATUS: the workflow greps this to
+  // decide whether to commit the refreshed file back to the orphan branch. It
+  // must NOT be a `  ! ` reason — those are classify()'s output and are what
+  // Slack names as the cause of a verdict, and this is neither.
+  console.log(`ADOPTION_STATE_WRITTEN=${stateWritten}`);
+
   if (summaryPath) {
     const md = buildSummary({
       status,
@@ -2353,6 +2654,7 @@ async function main(): Promise<number> {
       staleExclusions,
       malformedRepos: malformed,
       stateNote,
+      stateWriteNote,
     });
     writeFileSync(resolve(summaryPath), md, "utf-8");
     console.log(`Summary written to ${summaryPath}`);
