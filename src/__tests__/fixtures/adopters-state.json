@@ -1,0 +1,7 @@
+{
+  "lastScan": "2026-08-31T16:03:00Z",
+  "adopters": [
+    { "repo": "a/one", "channels": ["package"], "missedRuns": 0 },
+    { "repo": "b/two", "channels": ["package"], "missedRuns": 0 }
+  ]
+}

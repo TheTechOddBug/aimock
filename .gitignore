@@ -21,3 +21,13 @@ docs/specs/
 # belt-and-suspenders for local runs and covers the post-fix / pinned variants.
 claude-code-output.log
 drift-report*.json
+
+# Adopter state checked out from the orphan adoption-data branch by
+# .github/workflows/update-adoption-wall.yml. Never committed to main.
+#
+# The name "adoption-data" is spelled in three places that cannot import from
+# each other: here, STATE_BRANCH in scripts/update-adoption-wall.ts, and the
+# STATE_BRANCH env in that workflow. The workflow's "Guard adoption-data naming"
+# step fails the run if the three disagree, so a rename that misses one is
+# caught before it can commit weekly state data into main's history.
+/adoption-data/
