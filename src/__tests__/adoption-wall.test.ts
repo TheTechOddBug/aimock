@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   ADOPTER_DISPLAY,
@@ -1113,10 +1114,72 @@ describe("marquee tracks", () => {
     expect(() => parseWall(replaceRegion(PAGE, broken))).toThrow(/two tracks must match/i);
   });
 
-  it("ships a pause control, because hover is unreachable on touch", () => {
-    expect(html).toContain('class="adopter-marquee-toggle"');
-    expect(html).toContain('aria-pressed="false"');
-    expect(html).toContain('data-paused="false"');
+  // A pause button was drafted into the generator and rejected: docs/index.html
+  // ships neither `.adopter-marquee-toggle` styling nor a `toggleAdopterMarquee`
+  // handler, so emitting one would inject an unstyled, inert control onto the
+  // public homepage on the weekly run. Pausing is CSS, on :hover/:focus-within.
+  it("emits no pause control, which the page has no styling or handler for", () => {
+    expect(html).not.toContain("adopter-marquee-toggle");
+    expect(html).not.toContain("toggleAdopterMarquee");
+    expect(html).not.toContain("data-paused");
+    expect(html).not.toContain("<button");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The generator against the page it actually owns
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * THE NO-OP PROPERTY. The workflow runs weekly and commits whatever the run
+ * writes, so any permanent disagreement between what renderWall emits and what
+ * docs/index.html ships is cosmetic churn pushed to main every single week — and
+ * on the first run it also ships whatever the generator emits that the page has
+ * no CSS or JS for. Feeding the page's OWN adopters back through the generator
+ * has to reproduce the page byte for byte.
+ *
+ * Both sides go through prettier with the page's own config, which is what
+ * main() does, and for the same reason: the generator's own indentation is not
+ * the shipped indentation, so comparing raw strings would fail on whitespace
+ * and prove nothing about the markup.
+ */
+describe("round-tripping the shipped page", () => {
+  const DOCS_PATH = fileURLToPath(new URL("../../docs/index.html", import.meta.url));
+  const shipped = readFileSync(DOCS_PATH, "utf-8");
+
+  const format = async (source: string): Promise<string> => {
+    const prettier = await import("prettier");
+    const config = await prettier.resolveConfig(DOCS_PATH);
+    return prettier.format(source, { ...config, filepath: DOCS_PATH });
+  };
+
+  /** The rendered wall read back off the page, in the form renderWall takes. */
+  const shippedEntries = (): WallEntry[] =>
+    parseWall(shipped).map((tile) => ({
+      repo: tile.repo,
+      logo: tile.logo,
+      stars: 0,
+      ...resolveDisplay(tile.repo),
+    }));
+
+  it("reads the live wall back as a full set of curated tiles", () => {
+    const entries = shippedEntries();
+    expect(entries.length).toBeGreaterThanOrEqual(MIN_WALL_SIZE);
+    // An unmapped tile would mean the page and ADOPTER_DISPLAY have drifted, and
+    // the re-render below would then be comparing against a raw org login.
+    expect(entries.filter((e) => !e.mapped).map((e) => e.repo)).toEqual([]);
+  });
+
+  it("re-renders the page's own adopters byte for byte", async () => {
+    const rebuilt = await format(replaceRegion(shipped, renderWall(shippedEntries())));
+    expect(rebuilt).toBe(await format(shipped));
+  });
+
+  it("ships no markup the page has no styling or handler for", () => {
+    for (const orphan of ["adopter-marquee-toggle", "toggleAdopterMarquee", "data-paused"]) {
+      expect(renderWall(shippedEntries())).not.toContain(orphan);
+      expect(shipped).not.toContain(orphan);
+    }
   });
 });
 
