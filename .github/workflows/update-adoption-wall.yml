@@ -54,11 +54,22 @@ jobs:
   update-wall:
     runs-on: ubuntu-latest
     permissions:
-      # Everything this job touches lives in THIS repo, so the default workflow
-      # token is enough. It deliberately no longer mints a GitHub App token: the
-      # adopter data used to come from the private CopilotKit/backoffice repo,
-      # which put an app private key and a cross-repo read into a PUBLIC repo's
-      # CI for one JSON file. Do not reintroduce that.
+      # Everything this job READS lives in THIS repo. The cross-repo read this
+      # workflow used to carry is gone for good: adopter data came from the
+      # private CopilotKit/backoffice repo, which put a private repo's contents
+      # behind a PUBLIC repo's CI for one JSON file. DO NOT REINTRODUCE THAT --
+      # the adopter state lives on the orphan `adoption-data` branch of this
+      # repo precisely so it never has to.
+      #
+      # These permissions still cover every push EXCEPT the auto-land onto the
+      # default branch. That one cannot use the workflow token at all: ruleset
+      # `blorpathupap` requires a pull request on the default branch, and the
+      # GitHub Actions app (id 15368) CANNOT be added as a bypass actor -- the
+      # API rejects it with "Actor GitHub Actions integration must be part of
+      # the ruleset source or owner organization", because it is not an org
+      # installation. So the workflow token gets GH013 and the weekly refresh
+      # is never delivered. The "Mint app token" step below is the ONLY path;
+      # see the note there for how its exposure is bounded.
       contents: write
       pull-requests: write
     steps:
@@ -372,6 +383,36 @@ jobs:
       # NOTE: there is no separate opt-in variable gating this. A safe, changed,
       # region-confined run pushes to ${{ github.ref_name }} unattended, and the
       # Slack line below says so in those words.
+      # The ONE push the workflow token cannot make -- see the permissions
+      # note at the top of this job. copilotkit-bot (app 1108748) is already a
+      # bypass actor on ruleset `blorpathupap`, and this is the same app, the
+      # same pinned action and the same secret that .github/workflows/fix-drift.yml
+      # already uses in this repo; it is not a new key in this CI.
+      #
+      # Minted HERE rather than at job start, and behind the SAME condition as
+      # the push it serves, on purpose:
+      #   - resolving ~180 repos and probing every avatar can run long, and an
+      #     app token only lives an hour -- minting at job start could hand the
+      #     push an already-expired token;
+      #   - a run that is not auto-landing (needs-review, unconfined, no change)
+      #     never mints a token at all.
+      # Only `contents` is requested: this step pushes, and nothing else. The
+      # token is scoped to this repo, is never echoed and is never written to a
+      # file -- it reaches git through the environment only, exactly like the
+      # workflow token on the other pushing steps.
+      - name: Mint app token
+        id: app-token
+        if: >-
+          steps.state_branch.outputs.exists == 'true' &&
+          steps.wall.outputs.status == 'safe' &&
+          steps.changes.outputs.changed == 'true' &&
+          steps.confine.outputs.confined == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: "1108748"
+          private-key: ${{ secrets.DEVOPS_BOT_PRIVATE_KEY }}
+          permission-contents: write
+
       - name: Commit to main
         if: >-
           steps.state_branch.outputs.exists == 'true' &&
@@ -379,13 +420,20 @@ jobs:
           steps.changes.outputs.changed == 'true' &&
           steps.confine.outputs.confined == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
           echo "::add-mask::${AUTH}"
           export GIT_CONFIG_COUNT=1
           export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
           export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${AUTH}"
+          # Overrides the github-actions[bot] identity set by "Configure git
+          # identity" above, for THIS commit only. That step still serves the
+          # review-PR path, which still pushes as the workflow token. The author
+          # of a commit should be whoever actually put it on the branch, and on
+          # the default branch that is now copilotkit-bot.
+          git config user.name "copilotkit-bot[bot]"
+          git config user.email "194550712+copilotkit-bot[bot]@users.noreply.github.com"
           git add -A docs/
           # --no-verify: see the HUSKY note in the workflow env block.
           git commit --no-verify -m "docs: refresh adoption wall"
