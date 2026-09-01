@@ -246,6 +246,39 @@
         transform: translateY(0);
       }
 
+      /* The OS-level request is to stop motion on the PAGE, not only in the
+         marquee (whose own reduced-motion rules live with the marquee CSS).
+         This neutralises every remaining moving part: the fadeUp entrances, the
+         looping pulse and blink, the scroll-triggered reveal transitions and
+         smooth scrolling. Durations collapse rather than being removed so that
+         a `both`-filled animation still lands on its final frame instead of
+         never applying, and iteration-count 1 stops the infinite loops on their
+         100% keyframe (fully opaque) rather than mid-fade. */
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+        *,
+        *::before,
+        *::after {
+          animation-duration: 0.001ms !important;
+          animation-delay: 0ms !important;
+          animation-iteration-count: 1 !important;
+          transition-duration: 0.001ms !important;
+          transition-delay: 0ms !important;
+        }
+        /* .fade-in is revealed by an IntersectionObserver adding .visible. The
+           observer still fires here, but with the transition gone the hidden
+           resting state is no longer a frame anyone sees — and a section whose
+           observer never fires (JS off, a browser without it) would be left
+           permanently blank. So under reduced motion the resting state IS the
+           revealed state and .visible becomes a no-op. */
+        .fade-in {
+          opacity: 1;
+          transform: none;
+        }
+      }
+
       /* ─── Hero ───────────────────────────────────────────────────── */
       .hero {
         padding: 120px 0 3rem;
@@ -965,6 +998,201 @@
         text-align: center;
         margin-bottom: 1rem;
       }
+
+      /* ─── Adoption Marquee ───────────────────────────────────────
+         A single horizontal band of adopter logos, auto-scrolling in a seamless
+         loop. Structure: viewport (clips + fades) > row (the ONLY animated
+         element) > two identical tracks. The row travels exactly -50%, which is
+         one whole track, so at the end of the loop the second track sits where
+         the first began and the restart is invisible.
+
+         --marquee-duration is set inline on .adopter-marquee and SCALES WITH
+         TILE COUNT, so a tile always takes the same time to cross. Keep it
+         inline rather than hardcoding a duration in this stylesheet: the wall
+         grows, and a fixed duration would speed up every time it did. The
+         generator that will maintain the tile list also recomputes it. */
+      .section-adopters {
+        padding: 2.5rem 0 1.5rem;
+      }
+      .adopter-eyebrow {
+        font-family: var(--font-mono);
+        font-size: 0.72rem;
+        font-weight: 500;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        text-align: center;
+        color: var(--text-dim);
+      }
+      .adopter-marquee {
+        --marquee-duration: 64s;
+        position: relative;
+        margin-top: 1.75rem;
+      }
+      .adopter-marquee-viewport {
+        overflow: hidden;
+        /* Fade both ends so logos enter and leave rather than being chopped. */
+        -webkit-mask-image: linear-gradient(
+          to right,
+          transparent 0,
+          #000 7%,
+          #000 93%,
+          transparent 100%
+        );
+        mask-image: linear-gradient(to right, transparent 0, #000 7%, #000 93%, transparent 100%);
+      }
+      .adopter-marquee-row {
+        display: flex;
+        width: max-content;
+        animation: adopter-marquee-scroll var(--marquee-duration) linear infinite;
+      }
+      .adopter-track {
+        display: flex;
+        align-items: flex-start;
+        gap: 2.75rem;
+        /* Matches the gap, so the seam between the two tracks is not a wide gap. */
+        padding-right: 2.75rem;
+      }
+      @keyframes adopter-marquee-scroll {
+        from {
+          transform: translateX(0);
+        }
+        to {
+          transform: translateX(-50%);
+        }
+      }
+      /* Hover covers a mouse, focus-within a keyboard. Both stop the strip
+         while the reader is reaching for a name, and end when the reader moves
+         away. prefers-reduced-motion removes the animation outright. */
+      .adopter-marquee:hover .adopter-marquee-row,
+      .adopter-marquee:focus-within .adopter-marquee-row {
+        animation-play-state: paused;
+      }
+      .adopter {
+        flex: 0 0 auto;
+        width: 104px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.7rem;
+        opacity: 0.78;
+        color: inherit;
+        text-decoration: none;
+        transition: opacity 0.5s var(--ease-out-expo);
+      }
+      .adopter-logo,
+      .adopter-monogram {
+        display: block;
+        width: 40px;
+        height: 40px;
+        border-radius: 8px;
+        transition:
+          filter 0.5s var(--ease-out-expo),
+          transform 0.5s var(--ease-out-expo);
+      }
+      .adopter-logo {
+        object-fit: cover;
+        filter: grayscale(1) contrast(0.9) brightness(1.1);
+      }
+      /* A dark-on-transparent mark is an invisible square on --bg-deep. The chip
+         gives it a ground of its own; the mark is inset so the 40x40 footprint
+         is unchanged and the strip does not shift. Set per adopter by hand in
+         ADOPTER_DISPLAY — see the `chip` flag there. */
+      .adopter-logo--chip {
+        background: #f2f2f5;
+        padding: 4px;
+        object-fit: contain;
+      }
+      /* Safety net for an adopter with no usable logo (a default identicon, a
+         dead avatar). Same footprint, so nothing moves. See `monogram`. */
+      .adopter-monogram {
+        font-family: var(--font-sans);
+        font-size: 1.1rem;
+        font-weight: 600;
+        line-height: 40px;
+        text-align: center;
+        color: var(--text-secondary);
+        background: var(--bg-card);
+        border: 1px solid var(--border);
+      }
+      .adopter-name {
+        font-size: 0.8rem;
+        font-weight: 500;
+        line-height: 1.35;
+        text-align: center;
+        color: var(--text-dim);
+        transition: color 0.5s var(--ease-out-expo);
+      }
+      .adopter:hover,
+      .adopter:focus-visible {
+        opacity: 1;
+        text-decoration: none;
+      }
+      .adopter:hover .adopter-logo,
+      .adopter:focus-visible .adopter-logo,
+      .adopter:hover .adopter-monogram,
+      .adopter:focus-visible .adopter-monogram {
+        filter: none;
+        transform: translateY(-2px);
+      }
+      .adopter:hover .adopter-name,
+      .adopter:focus-visible .adopter-name {
+        color: var(--text-primary);
+      }
+      /* Keyboard focus must stay visible: underline the name, not just recolour. */
+      .adopter:focus-visible {
+        outline: none;
+      }
+      .adopter:focus-visible .adopter-name {
+        text-decoration: underline;
+        text-underline-offset: 4px;
+      }
+      /* Reduced motion does not mean a frozen marquee showing an arbitrary
+         half-tile. The animation is removed, the duplicate track goes with it
+         (it only ever existed to make the loop seamless), and the strip becomes
+         something the reader scrolls themselves. */
+      @media (prefers-reduced-motion: reduce) {
+        .adopter-marquee-row {
+          animation: none;
+          width: 100%;
+        }
+        .adopter-track[aria-hidden="true"] {
+          display: none;
+        }
+        .adopter-marquee-viewport {
+          overflow-x: auto;
+          scroll-snap-type: x mandatory;
+          -webkit-overflow-scrolling: touch;
+          -webkit-mask-image: none;
+          mask-image: none;
+        }
+        .adopter {
+          scroll-snap-align: start;
+          transition: none;
+        }
+        .adopter-logo,
+        .adopter-monogram,
+        .adopter-name {
+          transition: none;
+        }
+        .adopter:hover .adopter-logo,
+        .adopter:focus-visible .adopter-logo,
+        .adopter:hover .adopter-monogram,
+        .adopter:focus-visible .adopter-monogram {
+          transform: none;
+        }
+      }
+      @media (max-width: 720px) {
+        .adopter {
+          width: 92px;
+        }
+        .adopter-track {
+          gap: 2rem;
+          padding-right: 2rem;
+        }
+        .adopter-name {
+          font-size: 0.72rem;
+        }
+      }
       .comparison-wrap {
         -webkit-overflow-scrolling: touch;
       }
@@ -1302,6 +1530,869 @@
             <div id="demo-term" class="demo-term"></div>
           </div>
         </div>
+      </div>
+    </section>
+
+    <!-- ─── Adoption marquee ─────────────────────────────────────── -->
+    <!-- Deliberately sits directly under the hero, not near the closing CTA. A
+         logo band is a quiet strip that does not compete with the hero, and it
+         answers "is this real" BEFORE the reader invests in the feature copy —
+         social proof placed after the ask is social proof nobody reached. -->
+    <section class="section-adopters" id="adopters">
+      <div class="container">
+        <p class="adopter-eyebrow fade-in">Teams building on aimock</p>
+        <!-- adoption-wall:start -->
+        <!-- Maintained BY HAND for now. The weekly generator that will own this
+             region ships separately; the adoption-wall:start/end sentinels above
+             and below mark the block it will rewrite, so keep them intact and
+             keep hand edits inside them. -->
+        <div class="adopter-marquee fade-in" style="--marquee-duration: 64s">
+          <div class="adopter-marquee-viewport">
+            <div class="adopter-marquee-row">
+              <div class="adopter-track">
+                <a
+                  class="adopter"
+                  href="https://openclaw.ai"
+                  data-repo="openclaw/openclaw"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/252820863?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">OpenClaw</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://www.theunwindai.com"
+                  data-repo="Shubhamsaboo/awesome-llm-apps"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/31396011?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">The Unwind AI</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://composio.dev"
+                  data-repo="ComposioHQ/composio"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/128464815?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Composio</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://karakeep.app"
+                  data-repo="karakeep-app/karakeep"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo adopter-logo--chip"
+                    src="https://avatars.githubusercontent.com/u/202258986?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Karakeep</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://mastra.ai"
+                  data-repo="mastra-ai/mastra"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/149120496?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Mastra</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://ag-ui.com"
+                  data-repo="ag-ui-protocol/ag-ui"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/209775067?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">AG-UI</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://tanstack.com/ai/latest"
+                  data-repo="TanStack/ai"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/72518640?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">TanStack</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://llmwiki.atomicstrata.ai"
+                  data-repo="atomicstrata/llm-wiki-compiler"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/272133849?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Atomic Strata</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://github.com/cortexkit/magic-context"
+                  data-repo="cortexkit/magic-context"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/271195168?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">CortexKit</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://www.zoocode.dev"
+                  data-repo="Zoo-Code-Org/Zoo-Code"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/278826416?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Zoo Code</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://www.hashbrown.dev"
+                  data-repo="liveloveapp/hashbrown"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/61214117?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Hashbrown</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://openstory.so"
+                  data-repo="openstory-so/openstory"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/229054016?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">OpenStory</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://tensorfoundry.io/products/olla"
+                  data-repo="thushan/olla"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/68254?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Tensor Foundry</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://mattermost.com/copilot"
+                  data-repo="mattermost/mattermost-plugin-agents"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/9828093?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Mattermost</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://getbodhi.app"
+                  data-repo="BodhiSearch/BodhiApp"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/138853064?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Bodhi</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://xskill.wiki"
+                  data-repo="SkillNerds/xskill"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/283534061?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">xskill</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://marieai.co"
+                  data-repo="marieai/marie-ai"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/59939457?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Marie AI</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://opilot.self.agency"
+                  data-repo="selfagency/opilot"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/2541728?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Opilot</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://testomat.io"
+                  data-repo="testomatio/explorbot"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/59105116?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Testomat.io</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://threadplane.ai"
+                  data-repo="cacheplane/angular-agent-framework"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/269322961?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Threadplane</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://github.com/ysansan98/ant-chat"
+                  data-repo="ysansan98/ant-chat"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/30469146?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Ant Chat</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://www.deepnote.com"
+                  data-repo="deepnote/vscode-deepnote"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/45339858?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Deepnote</span>
+                </a>
+              </div>
+              <div class="adopter-track" aria-hidden="true">
+                <a
+                  class="adopter"
+                  href="https://openclaw.ai"
+                  data-repo="openclaw/openclaw"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/252820863?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">OpenClaw</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://www.theunwindai.com"
+                  data-repo="Shubhamsaboo/awesome-llm-apps"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/31396011?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">The Unwind AI</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://composio.dev"
+                  data-repo="ComposioHQ/composio"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/128464815?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Composio</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://karakeep.app"
+                  data-repo="karakeep-app/karakeep"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo adopter-logo--chip"
+                    src="https://avatars.githubusercontent.com/u/202258986?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Karakeep</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://mastra.ai"
+                  data-repo="mastra-ai/mastra"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/149120496?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Mastra</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://ag-ui.com"
+                  data-repo="ag-ui-protocol/ag-ui"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/209775067?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">AG-UI</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://tanstack.com/ai/latest"
+                  data-repo="TanStack/ai"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/72518640?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">TanStack</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://llmwiki.atomicstrata.ai"
+                  data-repo="atomicstrata/llm-wiki-compiler"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/272133849?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Atomic Strata</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://github.com/cortexkit/magic-context"
+                  data-repo="cortexkit/magic-context"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/271195168?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">CortexKit</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://www.zoocode.dev"
+                  data-repo="Zoo-Code-Org/Zoo-Code"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/278826416?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Zoo Code</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://www.hashbrown.dev"
+                  data-repo="liveloveapp/hashbrown"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/61214117?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Hashbrown</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://openstory.so"
+                  data-repo="openstory-so/openstory"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/229054016?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">OpenStory</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://tensorfoundry.io/products/olla"
+                  data-repo="thushan/olla"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/68254?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Tensor Foundry</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://mattermost.com/copilot"
+                  data-repo="mattermost/mattermost-plugin-agents"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/9828093?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Mattermost</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://getbodhi.app"
+                  data-repo="BodhiSearch/BodhiApp"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/138853064?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Bodhi</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://xskill.wiki"
+                  data-repo="SkillNerds/xskill"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/283534061?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">xskill</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://marieai.co"
+                  data-repo="marieai/marie-ai"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/59939457?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Marie AI</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://opilot.self.agency"
+                  data-repo="selfagency/opilot"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/2541728?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Opilot</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://testomat.io"
+                  data-repo="testomatio/explorbot"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/59105116?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Testomat.io</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://threadplane.ai"
+                  data-repo="cacheplane/angular-agent-framework"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/269322961?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Threadplane</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://github.com/ysansan98/ant-chat"
+                  data-repo="ysansan98/ant-chat"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/30469146?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Ant Chat</span>
+                </a>
+                <a
+                  class="adopter"
+                  href="https://www.deepnote.com"
+                  data-repo="deepnote/vscode-deepnote"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-clone="true"
+                  tabindex="-1"
+                >
+                  <img
+                    class="adopter-logo"
+                    src="https://avatars.githubusercontent.com/u/45339858?s=128&amp;v=4"
+                    alt=""
+                    width="40"
+                    height="40"
+                    loading="lazy"
+                    referrerpolicy="no-referrer"
+                  />
+                  <span class="adopter-name">Deepnote</span>
+                </a>
+              </div>
+            </div>
+          </div>
+        </div>
+        <!-- adoption-wall:end -->
       </div>
     </section>
 
