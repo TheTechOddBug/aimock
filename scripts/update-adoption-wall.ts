@@ -462,6 +462,35 @@ export function orgOf(repo: string): string {
   return repo.split("/")[0] ?? repo;
 }
 
+/**
+ * Repo identity for comparison. GitHub treats `owner/name` case-insensitively
+ * and the producer's casing is not guaranteed to match the casing already on the
+ * page, so anything that decides whether a tile SURVIVED has to normalise —
+ * `excludeReason`, `resolveDisplay` and the org dedupe all already do. Comparing
+ * exact case there means a repo respelled between two scans stops matching its
+ * own successor: the tile reads as a disappearance, its star-floor removal loses
+ * its explanation and escalates to a NEEDS-REVIEW alarm, and a slot that never
+ * changed hands is reported as an org handover.
+ */
+export function repoKey(repo: string): string {
+  return repo.toLowerCase();
+}
+
+/**
+ * `meta.get` that tolerates the same casing drift. The map is keyed by the string
+ * the state file asked about; the alarm paths look up the string the PAGE was
+ * written with, and the two are not guaranteed to agree.
+ */
+export function metaFor(repo: string, meta: Map<string, RepoMeta>): RepoMeta | undefined {
+  const direct = meta.get(repo);
+  if (direct) return direct;
+  const want = repoKey(repo);
+  for (const [key, m] of meta) {
+    if (repoKey(key) === want) return m;
+  }
+  return undefined;
+}
+
 export function avatarUrl(ownerId: number): string {
   return `https://avatars.githubusercontent.com/u/${ownerId}?s=128&v=4`;
 }
@@ -531,6 +560,14 @@ export function rankCandidates(
  * NEEDS-REVIEW with no way to clear it, which is a guard that has stopped
  * guarding anything. Passing over the fork keeps the guard pointed at the
  * biggest name that could genuinely have vanished.
+ *
+ * STAR_FLOOR is passed over for exactly the same reason and it is not a lesser
+ * case: `rankCandidates` does not apply the floor, so on a run where nothing
+ * clears 40 stars the highest-starred candidate is one the wall was never
+ * allowed to render, and reporting it as "excluded from the wall" points a human
+ * at a silent deletion that never happened. Because `ranked` is sorted by stars
+ * descending, the first candidate under the floor means every remaining one is
+ * too, so there is no flagship left to guard and the answer is null.
  */
 export function topCandidate(
   adopters: AdopterState[],
@@ -543,6 +580,7 @@ export function topCandidate(
       forksOutranking.push(candidate.repo);
       continue;
     }
+    if (candidate.stars < STAR_FLOOR) break;
     return { repo: candidate.repo, stars: candidate.stars, forksOutranking };
   }
   return null;
@@ -606,9 +644,14 @@ export function missingFromState(
 export function explainDrop(repo: string, meta: Map<string, RepoMeta>): DropNote | null {
   const reason = excludeReason(repo);
   if (reason) {
-    return { repo, kind: "exclude-list", detail: reason, stars: meta.get(repo)?.stars ?? null };
+    return {
+      repo,
+      kind: "exclude-list",
+      detail: reason,
+      stars: metaFor(repo, meta)?.stars ?? null,
+    };
   }
-  const m = meta.get(repo);
+  const m = metaFor(repo, meta);
   if (m && !m.isFork && m.stars < STAR_FLOOR) {
     return {
       repo,
@@ -630,13 +673,20 @@ export function explainDrop(repo: string, meta: Map<string, RepoMeta>): DropNote
  * first, the slot changes hands and the outgoing repo is absent from the new
  * list. The org never left the wall, so this is not a disappearance — but
  * seeing that requires knowing who holds the slot now, which means `next`.
+ *
+ * A handover requires the outgoing repo to STILL EXIST. Without that test, an
+ * adopter's repo being deleted, made private or taken down is laundered into a
+ * note the moment any other repo from the same org is on the new list — a note
+ * does not gate, so the run reports SAFE and the workflow pushes the shrunken
+ * wall to main with nobody told. "The slot changed hands" and "the repo is gone"
+ * are opposite facts and only `meta` can tell them apart.
  */
 export function partitionDrops(
   current: ParsedTile[],
   next: WallEntry[],
   meta: Map<string, RepoMeta>,
 ): { explained: DropNote[]; unexplained: string[] } {
-  const nextRepos = new Set(next.map((e) => e.repo));
+  const nextRepos = new Set(next.map((e) => repoKey(e.repo)));
   const successorByOrg = new Map<string, string>();
   for (const e of next) {
     const org = orgOf(e.repo).toLowerCase();
@@ -645,25 +695,45 @@ export function partitionDrops(
   const explained: DropNote[] = [];
   const unexplained: string[] = [];
   for (const tile of current) {
-    if (nextRepos.has(tile.repo)) continue;
+    if (nextRepos.has(repoKey(tile.repo))) continue;
     const why = explainDrop(tile.repo, meta);
     if (why) {
       explained.push(why);
       continue;
     }
+    const m = metaFor(tile.repo, meta);
     const successor = successorByOrg.get(orgOf(tile.repo).toLowerCase());
-    if (successor) {
+    if (m && successor) {
       explained.push({
         repo: tile.repo,
         kind: "org-handover",
         detail: `the ${orgOf(tile.repo)} slot is held by \`${successor}\` this run`,
-        stars: meta.get(tile.repo)?.stars ?? null,
+        stars: m.stars,
       });
       continue;
     }
     unexplained.push(tile.repo);
   }
   return { explained, unexplained };
+}
+
+/**
+ * Everything the wall requires of a candidate EXCEPT the exclude list: the latest
+ * scan must still see the repo, the API must have answered for it, and the answer
+ * must be a non-fork clearing STAR_FLOOR.
+ *
+ * It is a named predicate rather than an inline filter chain because two callers
+ * need it and they must not drift: `rankSelectable`, which decides the wall, and
+ * the run's "what did the exclude list actually do" report, which claims to name
+ * the repos that "had cleared the 40-star floor this run". Hand-copied filters
+ * mean the next change to eligibility silently makes that report describe a wall
+ * nobody rendered.
+ */
+export function clearsWallFilters(a: AdopterState, meta: Map<string, RepoMeta>): boolean {
+  if (typeof a.missedRuns === "number" && a.missedRuns > 0) return false;
+  const m = meta.get(a.repo);
+  if (!m) return false;
+  return !m.isFork && m.stars >= STAR_FLOOR;
 }
 
 /**
@@ -687,10 +757,7 @@ export function partitionDrops(
  */
 function rankSelectable(adopters: AdopterState[], meta: Map<string, RepoMeta>): WallEntry[] {
   return adopters
-    .filter((a) => !(typeof a.missedRuns === "number" && a.missedRuns > 0))
-    .filter((a) => meta.has(a.repo))
-    .filter((a) => !meta.get(a.repo)!.isFork)
-    .filter((a) => meta.get(a.repo)!.stars >= STAR_FLOOR)
+    .filter((a) => clearsWallFilters(a, meta))
     .filter((a) => excludeReason(a.repo) === null)
     .map((a) => {
       const m = meta.get(a.repo)!;
@@ -1059,7 +1126,8 @@ export interface ClassifyInput {
  * case nobody would otherwise notice.
  *
  * Two floors sit alongside it and are deliberately independent of each other and
- * of the shrink rule, because the failure they guard is not "the wall changed" —
+ * of the per-repo departure reasons, because the failure they guard is not "the
+ * wall changed" —
  * it is "the wall was quietly gutted by data we had no reason to trust". A wall
  * that loses its biggest name, or that falls under MIN_WALL_SIZE, is never SAFE,
  * even if the numbers technically went up and every logo resolves.
@@ -1085,7 +1153,7 @@ export function classify(input: ClassifyInput): {
   }
 
   if (input.next) {
-    const nextRepos = new Set(input.next.map((e) => e.repo));
+    const nextRepos = new Set(input.next.map((e) => repoKey(e.repo)));
 
     const floor = input.minWallSize ?? MIN_WALL_SIZE;
     if (input.next.length < floor) {
@@ -1095,7 +1163,7 @@ export function classify(input: ClassifyInput): {
     }
 
     const top = input.topCandidate;
-    if (top && !nextRepos.has(top.repo)) {
+    if (top && !nextRepos.has(repoKey(top.repo))) {
       reasons.push(
         `Highest-starred candidate ${top.repo} (${top.stars} stars) was excluded from the wall.`,
       );
@@ -1105,22 +1173,26 @@ export function classify(input: ClassifyInput): {
       ? partitionDrops(input.current, input.next, input.meta)
       : {
           explained: [],
-          unexplained: input.current.filter((t) => !nextRepos.has(t.repo)).map((t) => t.repo),
+          unexplained: input.current
+            .filter((t) => !nextRepos.has(repoKey(t.repo)))
+            .map((t) => t.repo),
         };
 
     for (const why of explained) notes.push(why);
 
-    // The shrink test measures the wall against the size it SHOULD be after the
-    // deliberate removals. Comparing raw counts would fire every time the star
-    // floor or the exclude list did its job, which is the false alarm the whole
-    // explained/unexplained split exists to prevent.
-    const expected = input.current.length - explained.length;
-    if (input.next.length < expected) {
-      reasons.push(
-        `Wall would shrink from ${expected} to ${input.next.length} adopters, beyond the ${explained.length} deliberate removal(s).`,
-      );
-    }
-
+    // THERE IS NO SEPARATE SHRINK REASON, and removing one is not a gap. It read
+    // `next.length < current.length - explained.length`; substituting
+    // `current.length = kept + explained.length + unexplained.length` and
+    // `next.length = kept + additions` reduces it to `additions <
+    // unexplained.length`, which cannot hold unless `unexplained` is non-empty —
+    // and every entry of `unexplained` already pushes its own reason naming the
+    // repo. So the aggregate line never changed a verdict; it only added a
+    // second, vaguer sentence AHEAD of the specific ones. That is not free: the
+    // workflow scrapes the first three `!` lines into Slack, so on a run with
+    // three unaccounted departures the count displaced the third repo's name
+    // from the only message a human reads. It also counted an org handover — a
+    // slot changing hands, not a removal — among the "deliberate removal(s)" it
+    // reported. MIN_WALL_SIZE above remains the wall's real size floor.
     for (const repo of unexplained) {
       reasons.push(`${repo} is on the wall today but absent from the new list.`);
     }
@@ -1501,8 +1573,13 @@ export async function fetchRepoMetaRest(
  */
 const GRAPHQL_BATCH = 100;
 
+/**
+ * `nameWithOwner` is deliberately NOT requested. It is the repo's CURRENT name,
+ * which for a renamed repo is not the name we asked about, and the only thing
+ * this file could do with a name it did not ask for is key on it — which is the
+ * bug. Identity comes from the alias we sent.
+ */
 interface GraphQLRepoNode {
-  nameWithOwner?: string;
   isFork?: boolean;
   stargazerCount?: number;
   owner?: { databaseId?: number };
@@ -1510,7 +1587,7 @@ interface GraphQLRepoNode {
 
 export function buildRepoMetaQuery(repos: string[]): string {
   const fields =
-    "nameWithOwner isFork stargazerCount owner { __typename ... on User { databaseId } ... on Organization { databaseId } }";
+    "isFork stargazerCount owner { __typename ... on User { databaseId } ... on Organization { databaseId } }";
   const parts = repos.map((repo, i) => {
     const [owner, name] = repo.split("/");
     return `r${i}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) { ${fields} }`;
@@ -1550,18 +1627,28 @@ export async function fetchRepoMetaGraphQL(
     if (fatal.length > 0) {
       throw new Error(`GitHub GraphQL error: ${fatal.map((e) => e.message).join("; ")}`);
     }
-    for (const node of Object.values(json.data)) {
+    // Keyed by the string we ASKED about, never by the answer. `repository(owner:,
+    // name:)` resolves through renames and replies with the repo's CURRENT
+    // nameWithOwner, so keying on the answer means every lookup by the state
+    // file's spelling misses: the adopter is dropped by rankSelectable, is
+    // invisible to topCandidate and explainDrop, and wedges the run at
+    // NEEDS-REVIEW with "absent from the new list" every week until a human
+    // renames it by hand — and an EXCLUDED_ADOPTERS entry, which is written
+    // against a name, stops applying. fetchRepoMetaRest already keys this way;
+    // the two paths must not disagree about what a repo is called.
+    for (const [alias, node] of Object.entries(json.data)) {
       if (!node) continue;
+      const requested = batch[Number(alias.slice(1))];
       if (
-        typeof node.nameWithOwner !== "string" ||
+        requested === undefined ||
         typeof node.stargazerCount !== "number" ||
         typeof node.isFork !== "boolean" ||
         typeof node.owner?.databaseId !== "number"
       ) {
-        console.warn(`  ⚠ Skipping ${node.nameWithOwner ?? "(unnamed)"}: incomplete repo metadata`);
+        console.warn(`  ⚠ Skipping ${requested ?? alias}: incomplete repo metadata`);
         continue;
       }
-      meta.set(node.nameWithOwner, {
+      meta.set(requested, {
         stars: node.stargazerCount,
         ownerId: node.owner.databaseId,
         isFork: node.isFork,
@@ -1569,20 +1656,6 @@ export async function fetchRepoMetaGraphQL(
     }
   }
   return requests;
-}
-
-/**
- * GraphQL resolves `nameWithOwner` in the repo's canonical casing, which is not
- * always the casing the state file used. Re-key so lookups by the state file's
- * spelling still hit.
- */
-export function aliasStateCasing(repos: string[], meta: Map<string, RepoMeta>): void {
-  const byLower = new Map([...meta].map(([repo, m]) => [repo.toLowerCase(), m]));
-  for (const repo of repos) {
-    if (meta.has(repo)) continue;
-    const m = byLower.get(repo.toLowerCase());
-    if (m) meta.set(repo, m);
-  }
 }
 
 async function fetchRepoMeta(repos: string[]): Promise<Map<string, RepoMeta>> {
@@ -1600,7 +1673,6 @@ async function fetchRepoMeta(repos: string[]): Promise<Map<string, RepoMeta>> {
 
   if (GITHUB_TOKEN) {
     const requests = await fetchRepoMetaGraphQL(missing, meta);
-    aliasStateCasing(missing, meta);
     console.log(resolutionLine(missing, meta, requests));
   } else {
     console.log(`  No GITHUB_TOKEN; falling back to ${missing.length} REST request(s).`);
@@ -1680,18 +1752,32 @@ export function resolutionLine(
  * a dead avatar on a repo that will not be on the page once the change lands,
  * blocking the very change that removes it. With no candidate list (verify-only,
  * or no state file) nothing is departing, so the whole live wall is probed.
+ *
+ * What departs is a URL, not a repo, so that is what is compared. A repo can
+ * survive to the new wall carrying a DIFFERENT avatar URL — its owner's
+ * `databaseId` changes when an org is deleted and recreated or a user account is
+ * converted to an org, and `avatarUrl`'s query string is ours to edit — and the
+ * URL the page currently holds is then exactly as dead as a departing tile's,
+ * while this run is already replacing it. Matching on repo left that stale URL in
+ * the queue and let it force NEEDS-REVIEW on the run that fixes it.
  */
 export function probeTargets(
   current: ParsedTile[],
   next: WallEntry[] | null,
 ): { url: string; repo: string }[] {
-  const survives = next === null ? null : new Set(next.map((e) => e.repo));
+  const survivingLogos =
+    next === null ? null : new Set(next.filter((e) => !e.monogram).map((e) => e.logo));
   const targets = current
     .filter((t) => t.logo !== "")
-    .filter((t) => survives === null || survives.has(t.repo))
+    .filter((t) => survivingLogos === null || survivingLogos.has(t.logo))
     .map((t) => ({ url: t.logo, repo: t.repo }));
   for (const e of next ?? []) {
     if (e.monogram) continue;
+    // Same filter the `current` side applies above. A non-monogram entry with
+    // an empty logo is a data defect, not a tile to probe: enqueuing "" makes
+    // the probe fetch a relative URL and report the run NEEDS-REVIEW over a
+    // request that was never about an avatar.
+    if (e.logo === "") continue;
     targets.push({ url: e.logo, repo: e.repo });
   }
   return targets;
@@ -1787,14 +1873,27 @@ async function main(): Promise<number> {
     }
 
     // What the exclude list actually did this run: only entries that removed a
-    // repo which had already cleared the star floor changed the wall.
-    suppressed = adopters
-      .filter((a) => !(typeof a.missedRuns === "number" && a.missedRuns > 0))
-      .filter((a) => meta.has(a.repo))
-      .filter((a) => !meta.get(a.repo)!.isFork && meta.get(a.repo)!.stars >= STAR_FLOOR)
-      .map((a) => ({ repo: a.repo, stars: meta.get(a.repo)!.stars, reason: excludeReason(a.repo) }))
-      .filter((e): e is { repo: string; stars: number; reason: string } => e.reason !== null)
-      .sort((x, y) => y.stars - x.stars);
+    // repo which had already cleared the star floor changed the wall. The
+    // eligibility test is `clearsWallFilters` — the SAME predicate rankSelectable
+    // uses — because this report claims to name repos the wall would otherwise
+    // have rendered, and a hand-copied second copy of the filter chain can drift
+    // out of agreement with the wall it is describing.
+    //
+    // Deduplicated by repo: parseAdopterState accepts a state file that lists the
+    // same repo twice, and counting one suppression as two overstates what the
+    // exclude list did in the one line that reports it.
+    const suppressedByRepo = new Map<string, { repo: string; stars: number; reason: string }>();
+    for (const a of adopters) {
+      if (!clearsWallFilters(a, meta)) continue;
+      const reason = excludeReason(a.repo);
+      if (reason === null) continue;
+      const key = repoKey(a.repo);
+      if (suppressedByRepo.has(key)) continue;
+      suppressedByRepo.set(key, { repo: a.repo, stars: meta.get(a.repo)!.stars, reason });
+    }
+    suppressed = [...suppressedByRepo.values()].sort(
+      (x, y) => y.stars - x.stars || x.repo.localeCompare(y.repo),
+    );
 
     const seenRepos = new Set(adopters.map((a) => a.repo.toLowerCase()));
     staleExclusions = Object.keys(EXCLUDED_ADOPTERS).filter((r) => !seenRepos.has(r.toLowerCase()));

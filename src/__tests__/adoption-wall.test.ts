@@ -15,9 +15,9 @@ import {
   decodeHtml,
   escapeHtml,
   exitCodeFor,
-  aliasStateCasing,
   buildRepoMetaQuery,
   buildSummary,
+  clearsWallFilters,
   fetchRepoMetaGraphQL,
   loadAdopterState,
   parseAdopterState,
@@ -30,6 +30,7 @@ import {
   excludeReason,
   explainDrop,
   forkDisagreements,
+  metaFor,
   partitionDrops,
   missingFromState,
   orgRunnersUp,
@@ -519,6 +520,52 @@ describe("candidate ranking", () => {
   it("topCandidate is null when nothing resolved", () => {
     expect(topCandidate([], metaMap({}))).toBeNull();
   });
+
+  // rankCandidates does not apply the star floor, so on a run where nothing
+  // clears it the highest-starred candidate is one the wall was never ALLOWED to
+  // render. Nominating it makes classify report a silent deletion that never
+  // happened, pointing a human at the wrong thing on the run that most needs
+  // them looking at the right one.
+  it("topCandidate passes over a repo below the star floor", () => {
+    const below: AdopterState[] = [
+      { repo: "small/a", missedRuns: 0 },
+      { repo: "small/b", missedRuns: 0 },
+    ];
+    const m = metaMap({
+      "small/a": meta(STAR_FLOOR - 1, 1),
+      "small/b": meta(STAR_FLOOR - 2, 2),
+    });
+    expect(topCandidate(below, m)).toBeNull();
+    const r = classify({
+      current: [],
+      next: [],
+      changed: false,
+      checks: [],
+      minWallSize: 0,
+      topCandidate: topCandidate(below, m),
+    });
+    expect(r.reasons).toEqual([]);
+  });
+
+  it("topCandidate still nominates a repo sitting exactly on the floor", () => {
+    const m = metaMap({ "on/floor": meta(STAR_FLOOR, 1) });
+    expect(topCandidate([{ repo: "on/floor", missedRuns: 0 }], m)?.repo).toBe("on/floor");
+  });
+
+  // The predicate the wall itself uses, so the "what did the exclude list do"
+  // report can never describe a wall nobody rendered.
+  it("clearsWallFilters agrees with what the wall renders", () => {
+    const m = metaMap({
+      "keeps/it": meta(OK_STARS, 1),
+      "too/small": meta(STAR_FLOOR - 1, 2),
+      "is/fork": { stars: OK_STARS, ownerId: 3, isFork: true },
+    });
+    expect(clearsWallFilters({ repo: "keeps/it", missedRuns: 0 }, m)).toBe(true);
+    expect(clearsWallFilters({ repo: "keeps/it", missedRuns: 2 }, m)).toBe(false);
+    expect(clearsWallFilters({ repo: "too/small", missedRuns: 0 }, m)).toBe(false);
+    expect(clearsWallFilters({ repo: "is/fork", missedRuns: 0 }, m)).toBe(false);
+    expect(clearsWallFilters({ repo: "never/resolved", missedRuns: 0 }, m)).toBe(false);
+  });
 });
 
 describe("batched repo metadata query", () => {
@@ -700,10 +747,75 @@ describe("classify", () => {
       checks: allOk,
     });
     expect(r.status).toBe("NEEDS-REVIEW");
-    expect(r.reasons.join(" ")).toContain(
-      `shrink from ${MIN_WALL_SIZE + 1} to ${MIN_WALL_SIZE} adopters`,
-    );
+    expect(r.reasons).toEqual(["b/two is on the wall today but absent from the new list."]);
     expect(exitCodeFor(r.status)).toBe(EXIT_NEEDS_REVIEW);
+  });
+
+  // The workflow scrapes only the FIRST THREE `!` lines into Slack. An aggregate
+  // count in front of the named repos is not extra information, it is one repo's
+  // name deleted from the only message a human reads.
+  it("spends its reason lines on repo names, not on a count of them", () => {
+    const gone = ["x/one", "y/two", "z/three"];
+    const r = classify({
+      current: [...bigCurrent, ...gone.map(tile)],
+      next: bigNext,
+      changed: true,
+      checks: allOk,
+    });
+    expect(r.status).toBe("NEEDS-REVIEW");
+    expect(r.reasons).toHaveLength(gone.length);
+    for (const repo of gone) {
+      expect(r.reasons.slice(0, 3).join(" ")).toContain(repo);
+    }
+  });
+
+  // An org handover is a slot changing hands, not a removal. Counting it as one
+  // put a sentence in front of the named repos that was wrong about both halves.
+  it("never describes an org handover as a deliberate removal", () => {
+    // One slot changes hands and three tiles vanish unaccounted for. The org
+    // handover is a replacement, so calling it a removal both miscounts the run
+    // and puts a vaguer sentence ahead of the three repos that need naming.
+    const kept = bigNext.slice(0, 5);
+    const m = metaMap({
+      ...Object.fromEntries(kept.map((e) => [e.repo, meta(OK_STARS, 1)])),
+      "acme/old": meta(OK_STARS, 60),
+      "acme/new": meta(OK_STARS, 61),
+    });
+    const r = classify({
+      current: [...bigCurrent, tile("acme/old")],
+      next: [...kept, { repo: "acme/new" } as WallEntry],
+      changed: true,
+      checks: allOk,
+      minWallSize: 0,
+      meta: m,
+    });
+    expect(r.notes.map((n) => n.kind)).toEqual(["org-handover"]);
+    expect(r.reasons.join(" ")).not.toMatch(/removal/);
+    expect(r.reasons).toHaveLength(bigCurrent.length - kept.length);
+  });
+
+  // A repo respelled between two scans is the same repo. Comparing exact case
+  // made a tile stop matching its own successor.
+  it("does not call a tile missing because the new list respelled it", () => {
+    const r = classify({
+      current: [...bigCurrent, tile("Acme/Widget")],
+      next: [...bigNext, { repo: "acme/widget" } as WallEntry],
+      changed: true,
+      checks: allOk,
+    });
+    expect(r.reasons).toEqual([]);
+    expect(r.status).toBe("SAFE");
+  });
+
+  it("does not call the flagship excluded because the new list respelled it", () => {
+    const r = classify({
+      current: bigCurrent,
+      next: [...bigNext, { repo: "acme/widget" } as WallEntry],
+      changed: true,
+      checks: allOk,
+      topCandidate: { repo: "Acme/Widget", stars: 5000 },
+    });
+    expect(r.reasons).toEqual([]);
   });
 
   it("flags an adopter dropping off the wall even when the count holds", () => {
@@ -1233,6 +1345,50 @@ describe("a slot changing hands inside one org", () => {
     const m = metaMap({ "acme/old": meta(OK_STARS, 1) });
     expect(partitionDrops(current, next, m).unexplained).toEqual(["acme/old"]);
   });
+
+  // "The slot changed hands" and "the repo is gone" are opposite facts. Without
+  // asking whether the departing repo still resolves, an adopter being deleted,
+  // made private or taken down was filed as a note the moment any sibling repo
+  // from the same org was on the new list — and a note does not gate, so the run
+  // reported SAFE and the workflow pushed the shrunken wall to main.
+  it("is NOT a handover when the departing repo no longer exists", () => {
+    const current = [tile("acme/old")];
+    const next = [{ repo: "acme/new" } as WallEntry];
+    const m = metaMap({ "acme/new": meta(OK_STARS * 2, 1) });
+    const { explained, unexplained } = partitionDrops(current, next, m);
+    expect(explained).toEqual([]);
+    expect(unexplained).toEqual(["acme/old"]);
+    expect(
+      classify({ current, next, changed: true, checks: [], minWallSize: 1, meta: m }).status,
+    ).toBe("NEEDS-REVIEW");
+  });
+});
+
+describe("a repo respelled between two scans is the same repo", () => {
+  const tile = (repo: string) => ({ repo, name: repo, url: "u", logo: "l" });
+
+  it("a survivor the new list recased has not left the wall", () => {
+    const current = [tile("Acme/Widget")];
+    const next = [{ repo: "acme/widget" } as WallEntry];
+    const m = metaMap({ "acme/widget": meta(OK_STARS, 1) });
+    expect(partitionDrops(current, next, m)).toEqual({ explained: [], unexplained: [] });
+  });
+
+  // The escalation the casing bug caused: explainDrop's meta lookup missed, so a
+  // deliberate star-floor removal lost its explanation and came out the other
+  // side as an unexplained-disappearance alarm.
+  it("keeps a star-floor removal explained when the new list recased it", () => {
+    const m = metaMap({ "acme/widget": meta(STAR_FLOOR - 1, 1) });
+    const why = explainDrop("Acme/Widget", m);
+    expect(why?.kind).toBe("star-floor");
+    expect(why?.stars).toBe(STAR_FLOOR - 1);
+  });
+
+  it("metaFor finds a record written under a different casing", () => {
+    const m = metaMap({ "Acme/Widget": meta(OK_STARS, 1) });
+    expect(metaFor("acme/widget", m)?.stars).toBe(OK_STARS);
+    expect(metaFor("other/repo", m)).toBeUndefined();
+  });
 });
 
 describe("the same-org runner-up is reported, not silently dropped", () => {
@@ -1353,6 +1509,23 @@ describe("logo probing", () => {
     const urls = probeTargets(current, next).map((t) => t.url);
     expect(urls).toContain("logo-stays");
     expect(urls).not.toContain("logo-leaving");
+  });
+
+  // What departs is a URL, not a repo. A repo can survive to the new wall with a
+  // DIFFERENT avatar URL — its owner's databaseId changes when an org is deleted
+  // and recreated — and the dead URL still on the page then forces NEEDS-REVIEW
+  // on the very run that replaces it.
+  it("stops probing the OLD url of a survivor whose avatar changed", () => {
+    const current = [{ repo: "stays/put", name: "s", url: "u", logo: "logo-old" }];
+    const next: WallEntry[] = [{ ...entry("stays/put"), logo: "logo-new" }];
+    const urls = probeTargets(current, next).map((t) => t.url);
+    expect(urls).toEqual(["logo-new"]);
+  });
+
+  it("does not probe a live tile's url that the new wall renders as a monogram", () => {
+    const current = [{ repo: "stays/put", name: "s", url: "u", logo: "logo-old" }];
+    const next: WallEntry[] = [{ ...entry("stays/put"), logo: "logo-old", monogram: true }];
+    expect(probeTargets(current, next)).toEqual([]);
   });
 
   it("probes the whole live wall when no candidate list was built", () => {
@@ -1754,15 +1927,16 @@ describe("GraphQL tells a missing repo from a broken query", () => {
     );
   });
 
-  // EVERY field, one at a time: as one lumped case the four checks are
-  // redundant with each other and any one could be deleted while the suite
-  // stayed green. A node missing only `owner.databaseId` would otherwise write
-  // `avatars.githubusercontent.com/u/undefined` onto the page.
+  // EVERY field, one at a time: as one lumped case the checks are redundant with
+  // each other and any one could be deleted while the suite stayed green. A node
+  // missing only `owner.databaseId` would otherwise write
+  // `avatars.githubusercontent.com/u/undefined` onto the page. `nameWithOwner` is
+  // not among them because it is no longer asked for or read — identity is the
+  // alias we sent, not the name the API answered with.
   it.each([
-    ["owner.databaseId", { nameWithOwner: "a/one", isFork: false, stargazerCount: 10 }],
-    ["nameWithOwner", { isFork: false, stargazerCount: 10, owner: { databaseId: 1 } }],
-    ["stargazerCount", { nameWithOwner: "a/one", isFork: false, owner: { databaseId: 1 } }],
-    ["isFork", { nameWithOwner: "a/one", stargazerCount: 10, owner: { databaseId: 1 } }],
+    ["owner.databaseId", { isFork: false, stargazerCount: 10 }],
+    ["stargazerCount", { isFork: false, owner: { databaseId: 1 } }],
+    ["isFork", { stargazerCount: 10, owner: { databaseId: 1 } }],
   ])("skips a node missing %s instead of writing a half-filled RepoMeta", async (_f, node) => {
     const m = new Map<string, RepoMeta>();
     await withFetch(
@@ -1792,41 +1966,91 @@ describe("GraphQL tells a missing repo from a broken query", () => {
   });
 });
 
-describe("canonical-casing aliasing", () => {
-  // GraphQL answers in the repo's canonical casing, which is not always the
-  // casing the state file used. Without the alias, every lookup by the state
-  // file's spelling misses and the adopter silently leaves the wall.
-  it("re-keys canonical-cased metadata under the state file's spelling", () => {
-    const m = metaMap({ "Zoo-Code-Org/Zoo-Code": meta(OK_STARS, 5) });
-    aliasStateCasing(["zoo-code-org/zoo-code"], m);
-    expect(m.get("zoo-code-org/zoo-code")).toEqual({
-      stars: OK_STARS,
-      ownerId: 5,
-      isFork: false,
+describe("GraphQL metadata is keyed by the name we ASKED about", () => {
+  const gql = (body: unknown) =>
+    new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
     });
+
+  // `repository(owner:, name:)` resolves through renames and answers with the
+  // repo's CURRENT nameWithOwner. Keying on the answer means every later lookup
+  // by the state file's spelling misses.
+  it("keeps a RENAMED repo under its requested name", async () => {
+    const m = new Map<string, RepoMeta>();
+    await withFetch(
+      async () =>
+        gql({
+          data: {
+            r0: {
+              nameWithOwner: "new-owner/new-name",
+              isFork: false,
+              stargazerCount: OK_STARS,
+              owner: { databaseId: 7 },
+            },
+          },
+        }),
+      async () => {
+        await expect(fetchRepoMetaGraphQL(["old-owner/old-name"], m)).resolves.toBe(1);
+      },
+    );
+    expect([...m.keys()]).toEqual(["old-owner/old-name"]);
   });
 
-  it("does not overwrite an entry that already resolved exactly", () => {
-    const m = metaMap({ "a/one": meta(10, 1), "A/One": meta(99, 2) });
-    aliasStateCasing(["a/one"], m);
-    expect(m.get("a/one")).toEqual({ stars: 10, ownerId: 1, isFork: false });
+  it("keeps a canonically-recased repo under the state file's spelling", async () => {
+    const m = new Map<string, RepoMeta>();
+    await withFetch(
+      async () =>
+        gql({
+          data: {
+            r0: {
+              nameWithOwner: "Zoo-Code-Org/Zoo-Code",
+              isFork: false,
+              stargazerCount: OK_STARS,
+              owner: { databaseId: 5 },
+            },
+          },
+        }),
+      async () => {
+        await expect(fetchRepoMetaGraphQL(["zoo-code-org/zoo-code"], m)).resolves.toBe(1);
+      },
+    );
+    expect([...m.keys()]).toEqual(["zoo-code-org/zoo-code"]);
   });
 
-  it("leaves a genuinely unresolved repo unresolved, rather than inventing one", () => {
-    const m = metaMap({ "a/one": meta(10, 1) });
-    aliasStateCasing(["b/two"], m);
-    expect(m.has("b/two")).toBe(false);
+  it("pairs each alias with its OWN repo, not with the order the answer arrived in", async () => {
+    const m = new Map<string, RepoMeta>();
+    await withFetch(
+      async () =>
+        gql({
+          data: {
+            r2: { isFork: false, stargazerCount: 300, owner: { databaseId: 3 } },
+            r0: { isFork: false, stargazerCount: 100, owner: { databaseId: 1 } },
+            r1: { isFork: false, stargazerCount: 200, owner: { databaseId: 2 } },
+          },
+        }),
+      async () => {
+        await expect(fetchRepoMetaGraphQL(["a/one", "b/two", "c/three"], m)).resolves.toBe(1);
+      },
+    );
+    expect(m.get("a/one")?.stars).toBe(100);
+    expect(m.get("b/two")?.stars).toBe(200);
+    expect(m.get("c/three")?.stars).toBe(300);
   });
 
-  // The end-to-end payoff: with the alias in place a casing-drifted adopter
-  // still renders; the individual assertions above are what makes the fix
-  // legible, this is what makes it matter.
-  it("keeps a casing-drifted adopter on the wall", () => {
-    const m = metaMap({ "Zoo-Code-Org/Zoo-Code": meta(OK_STARS, 5) });
-    const adopters: AdopterState[] = [{ repo: "zoo-code-org/zoo-code", missedRuns: 0 }];
-    expect(selectAdopters(adopters, m)).toEqual([]);
-    aliasStateCasing(["zoo-code-org/zoo-code"], m);
-    expect(selectAdopters(adopters, m).map((e) => e.repo)).toEqual(["zoo-code-org/zoo-code"]);
+  // The end-to-end payoff: a renamed adopter still ranks, and a renamed
+  // DENY-LISTED repo is still denied — EXCLUDED_ADOPTERS is written against a
+  // name, so an entry keyed on the API's answer would stop applying.
+  it("keeps a renamed adopter on the wall and a renamed exclusion excluded", () => {
+    const m = metaMap({
+      "old-owner/old-name": meta(OK_STARS, 7),
+      "rivet-dev/agentos": meta(OK_STARS, 8),
+    });
+    const adopters: AdopterState[] = [
+      { repo: "old-owner/old-name", missedRuns: 0 },
+      { repo: "rivet-dev/agentos", missedRuns: 0 },
+    ];
+    expect(selectAdopters(adopters, m).map((e) => e.repo)).toEqual(["old-owner/old-name"]);
   });
 });
 
