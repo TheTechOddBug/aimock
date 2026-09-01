@@ -1,0 +1,314 @@
+name: Update Adoption Wall
+
+# Kept separate from update-competitive-matrix.yml on purpose: that job's
+# subject is competitors, this one's is adopters. Different data source,
+# different failure domain, and a broken one should not silence the other.
+
+on:
+  schedule:
+    # Mondays 17:00 UTC. The weekly adoption scan pushes adopters.json to the
+    # adoption-data branch on Mondays at 16:03 UTC, so this sits an hour behind
+    # it and always reads a freshly-refreshed file.
+    - cron: "0 17 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: adoption-wall
+  # NOT cancel-in-progress. This job pushes commits to main and opens PRs;
+  # cancelling it between `git push` and `gh pr create` leaves a pushed branch
+  # with no PR attached to it and nobody looking at it. A re-run queues behind
+  # the running one instead, which is the whole point of re-running after a fix.
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # SINGLE SOURCE OF TRUTH for the orphan branch name on the workflow side.
+  # It is also spelled in scripts/update-adoption-wall.ts (STATE_BRANCH) and in
+  # .gitignore; the "Guard adoption-data naming" step below fails the run if the
+  # three ever drift apart. A rename that misses one would commit weekly state
+  # data into main's history, which is the exact outcome the orphan-branch
+  # design exists to prevent, so it is a hard gate rather than a comment.
+  STATE_BRANCH: adoption-data
+  STATE_FILE: adopters.json
+
+jobs:
+  update-wall:
+    runs-on: ubuntu-latest
+    permissions:
+      # Everything this job touches lives in THIS repo, so the default workflow
+      # token is enough. It deliberately no longer mints a GitHub App token: the
+      # adopter data used to come from the private CopilotKit/backoffice repo,
+      # which put an app private key and a cross-repo read into a PUBLIC repo's
+      # CI for one JSON file. Do not reintroduce that.
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The branch name is spelled in three places that cannot import from each
+      # other (this workflow, the TS script, .gitignore). This step is the join.
+      - name: Guard adoption-data naming
+        run: |
+          ok=1
+          if ! grep -qE "^export const STATE_BRANCH = \"${STATE_BRANCH}\";" scripts/update-adoption-wall.ts; then
+            echo "::error::scripts/update-adoption-wall.ts STATE_BRANCH does not match '${STATE_BRANCH}'."
+            ok=0
+          fi
+          if ! grep -qE "^export const STATE_FILE = \"${STATE_FILE}\";" scripts/update-adoption-wall.ts; then
+            echo "::error::scripts/update-adoption-wall.ts STATE_FILE does not match '${STATE_FILE}'."
+            ok=0
+          fi
+          if ! grep -qxF "/${STATE_BRANCH}/" .gitignore; then
+            echo "::error::.gitignore has no '/${STATE_BRANCH}/' entry — a checkout of the orphan branch could be committed to main."
+            ok=0
+          fi
+          [ "$ok" = 1 ] || exit 1
+          echo "Branch name '${STATE_BRANCH}' agrees across workflow, script and .gitignore."
+
+      # The adopter state, from the ORPHAN `adoption-data` branch of this repo.
+      #
+      # ORPHAN MEANS ORPHAN: that branch shares no history with main, holds
+      # nothing but adopters.json, and MUST NEVER BE MERGED INTO main. If a
+      # branch-cleanup pass ever flags it as stale, leave it alone.
+      #
+      # This probe exists because "the branch does not exist yet" and "the
+      # checkout blew up" are completely different events that a
+      # continue-on-error checkout renders indistinguishable — and the second
+      # one, silently swallowed, freezes the wall while every run stays green.
+      # `git ls-remote --exit-code` separates them by exit status:
+      #   0   -> the ref is there            (checkout, normally)
+      #   2   -> no matching ref             (benign; expected before first push)
+      #   any -> the remote could not answer (loud; fail the run)
+      - name: Probe for adopter state branch
+        id: state_branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Auth is passed through git's environment config rather than written
+          # into .git/config, so nothing has to be cleaned up afterwards and the
+          # `persist-credentials: false` above stays true.
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::${AUTH}"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${AUTH}"
+          set +e
+          git ls-remote --exit-code --heads \
+            "https://github.com/${GITHUB_REPOSITORY}" "refs/heads/${STATE_BRANCH}" \
+            > "${RUNNER_TEMP}/ls-remote.out" 2> "${RUNNER_TEMP}/ls-remote.err"
+          CODE=$?
+          set -e
+          case "$CODE" in
+            0)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "Orphan branch '${STATE_BRANCH}' exists; checking it out."
+              ;;
+            2)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              echo "Orphan branch '${STATE_BRANCH}' does not exist on the remote."
+              echo "Expected before the weekly routine's first push. The wall will be left as-is."
+              ;;
+            *)
+              echo "exists=error" >> "$GITHUB_OUTPUT"
+              cat "${RUNNER_TEMP}/ls-remote.err" || true
+              echo "::error::Could not ask the remote whether '${STATE_BRANCH}' exists (git ls-remote exit ${CODE}). This is NOT the benign missing-branch case; refusing to report a clean run."
+              exit "$CODE"
+              ;;
+          esac
+
+      # No continue-on-error: the branch is known to exist by the time this
+      # runs, so any failure here is a real failure and must stop the run.
+      # Sparse + depth 1 so this costs one file, not a second clone.
+      - name: Fetch adopter state
+        if: steps.state_branch.outputs.exists == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.STATE_BRANCH }}
+          path: ${{ env.STATE_BRANCH }}
+          fetch-depth: 1
+          sparse-checkout: ${{ env.STATE_FILE }}
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Report adopter state availability
+        env:
+          EXISTS: ${{ steps.state_branch.outputs.exists }}
+        run: |
+          if [ "$EXISTS" != "true" ]; then
+            echo "No ${STATE_BRANCH}/${STATE_FILE} — the orphan branch is not there yet."
+            echo "Expected before the routine's first push. The wall will be left as-is."
+            exit 0
+          fi
+          if [ ! -f "${STATE_BRANCH}/${STATE_FILE}" ]; then
+            echo "::error::The '${STATE_BRANCH}' branch exists and was checked out, but ${STATE_BRANCH}/${STATE_FILE} is not there. That is a broken producer, not a first run."
+            exit 1
+          fi
+          echo "${STATE_BRANCH}/${STATE_FILE} present ($(wc -c < "${STATE_BRANCH}/${STATE_FILE}") bytes)."
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6.0.10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # Exit code is the contract, not the log text:
+      #   0 clean · 10 changed-safe · 20 needs-review · anything else = failure.
+      # Output is redirected to a file first so the exit code survives; a pipe
+      # here would report the exit status of the last command in the pipeline.
+      - name: Update adoption wall
+        id: wall
+        env:
+          # Used only to resolve stars / fork status / owner ids from the GitHub
+          # API. The adopter list itself is read off disk, not fetched.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          npx tsx scripts/update-adoption-wall.ts --summary "${RUNNER_TEMP}/adoption-wall-summary.md" > "${RUNNER_TEMP}/adoption-wall.log" 2>&1
+          CODE=$?
+          set -e
+          cat "${RUNNER_TEMP}/adoption-wall.log"
+          # The script prints every reason it reached its verdict as a "  ! "
+          # line. Carry the first few out of the log so the Slack message can
+          # name the ACTUAL cause instead of guessing one. Truncated because a
+          # Slack message is not a log viewer.
+          {
+            echo "reason<<ADOPTION_WALL_REASON_EOF"
+            sed -n 's/^  ! //p' "${RUNNER_TEMP}/adoption-wall.log" \
+              | head -3 \
+              | cut -c1-300 \
+              | grep -v '^ADOPTION_WALL_REASON_EOF$' || true
+            echo "ADOPTION_WALL_REASON_EOF"
+          } >> "$GITHUB_OUTPUT"
+          case "$CODE" in
+            0)  echo "status=clean" >> "$GITHUB_OUTPUT" ;;
+            10) echo "status=safe" >> "$GITHUB_OUTPUT" ;;
+            20) echo "status=needs-review" >> "$GITHUB_OUTPUT" ;;
+            *)  echo "Adoption wall script failed with exit ${CODE}"; exit "$CODE" ;;
+          esac
+
+      - name: Check for changes
+        id: changes
+        run: |
+          # Scoped to docs/ on purpose: the orphan-branch checkout sits in the
+          # working tree (and is gitignored) and is never committed.
+          # `git status --porcelain` rather than `git diff --quiet`: diff is
+          # blind to a NEWLY CREATED file, so a script that starts writing a new
+          # page under docs/ would silently report "nothing changed" and the run
+          # would go green having shipped nothing.
+          if [ -z "$(git status --porcelain -- docs/)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git status --porcelain -- docs/
+          fi
+
+      - name: Configure git identity
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          # Identity only. The push credential is NOT written here: it is passed
+          # per-command through git's environment config on the pushing steps,
+          # so it never lands in .git/config and `persist-credentials: false`
+          # keeps meaning what it says.
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      # The whole point of the wall: a healthy, purely-additive refresh lands
+      # itself. No weekly click.
+      - name: Commit to main
+        if: steps.wall.outputs.status == 'safe' && steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::${AUTH}"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${AUTH}"
+          git add -A docs/
+          git commit -m "docs: refresh adoption wall"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      # Anything a human should look at — a shrinking wall, an adopter dropping
+      # off, a dead logo — goes through a PR instead.
+      # Needs the org's "Allow GitHub Actions to create and approve pull
+      # requests" setting; without it gh pr create 403s on the workflow token.
+      - name: Open review PR
+        if: steps.wall.outputs.status == 'needs-review' && steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::${AUTH}"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${AUTH}"
+          # Run id + attempt, not just the date: a same-day re-run — which is
+          # exactly what you do after fixing whatever the first run tripped on —
+          # would otherwise die on `git checkout -b`, on the push, or on
+          # `gh pr create` finding a PR already open for that branch.
+          BRANCH="auto/adoption-wall-$(date -u +%Y%m%d)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git checkout -b "$BRANCH"
+          git add -A docs/
+          git commit -m "docs: refresh adoption wall (needs review)"
+          git push -u origin "$BRANCH"
+          gh pr create \
+            --title "Adoption wall needs review" \
+            --body-file "${RUNNER_TEMP}/adoption-wall-summary.md" \
+            --base "${GITHUB_REF_NAME}" \
+            --head "$BRANCH"
+
+      - name: Notify Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          STATUS: ${{ steps.wall.outputs.status }}
+          CHANGED: ${{ steps.changes.outputs.changed }}
+          REASON: ${{ steps.wall.outputs.reason }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "$SLACK_WEBHOOK" ]; then echo "SLACK_WEBHOOK not set, skipping"; exit 0; fi
+          RUN_LINK="<https://github.com/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}|View run>"
+          # One line, from the script's own reasons, so the message names the
+          # cause it actually found. A corrupt adopters.json and a dead logo are
+          # both "needs-review with nothing changed" and this is the only signal
+          # a human gets; asserting "logo check failed" for both named the wrong
+          # cause roughly whenever it mattered.
+          WHY=$(printf '%s' "$REASON" | head -1)
+          [ -n "$WHY" ] || WHY="see the run log for the reason"
+          if [ "$JOB_STATUS" != "success" ]; then
+            EMOJI="❌"
+            MSG="*Adoption wall update failed*. ${RUN_LINK}"
+          elif [ "$STATUS" = "needs-review" ] && [ "$CHANGED" = "true" ]; then
+            EMOJI="🛑"
+            MSG="*Adoption wall needs review* — PR opened rather than pushed to main. Reason: ${WHY} ${RUN_LINK}"
+          elif [ "$STATUS" = "needs-review" ]; then
+            EMOJI="⚠️"
+            MSG="*Adoption wall needs review* — nothing changed under docs/, so there is nothing to merge; fix the source. Reason: ${WHY} ${RUN_LINK}"
+          elif [ "$STATUS" = "safe" ] && [ "$CHANGED" = "true" ]; then
+            EMOJI="🧱"
+            MSG="Adoption wall refreshed and pushed to main. ${RUN_LINK}"
+          else
+            EMOJI="✅"
+            MSG="Adoption wall check — logos healthy, no changes."
+          fi
+          PAYLOAD=$(jq -n --arg text "${EMOJI} ${MSG}" '{text: $text}')
+          # --fail-with-body + timeouts: a revoked or dead webhook returns 403
+          # or 404 and plain `curl -s` calls that a success, so the one channel
+          # that tells a human this job is unhealthy can be broken for months
+          # with nothing to show for it. If the notification cannot be
+          # delivered, the run says so.
+          # `--retry` WITHOUT --retry-all-errors on purpose: a 5xx or a timeout
+          # is worth another go, a revoked webhook's 403 is not, and retrying it
+          # only delays the report by 15s.
+          curl -sS --fail-with-body \
+            --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-delay 5 \
+            -X POST "$SLACK_WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
