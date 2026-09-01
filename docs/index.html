@@ -77,6 +77,12 @@
         --font-features-mono: "liga" 0, "calt" 0;
         --font-sans: "Instrument Sans", -apple-system, system-ui, sans-serif;
         --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+        /* Rendered height of the fixed nav. Anything that sticks below the nav
+           offsets from this instead of re-guessing the number. The value here is
+           the desktop/mobile fallback for a no-JS render; the nav measures itself
+           on load and on resize and overwrites it, so a change to nav padding,
+           brand font-size or link wrapping can no longer silently desync. */
+        --nav-h: 70px;
       }
 
       html {
@@ -144,7 +150,12 @@
       nav .container {
         display: flex;
         align-items: center;
-        justify-content: space-between;
+        gap: 2rem;
+      }
+      /* Pushes both link groups to the right, so splitting them into two lists
+         leaves the desktop bar looking exactly as it did with one. */
+      .nav-brand {
+        margin-right: auto;
       }
       .nav-brand {
         display: flex;
@@ -162,13 +173,6 @@
       }
       .nav-brand .prompt {
         color: var(--accent);
-      }
-      .nav-brand .powered-by {
-        font-size: 0.6rem;
-        font-weight: 400;
-        color: var(--text-dim);
-        padding-left: 1.5rem;
-        margin-top: -2px;
       }
       .nav-links {
         display: flex;
@@ -611,9 +615,6 @@
         box-shadow: 0 0 10px var(--error);
         animation: pulse 1.5s infinite;
       }
-      .record-left h2 {
-        display: none; /* moved above grid */
-      }
       .steps {
         display: flex;
         flex-direction: column;
@@ -696,18 +697,6 @@
         text-decoration: none;
       }
 
-      /* ─── Section: Transition ─────────────────────────────────────── */
-      .section-transition {
-        padding: 6rem 0;
-        text-align: center;
-      }
-      .transition-text {
-        font-size: clamp(1.4rem, 3vw, 2rem);
-        font-weight: 600;
-        color: var(--text-secondary);
-        letter-spacing: -0.02em;
-        margin-bottom: 3rem;
-      }
       .service-strip {
         display: flex;
         gap: 1rem;
@@ -1204,7 +1193,7 @@
       }
       .comparison-table thead th {
         position: sticky;
-        top: 57px;
+        top: var(--nav-h);
         z-index: 10;
         padding: 1rem;
         background: var(--bg-deep);
@@ -1231,7 +1220,9 @@
         text-align: center;
         color: var(--text-secondary);
       }
-      .comparison-table tbody td:first-child {
+      .comparison-table tbody th {
+        padding: 0.75rem 1rem;
+        border: 1px solid var(--border);
         text-align: left;
         color: var(--text-primary);
         font-weight: 500;
@@ -1359,11 +1350,35 @@
 
       /* ─── Mobile ──────────────────────────────────────────────────── */
       @media (max-width: 768px) {
-        .nav-links {
+        /* The five section anchors used to be display:none below 768px, which
+           left phones with no way to reach any section at all. They now take
+           their own full-width row under the brand and scroll horizontally —
+           Docs and the GitHub button keep their place on the first row — so
+           every anchor stays reachable without a JS-dependent menu. The mask
+           fades the right edge to advertise that the row scrolls. */
+        nav .container {
+          flex-wrap: wrap;
           gap: 1rem;
+          row-gap: 0.6rem;
         }
-        .nav-links .nav-hide-mobile {
+        .nav-sections {
+          order: 3;
+          width: 100%;
+          gap: 1.4rem;
+          overflow-x: auto;
+          scrollbar-width: none;
+          -webkit-overflow-scrolling: touch;
+          -webkit-mask-image: linear-gradient(to right, #000 85%, transparent 100%);
+          mask-image: linear-gradient(to right, #000 85%, transparent 100%);
+        }
+        .nav-sections::-webkit-scrollbar {
           display: none;
+        }
+        .nav-sections li {
+          flex: 0 0 auto;
+        }
+        .nav-sections a {
+          font-size: 0.8rem;
         }
         .demo-grid {
           grid-template-columns: 1fr;
@@ -1416,14 +1431,23 @@
         .hero h1 {
           font-size: 2rem;
         }
-        .nav-brand .powered-by {
-          display: none;
-        }
         .cn-label {
           display: none;
         }
       }
     </style>
+    <!-- .fade-in rests hidden and is revealed by an IntersectionObserver. With
+         scripting off there is no observer, so everything below the hero would
+         render permanently blank. Restore the revealed state as the resting
+         state. (The observer-threw case is handled in the script itself.) -->
+    <noscript>
+      <style>
+        .fade-in {
+          opacity: 1;
+          transform: none;
+        }
+      </style>
+    </noscript>
     <script src="/pixels.js" defer></script>
   </head>
 
@@ -1434,12 +1458,14 @@
         <div class="nav-brand">
           <div class="brand-main"><span class="prompt">$</span> aimock</div>
         </div>
-        <ul class="nav-links">
-          <li><a href="#record" class="nav-hide-mobile">Record & Replay</a></li>
-          <li><a href="#suite" class="nav-hide-mobile">Suite</a></li>
-          <li><a href="#features" class="nav-hide-mobile">Features</a></li>
-          <li><a href="#comparison" class="nav-hide-mobile">Comparison</a></li>
-          <li><a href="#switch" class="nav-hide-mobile">Switch</a></li>
+        <ul class="nav-links nav-sections">
+          <li><a href="#record">Record &amp; Replay</a></li>
+          <li><a href="#suite">Suite</a></li>
+          <li><a href="#features">Features</a></li>
+          <li><a href="#comparison">Comparison</a></li>
+          <li><a href="#switch">Switch</a></li>
+        </ul>
+        <ul class="nav-links nav-actions">
           <li><a href="/docs">Docs</a></li>
           <li>
             <a
@@ -2560,7 +2586,7 @@
             <div class="demo-body">
               <pre><span class="t-green">$</span> npx @copilotkit/aimock --config aimock.json
 
-<span class="t-blue">&#9889;</span> aimock v1.16.0
+<span class="t-blue">&#9889;</span> aimock v1.39.0
 
 <span class="t-green">&#10003;</span> LLM    <span class="t-dim">mounted at</span>  /v1/chat/completions
 <span class="t-green">&#10003;</span> LLM    <span class="t-dim">mounted at</span>  /v1/messages
@@ -2714,65 +2740,69 @@
           <table class="comparison-table">
             <thead>
               <tr>
-                <th>Capability</th>
-                <th class="col-aimock">
+                <th scope="col">Capability</th>
+                <th scope="col" class="col-aimock">
                   <a href="https://github.com/CopilotKit/aimock">aimock</a>
                 </th>
-                <th><a href="https://github.com/mswjs/msw">MSW</a></th>
-                <th><a href="https://github.com/vidaiUK/VidaiMock">VidaiMock</a></th>
-                <th><a href="https://github.com/dwmkerr/mock-llm">mock-llm</a></th>
-                <th><a href="https://github.com/piyook/llm-mock">piyook/llm-mock</a></th>
-                <th><a href="https://github.com/mokksy/ai-mocks">mokksy/ai-mocks</a></th>
+                <th scope="col"><a href="https://github.com/mswjs/msw">MSW</a></th>
+                <th scope="col"><a href="https://github.com/vidaiUK/VidaiMock">VidaiMock</a></th>
+                <th scope="col"><a href="https://github.com/dwmkerr/mock-llm">mock-llm</a></th>
+                <th scope="col">
+                  <a href="https://github.com/piyook/llm-mock">piyook/llm-mock</a>
+                </th>
+                <th scope="col">
+                  <a href="https://github.com/mokksy/ai-mocks">mokksy/ai-mocks</a>
+                </th>
               </tr>
             </thead>
             <tbody>
               <tr>
-                <td>Cross-process interception</td>
+                <th scope="row">Cross-process interception</th>
                 <td class="col-aimock"><span class="yes">Real server &#10003;</span></td>
                 <td>In-process only</td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span> (Docker)</td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span> (Ktor)</td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span> (Docker)</td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span> (Ktor)</td>
               </tr>
               <tr>
-                <td>Chat Completions SSE</td>
+                <th scope="row">Chat Completions SSE</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
                 <td><span class="manual">manual</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
               </tr>
               <tr>
-                <td>Responses API SSE</td>
+                <th scope="row">Responses API SSE</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
                 <td><span class="manual">manual</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
               </tr>
               <tr>
-                <td>Claude Messages API</td>
+                <th scope="row">Claude Messages API</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
                 <td><span class="manual">manual</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
               </tr>
               <tr>
-                <td>Gemini streaming</td>
+                <th scope="row">Gemini streaming</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
                 <td><span class="manual">manual</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
               </tr>
               <tr>
-                <td>Multi-provider support</td>
+                <th scope="row">Multi-provider support</th>
                 <td class="col-aimock">
                   <span class="yes">13 providers (15 API surfaces) &#10003;</span>
                 </td>
@@ -2783,286 +2813,296 @@
                 <td>5 providers</td>
               </tr>
               <tr>
-                <td>OpenRouter router / fallback simulation</td>
+                <th scope="row">OpenRouter router / fallback simulation</th>
                 <td class="col-aimock"><span class="yes">Deterministic &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>WebSocket APIs</td>
+                <th scope="row">WebSocket APIs</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Embeddings API</td>
+                <th scope="row">Embeddings API</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
               </tr>
               <tr>
-                <td>Image generation</td>
+                <th scope="row">Image generation</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Image editing</td>
+                <th scope="row">Image editing</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Text-to-Speech</td>
+                <th scope="row">Text-to-Speech</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Audio transcription</td>
+                <th scope="row">Audio transcription</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Audio translation</td>
+                <th scope="row">Audio translation</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Non-speech audio</td>
+                <th scope="row">Non-speech audio</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Video generation</td>
+                <th scope="row">Video generation</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>AG-UI event mocking</td>
+                <th scope="row">AG-UI event mocking</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>MCP tool mocking</td>
+                <th scope="row">MCP tool mocking</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>A2A agent mocking</td>
+                <th scope="row">A2A agent mocking</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
               </tr>
               <tr>
-                <td>Vector DB mocking</td>
+                <th scope="row">Vector DB mocking</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Search &amp; rerank</td>
+                <th scope="row">Search &amp; rerank</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Record &amp; replay</td>
+                <th scope="row">Record &amp; replay</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Drift detection</td>
-                <td class="col-aimock"><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <th scope="row">Drift detection</th>
+                <td class="col-aimock">
+                  <span class="yes" role="img" aria-label="Yes">&#10003;</span>
+                </td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Sequential / stateful responses</td>
+                <th scope="row">Sequential / stateful responses</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
                 <td><span class="manual">manual</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Request journal</td>
-                <td class="col-aimock"><span class="yes">&#10003;</span></td>
+                <th scope="row">Request journal</th>
+                <td class="col-aimock">
+                  <span class="yes" role="img" aria-label="Yes">&#10003;</span>
+                </td>
                 <td><span class="manual">manual</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Error injection</td>
-                <td class="col-aimock"><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
+                <th scope="row">Error injection</th>
+                <td class="col-aimock">
+                  <span class="yes" role="img" aria-label="Yes">&#10003;</span>
+                </td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
                 <td><span class="partial">partial</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Chaos testing</td>
+                <th scope="row">Chaos testing</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Streaming physics</td>
+                <th scope="row">Streaming physics</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Structured output / JSON mode</td>
+                <th scope="row">Structured output / JSON mode</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
                 <td><span class="manual">manual</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Programmatic API</td>
-                <td class="col-aimock"><span class="yes">&#10003;</span> (TypeScript/JS)</td>
-                <td><span class="yes">&#10003;</span> (TypeScript/JS)</td>
+                <th scope="row">Programmatic API</th>
+                <td class="col-aimock">
+                  <span class="yes" role="img" aria-label="Yes">&#10003;</span> (TypeScript/JS)
+                </td>
+                <td>
+                  <span class="yes" role="img" aria-label="Yes">&#10003;</span> (TypeScript/JS)
+                </td>
                 <td>No (binary only)</td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span> (Kotlin/JVM)</td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span> (Kotlin/JVM)</td>
               </tr>
               <tr>
-                <td>Fixture files</td>
+                <th scope="row">Fixture files</th>
                 <td class="col-aimock"><span class="yes">JSON &#10003;</span></td>
                 <td>Code-only</td>
                 <td>Tera templates</td>
                 <td>YAML config</td>
                 <td>JSON templates</td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>GitHub Action</td>
+                <th scope="row">GitHub Action</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
               </tr>
               <tr>
-                <td>Vitest / Jest plugins</td>
+                <th scope="row">Vitest / Jest plugins</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Docker + Helm</td>
+                <th scope="row">Docker + Helm</th>
                 <td class="col-aimock"><span class="yes">Both &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
                 <td>Docker only</td>
-                <td><span class="yes">&#10003;</span> (Both)</td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span> (Both)</td>
                 <td>Docker only</td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Prometheus metrics</td>
+                <th scope="row">Prometheus metrics</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Streaming usage chunks</td>
+                <th scope="row">Streaming usage chunks</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="yes">&#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="yes" role="img" aria-label="Yes">&#10003;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Rate limiting headers</td>
+                <th scope="row">Rate limiting headers</th>
                 <td class="col-aimock"><span class="yes">Built-in &#10003;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
-                <td><span class="no">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
+                <td><span class="no" role="img" aria-label="No">&#10007;</span></td>
               </tr>
               <tr>
-                <td>Dependencies</td>
+                <th scope="row">Dependencies</th>
                 <td class="col-aimock"><span class="yes">Zero &#10003;</span></td>
                 <td>~300KB</td>
                 <td>Zero (Rust)</td>
@@ -3090,29 +3130,33 @@
           class="fade-in"
           style="display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap"
         >
-          <a href="/migrate-from-msw" class="btn btn-secondary"
+          <a href="/migrate-from-msw" class="btn-secondary"
             ><img
               src="https://mswjs.io/icon.svg"
+              loading="lazy"
+              referrerpolicy="no-referrer"
               alt=""
               width="16"
               height="16"
               style="vertical-align: -2px; margin-right: 6px; filter: grayscale(1) brightness(2)"
             />MSW</a
           >
-          <a href="/migrate-from-vidaimock" class="btn btn-secondary">VidaiMock</a>
-          <a href="/migrate-from-mock-llm" class="btn btn-secondary">mock-llm</a>
-          <a href="/migrate-from-piyook" class="btn btn-secondary">piyook</a>
-          <a href="/migrate-from-python-mocks" class="btn btn-secondary"
+          <a href="/migrate-from-vidaimock" class="btn-secondary">VidaiMock</a>
+          <a href="/migrate-from-mock-llm" class="btn-secondary">mock-llm</a>
+          <a href="/migrate-from-piyook" class="btn-secondary">piyook</a>
+          <a href="/migrate-from-python-mocks" class="btn-secondary"
             ><img
               src="https://www.python.org/static/favicon.ico"
+              loading="lazy"
+              referrerpolicy="no-referrer"
               alt=""
               width="16"
               height="16"
               style="vertical-align: -2px; margin-right: 6px"
             />Python</a
           >
-          <a href="/migrate-from-mokksy" class="btn btn-secondary">Mokksy</a>
-          <a href="/migrate-from-openai-responses" class="btn btn-secondary">openai-responses</a>
+          <a href="/migrate-from-mokksy" class="btn-secondary">Mokksy</a>
+          <a href="/migrate-from-openai-responses" class="btn-secondary">openai-responses</a>
         </div>
       </div>
     </section>
@@ -3203,23 +3247,61 @@
         });
       }
 
-      // Scroll-triggered fade-in via IntersectionObserver
+      // Publish the nav's rendered height as --nav-h so anything sticking below
+      // it (the comparison table's sticky header) offsets from the real number
+      // rather than a hard-coded guess that silently rots when the nav changes.
       (function () {
-        var observer = new IntersectionObserver(
-          function (entries) {
-            entries.forEach(function (entry) {
-              if (entry.isIntersecting) {
-                entry.target.classList.add("visible");
-                observer.unobserve(entry.target);
-              }
-            });
-          },
-          { threshold: 0.1, rootMargin: "0px 0px -40px 0px" },
-        );
+        try {
+          var nav = document.querySelector("nav");
+          if (!nav) return;
+          var apply = function () {
+            document.documentElement.style.setProperty(
+              "--nav-h",
+              Math.round(nav.getBoundingClientRect().height) + "px",
+            );
+          };
+          apply();
+          window.addEventListener("resize", apply);
+        } catch (e) {
+          /* the CSS fallback value stands */
+        }
+      })();
 
-        document.querySelectorAll(".fade-in").forEach(function (el) {
-          observer.observe(el);
-        });
+      // Scroll-triggered fade-in via IntersectionObserver.
+      // .fade-in rests at opacity 0, so if this never runs the whole page below
+      // the hero is blank. Every failure path — no IntersectionObserver, a
+      // constructor that throws — must therefore end with the content revealed.
+      // The try/catch also keeps a throw here from aborting the rest of this
+      // <script>, which is what animates the hero terminal.
+      (function () {
+        var revealAll = function () {
+          document.querySelectorAll(".fade-in").forEach(function (el) {
+            el.classList.add("visible");
+          });
+        };
+        try {
+          if (typeof IntersectionObserver !== "function") {
+            revealAll();
+            return;
+          }
+          var observer = new IntersectionObserver(
+            function (entries) {
+              entries.forEach(function (entry) {
+                if (entry.isIntersecting) {
+                  entry.target.classList.add("visible");
+                  observer.unobserve(entry.target);
+                }
+              });
+            },
+            { threshold: 0.1, rootMargin: "0px 0px -40px 0px" },
+          );
+
+          document.querySelectorAll(".fade-in").forEach(function (el) {
+            observer.observe(el);
+          });
+        } catch (e) {
+          revealAll();
+        }
       })();
 
       // ── Terminal demo animation ──────────────────────────────────────
@@ -3279,8 +3361,61 @@
         },
       ];
 
+      // The page-wide prefers-reduced-motion CSS block cannot reach a demo that
+      // is animated in JS, so the terminal has to opt out itself: under reduced
+      // motion it paints the finished transcript once and never loops.
+      var termReduceMotion = !!(
+        window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      );
+      var termVisible = false;
+      var termRunning = false;
+      var termStaticDone = false;
+      var termRestartTimer = null;
+
+      // The end state of termSteps, with no typing and no timers.
+      function renderTermStatic(term) {
+        term.innerHTML = "";
+        termSteps.forEach(function (step) {
+          if (step.type === "stream") {
+            var target = document.getElementById(step.target);
+            if (target) target.textContent = step.text;
+            return;
+          }
+          var line = document.createElement("div");
+          line.className = "line visible";
+          if (step.type === "prompt") {
+            line.innerHTML = '<span class="prompt-sym">$ </span><span class="cmd"></span>';
+            line.querySelector(".cmd").textContent = step.text;
+          } else {
+            line.innerHTML = step.html === "" ? "&nbsp;" : step.html;
+          }
+          term.appendChild(line);
+        });
+      }
+
+      // Only loop while the demo is actually on screen and the tab is visible;
+      // re-entering the viewport restarts it.
+      function scheduleTermRestart() {
+        clearTimeout(termRestartTimer);
+        termRestartTimer = setTimeout(function () {
+          if (termReduceMotion || !termVisible || document.hidden) return;
+          runTermDemo();
+        }, 4000);
+      }
+
       function runTermDemo() {
         var term = document.getElementById("demo-term");
+        if (!term) return;
+        if (termReduceMotion) {
+          if (!termStaticDone) {
+            renderTermStatic(term);
+            termStaticDone = true;
+          }
+          termRunning = false;
+          return;
+        }
+        clearTimeout(termRestartTimer);
+        termRunning = true;
         term.innerHTML = "";
         var stepIdx = 0;
 
@@ -3291,7 +3426,8 @@
             cursorLine.innerHTML = '<span class="prompt-sym">$ </span><span class="cursor"></span>';
             cursorLine.style.opacity = "1";
             term.appendChild(cursorLine);
-            setTimeout(runTermDemo, 4000);
+            termRunning = false;
+            scheduleTermRestart();
             return;
           }
 
@@ -3375,22 +3511,33 @@
         nextStep();
       }
 
-      // Start when demo scrolls into view
+      // Start when demo scrolls into view. It stays observed so the loop can be
+      // stopped when it scrolls away and picked up again when it comes back.
       (function () {
         var demoTerm = document.getElementById("demo-term");
         if (!demoTerm) return;
-        var demoObserver = new IntersectionObserver(
-          function (entries) {
-            entries.forEach(function (e) {
-              if (e.isIntersecting) {
-                runTermDemo();
-                demoObserver.unobserve(e.target);
-              }
-            });
-          },
-          { threshold: 0.1 },
-        );
-        demoObserver.observe(demoTerm);
+        try {
+          if (typeof IntersectionObserver !== "function") {
+            runTermDemo();
+            return;
+          }
+          var demoObserver = new IntersectionObserver(
+            function (entries) {
+              entries.forEach(function (e) {
+                termVisible = e.isIntersecting;
+                if (termVisible && !termRunning) runTermDemo();
+              });
+            },
+            { threshold: 0.1 },
+          );
+          demoObserver.observe(demoTerm);
+          document.addEventListener("visibilitychange", function () {
+            if (!document.hidden && termVisible && !termRunning) runTermDemo();
+          });
+        } catch (e) {
+          renderTermStatic(demoTerm);
+          termStaticDone = true;
+        }
       })();
     </script>
   </body>
