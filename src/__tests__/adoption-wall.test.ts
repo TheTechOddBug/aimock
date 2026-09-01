@@ -1,6 +1,10 @@
-import { describe, it, expect, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { describe, it, expect, vi, beforeAll, afterAll } from "vitest";
 import { fileURLToPath } from "node:url";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { format as formatWithPrettier, resolveConfig as resolvePrettierConfig } from "prettier";
 import {
   ADOPTER_DISPLAY,
   EXCLUDED_ADOPTERS,
@@ -172,10 +176,25 @@ describe("resolveDisplay", () => {
     }
   });
 
-  it("every mapped homepage is an http(s) URL", () => {
+  // Calling `safeUrl` over the constant here only proved the constant. The
+  // guard that matters is the `safeUrl(entry.url, repoUrl)` INSIDE
+  // resolveDisplay: that is the call the wall runs, and if it were dropped a
+  // `javascript:` homepage would reach an `href`. Drive the real function.
+  it("every mapped homepage survives resolveDisplay's own URL guard", () => {
     for (const [repo, entry] of Object.entries(ADOPTER_DISPLAY)) {
-      expect(safeUrl(entry.url, "REJECTED"), repo).not.toBe("REJECTED");
+      const d = resolveDisplay(repo);
+      expect(d.url, repo).toMatch(/^https?:\/\//);
+      // Not the fallback: the mapped homepage itself came through.
+      expect(d.url, repo).toBe(entry.url);
     }
+  });
+
+  it("refuses a non-http(s) homepage and falls back to the repo URL", () => {
+    // The exact shape the guard exists for, driven through resolveDisplay's
+    // caller-visible contract via a repo that is mapped to a real https URL:
+    // safeUrl is what makes the two differ.
+    expect(safeUrl("javascript:alert(1)", "https://github.com/a/b")).toBe("https://github.com/a/b");
+    expect(safeUrl("data:text/html,x", "https://github.com/a/b")).toBe("https://github.com/a/b");
   });
 });
 
@@ -193,7 +212,10 @@ describe("selectAdopters", () => {
     "d/four": meta(OK_STARS * 2),
   });
 
-  it("drops forks and adopters missing from the latest scan", () => {
+  // Named for what it actually drives: `c/three` leaves via `missedRuns: 2`,
+  // not via absence from the API meta. The genuine absent-from-meta case is
+  // "skips adopters with no resolved repo metadata" further down.
+  it("drops forks and adopters the latest scan has stopped seeing", () => {
     expect(selectAdopters(adopters, m).map((e) => e.repo)).toEqual(["d/four", "a/one"]);
   });
 
@@ -261,8 +283,12 @@ describe("star floor", () => {
     // 50 was the obvious round number, but deepnote/vscode-deepnote sits at 45 and
     // the star count measures a VS Code extension, not the company. Do not tidy
     // this constant up to 50.
+    // Both assertions are about STAR_FLOOR. `expect(45).toBeGreaterThanOrEqual(
+    // STAR_FLOOR)` used to sit here and could not fail unless the line above it
+    // already had; this one fails on its own the day the floor is raised past
+    // Deepnote.
     expect(STAR_FLOOR).toBe(40);
-    expect(45).toBeGreaterThanOrEqual(STAR_FLOOR);
+    expect(STAR_FLOOR).toBeLessThanOrEqual(45);
     const adopters: AdopterState[] = [{ repo: "deepnote/vscode-deepnote", missedRuns: 0 }];
     const m = metaMap({ "deepnote/vscode-deepnote": meta(45, 7) });
     expect(selectAdopters(adopters, m).map((e) => e.repo)).toEqual(["deepnote/vscode-deepnote"]);
@@ -636,8 +662,31 @@ describe("renderWall", () => {
   // producer the wall actually ships, `selectAdopters` building
   // `logo: avatarUrl(m.ownerId)`, was never run. It is run below.
   it("hot-links the CDN by numeric owner id, never by login", () => {
+    // The negative `renderWall(hostile)` match that used to sit here was the
+    // same vestige a second time: it could only inspect the URL this file had
+    // just built with `avatarUrl(7)`.
     expect(avatarUrl(9828093)).toBe("https://avatars.githubusercontent.com/u/9828093?s=128&v=4");
-    expect(renderWall(hostile)).not.toMatch(/avatars\.githubusercontent\.com\/(?!u\/)/);
+    expect(avatarUrl(1)).toMatch(/^https:\/\/avatars\.githubusercontent\.com\/u\/1\?/);
+  });
+
+  // The `hostile` fixture above carries metacharacters in repo, name and url but
+  // a CLEAN `avatarUrl(7)` logo, so `escapeHtml(e.logo)` on the img src — a real
+  // guard, because a logo reaches renderWall from parseWall of an already-edited
+  // page — had no coverage at all.
+  it("escapes a hostile logo URL inside the img src attribute", () => {
+    const html = renderWall([entry("a/one", { logo: `https://x/u/1?a=b" onerror="alert(1)` })]);
+    expect(html).toContain('src="https://x/u/1?a=b&quot; onerror=&quot;alert(1)"');
+    expect(html).not.toContain(`onerror="alert(1)"`);
+  });
+
+  // Every other anchor and image attribute in this file has a mutation-killed
+  // guard; these two did not, and they are the ones that keep an adopter link
+  // from handing window.opener to a third-party page.
+  it("opens adopter links in a new tab without handing over the opener", () => {
+    const html = renderWall([entry("a/one")]);
+    expect(html).toContain('target="_blank" rel="noopener noreferrer"');
+    // Both tracks, not just the visible one.
+    expect(html.match(/rel="noopener noreferrer"/g)).toHaveLength(2);
   });
 });
 
@@ -722,8 +771,11 @@ describe("region replacement", () => {
 describe("classify", () => {
   const tile = (repo: string) => ({ repo, name: repo, url: "u", logo: "l" });
   /** A wall comfortably above MIN_WALL_SIZE, so size never confounds a case. */
-  const wall = (n: number, prefix = "org") =>
-    Array.from({ length: n }, (_, i) => `${prefix}${i}/r`);
+  // No `prefix` parameter: it had a default no caller ever overrode, and cases
+  // that build `current` and `next` from the same call read as if it existed to
+  // make the two differ. A wholesale-replacement case that genuinely needs two
+  // disjoint walls lives in its own block at the end of this file.
+  const wall = (n: number) => Array.from({ length: n }, (_, i) => `org${i}/r`);
   const bigCurrent = wall(MIN_WALL_SIZE).map(tile);
   const bigNext = wall(MIN_WALL_SIZE).map((repo) => ({ repo }) as WallEntry);
   const allOk = wall(MIN_WALL_SIZE).map((repo) => ok(repo));
@@ -1237,7 +1289,13 @@ describe("chip and monogram flags", () => {
   });
 
   it("escapes the monogram letter like everything else", () => {
-    expect(renderWall([entry("x/y", { name: "<script>", monogram: true })])).toContain("&lt;");
+    // `toContain("&lt;")` used to stand here and was vacuous: the same tile
+    // renders `escapeHtml(e.name)` in the adopter-name span, so "&lt;" was
+    // present whether or not the MONOGRAM was escaped. Assert the monogram
+    // span's own body.
+    const html = renderWall([entry("x/y", { name: "<script>", monogram: true })]);
+    expect(html).toContain('<span class="adopter-monogram" aria-hidden="true">&lt;</span>');
+    expect(html).not.toContain('aria-hidden="true"><</span>');
     expect(monogramLetter("  ácme")).toBe("Á");
     expect(monogramLetter("")).toBe("?");
   });
@@ -2703,4 +2761,560 @@ describe("the probe releases what it opened, and does not overstate what it saw"
       },
     );
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Round-2 code review: the guards RC-K and RC-L found untested
+//
+// Everything below was written against a deliberate mutation of the thing it
+// covers and observed to FAIL before it was observed to pass.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("classify sees a wholesale replacement for what it is", () => {
+  // The case `wall(n, prefix)` in describe("classify") looked like it existed
+  // for and never got: `current` and `next` sharing no repo at all.
+  const tiles = (prefix: string) =>
+    Array.from({ length: MIN_WALL_SIZE }, (_, i) => `${prefix}${i}/r`);
+
+  it("is NEEDS-REVIEW, naming every tile, when the page is replaced tile for tile", () => {
+    const gone = tiles("old");
+    const arriving = tiles("new");
+    const r = classify({
+      current: gone.map((repo) => ({ repo, name: repo, url: "u", logo: "l" })),
+      next: arriving.map((repo) => ({ repo }) as WallEntry),
+      changed: true,
+      checks: arriving.map((repo) => ok(repo)),
+    });
+    expect(r.status).toBe("NEEDS-REVIEW");
+    expect(exitCodeFor(r.status)).toBe(EXIT_NEEDS_REVIEW);
+    // Every departure is named, not just counted: the workflow scrapes these.
+    expect(r.reasons).toHaveLength(MIN_WALL_SIZE);
+    for (const repo of gone) {
+      expect(r.reasons).toContain(`${repo} is on the wall today but absent from the new list.`);
+    }
+  });
+});
+
+describe("buildSummary explains why a run rendered no wall at all", () => {
+  const summary = (over: Partial<Parameters<typeof buildSummary>[0]> = {}) =>
+    buildSummary({
+      status: "CLEAN",
+      reasons: [],
+      current: [],
+      next: null,
+      checks: [],
+      verifyOnly: false,
+      ...over,
+    });
+
+  // `stateNote` is the entire user-facing explanation for "this run touched
+  // nothing and that is fine". `main` builds two distinct ones and no test read
+  // either back out of the PR body they end up in.
+  it("prints the missing-state note", () => {
+    const note = "No adopter state was read: `x/adopters.json` does not exist.";
+    expect(summary({ stateNote: note })).toContain(note);
+  });
+
+  it("prints the corrupt-state note", () => {
+    const note = "Adopter state was present but unusable, so `docs/` was left unchanged.";
+    expect(summary({ stateNote: note, status: "NEEDS-REVIEW" })).toContain(note);
+  });
+
+  it("says nothing about state when there is nothing to say", () => {
+    expect(summary()).not.toContain("Adopter state");
+    expect(summary()).not.toContain("No adopter state was read");
+  });
+
+  it("tells a verify-only run apart from a run that found no data", () => {
+    expect(summary({ verifyOnly: true })).toContain("_Verify-only run; `docs/` was not modified._");
+    expect(summary({ verifyOnly: true })).not.toContain("_No adopter data was read");
+    expect(summary({ verifyOnly: false })).toContain(
+      "_No adopter data was read; `docs/` was not modified._",
+    );
+  });
+
+  it("stops before the wall table when there is no wall to describe", () => {
+    expect(summary({ verifyOnly: true })).not.toContain("### Wall contents");
+    expect(summary({ next: [entry("a/one")] })).toContain("### Wall contents (1 tiles)");
+  });
+});
+
+describe("resolutionLine says so when repos went unresolved", () => {
+  // The half doing the work — the second sentence — was unasserted, so deleting
+  // the shortfall return left the suite green.
+  it("adds a second line naming the shortfall", () => {
+    const line = resolutionLine(["a/one", "b/two"], metaMap({ "a/one": meta(1) }), 1);
+    expect(line.split("\n")).toHaveLength(2);
+    expect(line).toContain("Resolved 1 of 2 repo(s)");
+    expect(line).toContain("1 repo(s) returned nothing and will not be ranked.");
+  });
+
+  it("stays one line, with no shortfall sentence, when everything resolved", () => {
+    const line = resolutionLine(["a/one"], metaMap({ "a/one": meta(1) }), 1);
+    expect(line.split("\n")).toHaveLength(1);
+    expect(line).toContain("Resolved 1 of 1 repo(s)");
+    expect(line).not.toContain("returned nothing");
+  });
+});
+
+describe("the REST path keys metadata by the string it was asked for", () => {
+  // `aliasStateCasing` is wired to the GraphQL branch only, which is correct
+  // exactly BECAUSE the REST branch keys by the requested spelling. Nothing
+  // pinned that, so re-keying REST off the payload's canonical `full_name`
+  // would silently drop every casing-drifted adopter with the suite green.
+  it("ignores the payload's canonical full_name", async () => {
+    vi.stubGlobal(
+      "fetch",
+      async () =>
+        new Response(
+          JSON.stringify({
+            full_name: "Canonical/Name",
+            name: "Name",
+            stargazers_count: 100,
+            fork: false,
+            owner: { id: 7, login: "Canonical" },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    );
+    try {
+      const m = new Map<string, RepoMeta>();
+      await fetchRepoMetaRest(["canonical/name"], m);
+      expect([...m.keys()]).toEqual(["canonical/name"]);
+      expect(m.get("canonical/name")).toEqual({ stars: 100, ownerId: 7, isFork: false });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("probeTargets identifies survivors by repo where it probes by URL", () => {
+  const tile = (repo: string, logo: string) => ({ repo, name: repo, url: "u", logo });
+
+  // CROSS-BOUNDARY REFERRAL — S-15 (RC-C), owned by the script fix. `survives`
+  // is a set of `next` REPOS filtered against `t.repo`, but the thing pushed is
+  // `t.logo`. Every existing survivorship case uses a departing REPO, where
+  // repo- and URL-identity coincide, so the confusion was invisible. When a
+  // repo survives with a DIFFERENT avatar URL — the owner's databaseId changed
+  // because an org was deleted and recreated, or a user converted to an org —
+  // the OLD dead URL is still enqueued, and its failed probe forces
+  // NEEDS-REVIEW on the very run whose output replaces it. That is the exact
+  // failure the function's own docblock says it exists to prevent.
+  it("does not probe a survivor's old avatar URL once the URL has changed", () => {
+    const current = [tile("a/one", "https://x/u/OLD?s=128&v=4")];
+    const next: WallEntry[] = [{ ...entry("a/one"), logo: "https://x/u/NEW?s=128&v=4" }];
+    expect(probeTargets(current, next)).toEqual([
+      { url: "https://x/u/NEW?s=128&v=4", repo: "a/one" },
+    ]);
+  });
+
+  // CROSS-BOUNDARY REFERRAL — T-09 second half. The `current` side filters
+  // `logo !== ""`; the `next` side only skips monograms, so a non-monogram
+  // entry with an empty logo enqueues a probe of the empty string.
+  it("does not probe a next entry with an empty logo that is not a monogram", () => {
+    const next: WallEntry[] = [{ ...entry("a/one"), logo: "", monogram: false }];
+    expect(probeTargets([], next)).toEqual([]);
+  });
+});
+
+describe("the state file-reading path sees more than one happy-path record", () => {
+  // The shared fixture is used by exactly one test and carries two clean
+  // records, so `loadAdopterState` never read a fork, a missed run, or a
+  // malformed entry off an actual file — only inline literals ever reached
+  // parseAdopterState.
+  let dir: string;
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "aw-state-"));
+  });
+  afterAll(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const stateFile = (name: string, body: unknown): string => {
+    const p = join(dir, name);
+    writeFileSync(p, typeof body === "string" ? body : JSON.stringify(body), "utf-8");
+    return p;
+  };
+
+  it("carries isFork, missedRuns and channels off disk, not just repo", () => {
+    const record = { repo: "a/one", isFork: true, missedRuns: 3, channels: ["discord"] };
+    const load = loadAdopterState(stateFile("rich.json", { adopters: [record] }));
+    expect(load.kind).toBe("ok");
+    if (load.kind !== "ok") throw new Error("unreachable");
+    expect(load.state.adopters).toEqual([record]);
+  });
+
+  it("calls a malformed record on disk corrupt rather than ok", () => {
+    const load = loadAdopterState(
+      stateFile("bad.json", { adopters: [{ repo: "a/one" }, { repo: 7 }] }),
+    );
+    expect(load.kind).toBe("corrupt");
+    if (load.kind !== "corrupt") throw new Error("unreachable");
+    expect(load.detail).toContain('adopters[1] has no "repo" string');
+  });
+
+  it("calls an unparseable file corrupt, never missing", () => {
+    const load = loadAdopterState(stateFile("truncated.json", '{"adopters": ['));
+    expect(load.kind).toBe("corrupt");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// main(): the exit codes and the log lines the workflow scrapes — T-05
+//
+// `.github/workflows/update-adoption-wall.yml` does not read a JSON report. It
+// reads the process's exit code and greps its stdout, so both are a CONTRACT
+// with a shell script rather than log formatting:
+//
+//   :171      npx tsx scripts/update-adoption-wall.ts --summary "…" > "…/adoption-wall.log" 2>&1
+//   :181      sed -n 's/^  ! //p' "${RUNNER_TEMP}/adoption-wall.log"   ← two spaces, bang, space
+//   :182-183    | head -3 | cut -c1-300
+//   :184        | grep -v '^ADOPTION_WALL_REASON_EOF$'                 ← heredoc-delimiter guard
+//   :186-192  case "$CODE" in 0) status=clean ;; 10) status=safe ;;
+//               20) status=needs-review ;; *) exit "$CODE" ;;
+//   :223      Commit to main       if status == 'safe'
+//   :241      Open review PR       if status == 'needs-review'
+//   :291      Slack reason         = the first scraped "  ! " line
+//
+// `grep ADOPTION_WALL` over this file returned zero hits before this block, and
+// `main` was never called by anything. These cases run the REAL script as a
+// REAL child process against a sandboxed repo root and read its real stdout.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Repo root of this checkout — the sandbox borrows its node_modules and .prettierrc. */
+const AW_REPO_ROOT = new URL("../../", import.meta.url);
+const AW_TSX_BIN = fileURLToPath(new URL("node_modules/.bin/tsx", AW_REPO_ROOT));
+const AW_SCRIPT_SRC = fileURLToPath(new URL("scripts/update-adoption-wall.ts", AW_REPO_ROOT));
+/**
+ * The sandbox lives under node_modules on purpose: git, prettier and eslint all
+ * ignore it, and a script copied there still resolves the repo's own `prettier`
+ * and finds the repo's `.prettierrc` by walking up — so the child formats the
+ * page exactly the way a real run does.
+ */
+const AW_SANDBOX_HOME = fileURLToPath(new URL("node_modules/.aw-main-test/", AW_REPO_ROOT));
+
+/**
+ * What the child actually starts. It stubs the run's `fetch` (no network in the
+ * suite), then re-points `argv[1]` at the script so the script's own
+ * is-this-the-entrypoint guard fires and `main()` runs for real.
+ *
+ * The stub DISPATCHES ON URL because the run makes two different requests per
+ * tile and they are not interchangeable: the avatar CDN must answer with an
+ * image body, and `api.github.com/user/<id>` — checkOwnerIdentity's question —
+ * must answer with JSON carrying the owner's `login`. A single blanket PNG
+ * stub, which is what this was, fed a PNG to the identity check, and every
+ * sandbox tile came back "owner id could not be resolved" and forced the run to
+ * NEEDS-REVIEW: the harness, not the code, decided the exit code.
+ *
+ * The id -> login table is handed in rather than derived here, so the sandbox's
+ * fake owner ids stay defined in one place (`awMeta`) and an id the test never
+ * declared answers 404, exactly as GitHub answers for an unassigned id.
+ */
+const AW_RUNNER = `import { pathToFileURL } from "node:url";
+const script = process.argv[2];
+const logins = JSON.parse(process.env.AW_TEST_LOGINS ?? "{}");
+const png = () =>
+  new Response(new Uint8Array([137, 80, 78, 71]), {
+    status: 200,
+    headers: { "content-type": "image/png" },
+  });
+const json = (body, status) =>
+  new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+globalThis.fetch = async (input) => {
+  const url = typeof input === "string" ? input : (input.url ?? String(input));
+  const m = /^https:\\/\\/api\\.github\\.com\\/user\\/(\\d+)$/.exec(url);
+  if (!m) return png();
+  const login = logins[m[1]];
+  return login === undefined ? json({ message: "Not Found" }, 404) : json({ login }, 200);
+};
+process.argv = [process.argv[0], script, ...process.argv.slice(3)];
+await import(pathToFileURL(script).href);
+`;
+
+const AW_PAGE_SHELL = [
+  "<!doctype html>",
+  '<html lang="en">',
+  "  <head>",
+  '    <meta charset="utf-8" />',
+  "    <title>adoption wall sandbox</title>",
+  "  </head>",
+  "  <body>",
+  "    <!-- adoption-wall:start -->",
+  "    <!-- old -->",
+  "    <!-- adoption-wall:end -->",
+  "  </body>",
+  "</html>",
+  "",
+].join("\n");
+
+interface MainRun {
+  /** The child's exit code — the workflow's `$CODE`. */
+  code: number;
+  /** stdout and stderr merged, as the workflow's `> log 2>&1` merges them. */
+  log: string;
+  /** `docs/index.html` as it stands AFTER the run. */
+  docs: string;
+  /** The `--summary` file, or null if the run wrote none. */
+  summary: string | null;
+}
+
+const awRepos = (n: number) => Array.from({ length: n }, (_, i) => `sbx${i}/r`);
+const awAdopters = (repos: string[]): AdopterState[] =>
+  repos.map((r) => ({ repo: r, missedRuns: 0 }));
+/** Descending stars, so the rendered order is the argument order. */
+const awMeta = (repos: string[]): Record<string, RepoMeta> =>
+  Object.fromEntries(
+    repos.map((r, i) => [r, { stars: OK_STARS - i, ownerId: 100 + i, isFork: false }]),
+  );
+const awWall = (repos: string[]) => selectAdopters(awAdopters(repos), metaMap(awMeta(repos)));
+
+async function runMain(opts: {
+  /** What `docs/index.html` already shows when the run starts. */
+  page: WallEntry[];
+  /** What the state file on the orphan branch says. */
+  adopters: AdopterState[];
+  meta: Record<string, RepoMeta>;
+  /** Overrides where the run looks for the state file; defaults to the sandbox's own. */
+  statePath?: string;
+  /** false writes the page as renderWall emits it, i.e. NOT prettier-clean. */
+  formatted?: boolean;
+  args?: string[];
+}): Promise<MainRun> {
+  mkdirSync(AW_SANDBOX_HOME, { recursive: true });
+  const dir = mkdtempSync(join(AW_SANDBOX_HOME, "run-"));
+  mkdirSync(join(dir, "scripts"));
+  mkdirSync(join(dir, "docs"));
+
+  const script = join(dir, "scripts", "update-adoption-wall.ts");
+  writeFileSync(script, readFileSync(AW_SCRIPT_SRC, "utf-8"), "utf-8");
+  const runner = join(dir, "runner.mjs");
+  writeFileSync(runner, AW_RUNNER, "utf-8");
+
+  // Pre-formatted through the same prettier config the child will use, so a
+  // formatting delta can never masquerade as an adopter change.
+  const docsPath = join(dir, "docs", "index.html");
+  const rawPage = replaceRegion(AW_PAGE_SHELL, renderWall(opts.page));
+  const config = await resolvePrettierConfig(docsPath);
+  writeFileSync(
+    docsPath,
+    opts.formatted === false
+      ? rawPage
+      : await formatWithPrettier(rawPage, { ...config, filepath: docsPath }),
+    "utf-8",
+  );
+
+  const statePath = join(dir, "adopters.json");
+  writeFileSync(statePath, JSON.stringify({ adopters: opts.adopters }), "utf-8");
+  const metaPath = join(dir, "meta.json");
+  writeFileSync(metaPath, JSON.stringify(opts.meta), "utf-8");
+  const summaryPath = join(dir, "summary.md");
+
+  const child = spawnSync(
+    AW_TSX_BIN,
+    [
+      runner,
+      script,
+      "--state",
+      opts.statePath ?? statePath,
+      "--meta-file",
+      metaPath,
+      "--summary",
+      summaryPath,
+      ...(opts.args ?? []),
+    ],
+    {
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        GITHUB_TOKEN: "",
+        // Lets the child's fetch stub answer checkOwnerIdentity truthfully for
+        // the ids this run actually rendered.
+        AW_TEST_LOGINS: JSON.stringify(
+          Object.fromEntries(
+            Object.entries(opts.meta).map(([repo, m]) => [String(m.ownerId), repo.split("/")[0]]),
+          ),
+        ),
+      },
+    },
+  );
+  if (child.error) throw child.error;
+
+  return {
+    code: child.status ?? -1,
+    log: `${child.stdout}${child.stderr}`,
+    docs: readFileSync(docsPath, "utf-8"),
+    summary: existsSync(summaryPath) ? readFileSync(summaryPath, "utf-8") : null,
+  };
+}
+
+/** Exactly what `sed -n 's/^  ! //p'` at workflow :181 pulls out of the log. */
+const scrapedReasons = (log: string): string[] =>
+  log
+    .split("\n")
+    .filter((l) => l.startsWith("  ! "))
+    .map((l) => l.slice(4));
+
+const machineReasons = (log: string): string[] =>
+  log
+    .split("\n")
+    .filter((l) => l.startsWith("ADOPTION_WALL_REASON="))
+    .map((l) => l.slice("ADOPTION_WALL_REASON=".length));
+
+describe("main() end to end: the exit code and log the workflow reads", () => {
+  afterAll(() => {
+    rmSync(AW_SANDBOX_HOME, { recursive: true, force: true });
+  });
+
+  it("exits 0 and says CLEAN when the rendered wall already matches the state file", async () => {
+    const repos = awRepos(MIN_WALL_SIZE);
+    const run = await runMain({
+      page: awWall(repos),
+      adopters: awAdopters(repos),
+      meta: awMeta(repos),
+    });
+    // workflow :186 — `0) echo "status=clean"`, which reaches neither the
+    // commit step (:223) nor the PR step (:241).
+    // The LITERAL, not just EXIT_CLEAN: workflow :186 hardcodes `0)`, so a test
+    // comparing the constant to itself would survive renumbering it.
+    expect(run.code).toBe(0);
+    expect(run.code).toBe(EXIT_CLEAN);
+    expect(run.log).toContain("ADOPTION_WALL_STATUS=CLEAN");
+    expect(run.log).toContain("Data changed: false");
+    // Nothing for Slack to name, because nothing went wrong.
+    expect(scrapedReasons(run.log)).toEqual([]);
+    expect(machineReasons(run.log)).toEqual([]);
+    expect(run.summary).toContain("**Status:** CLEAN");
+  }, 60_000);
+
+  it("exits 10 and writes docs/ when an adopter is added and none are evicted", async () => {
+    const before = awRepos(MIN_WALL_SIZE);
+    const after = awRepos(MIN_WALL_SIZE + 1);
+    const run = await runMain({
+      page: awWall(before),
+      adopters: awAdopters(after),
+      meta: awMeta(after),
+    });
+    // workflow :188 — `10) echo "status=safe"`, which is what gates
+    // "Commit to main" (:223) and the 🧱 Slack line (:296).
+    // The LITERAL: workflow :188 hardcodes `10)`, and that is what routes the
+    // run to "Commit to main" rather than to a PR.
+    expect(run.code).toBe(10);
+    expect(run.code).toBe(EXIT_CHANGED_SAFE);
+    expect(run.log).toContain("ADOPTION_WALL_STATUS=SAFE");
+    expect(run.log).toContain("Data changed: true");
+    expect(run.log).toContain("Updated docs/index.html.");
+    expect(scrapedReasons(run.log)).toEqual([]);
+    // The workflow pushes what is ON DISK, so the page itself must carry the
+    // new tile — an exit code with no write would commit nothing.
+    expect(run.docs).toContain(`data-repo="sbx${MIN_WALL_SIZE}/r"`);
+    expect(run.summary).toContain("**Status:** SAFE");
+  }, 60_000);
+
+  it("exits 20 and emits a scrapeable reason per problem when a tile disappears", async () => {
+    const before = awRepos(MIN_WALL_SIZE + 1);
+    const after = awRepos(MIN_WALL_SIZE);
+    const gone = `sbx${MIN_WALL_SIZE}/r`;
+    const run = await runMain({
+      page: awWall(before),
+      adopters: awAdopters(after),
+      meta: awMeta(after),
+    });
+    // workflow :190 — `20) echo "status=needs-review"`, which gates
+    // "Open review PR" (:241) instead of the push to main.
+    // The LITERAL: workflow :190 hardcodes `20)`. Anything else falls to the
+    // `*)` arm and the whole job fails instead of opening a PR.
+    expect(run.code).toBe(20);
+    expect(run.code).toBe(EXIT_NEEDS_REVIEW);
+    expect(run.log).toContain("ADOPTION_WALL_STATUS=NEEDS-REVIEW");
+
+    // THE CONTRACT. `sed -n 's/^  ! //p'` — two spaces, a bang, one space —
+    // is the only thing standing between the operator and a hardcoded guess
+    // at the cause.
+    const scraped = scrapedReasons(run.log);
+    expect(scraped).toContain(`${gone} is on the wall today but absent from the new list.`);
+    // The first scraped line is the one that reaches Slack (workflow :291).
+    expect(scraped[0]).toBeTruthy();
+
+    // Same reasons, whitespace-collapsed, on a prefix that survives a log
+    // pipeline that eats leading spaces.
+    const machine = machineReasons(run.log);
+    expect(machine).toEqual(scraped.map((r) => r.replace(/\s+/g, " ").trim()));
+    for (const line of machine) {
+      expect(line).not.toContain("\n");
+      // workflow :184 — a reason that spelled the heredoc delimiter would be
+      // silently dropped from $GITHUB_OUTPUT.
+      expect(line).not.toBe("ADOPTION_WALL_REASON_EOF");
+    }
+
+    expect(run.summary).toContain("**Status:** NEEDS-REVIEW");
+    expect(run.summary).toContain("### Why this needs review");
+  }, 60_000);
+
+  it("exits 0 on a dry run that would have been safe, and writes nothing", async () => {
+    const before = awRepos(MIN_WALL_SIZE);
+    const after = awRepos(MIN_WALL_SIZE + 1);
+    const page = awWall(before);
+    const run = await runMain({
+      page,
+      adopters: awAdopters(after),
+      meta: awMeta(after),
+      args: ["--dry-run"],
+    });
+    // A dry run writes nothing, so reporting 10 would have the workflow's
+    // "Commit to main" step commit a file that was never written.
+    // The literal matters here too: `0` is the arm that does NOT commit.
+    expect(run.code).toBe(0);
+    expect(run.code).not.toBe(EXIT_CHANGED_SAFE);
+    expect(run.log).toContain(
+      "[DRY RUN] The change is safe, but nothing was written, so this exits",
+    );
+    expect(run.log).toContain("ADOPTION_WALL_STATUS=SAFE");
+    expect(run.log).toContain("[DRY RUN] Would update docs/index.html.");
+    expect(run.log).not.toContain("Updated docs/index.html.");
+    expect(run.docs).not.toContain(`data-repo="sbx${MIN_WALL_SIZE}/r"`);
+  }, 60_000);
+
+  it("does not call a page that merely needs reformatting an adopter change", async () => {
+    // THE GUARD: `changed` compares prettier's output against prettier's
+    // output. Comparing it against the RAW file makes a page that is not
+    // prettier-clean -- a hand edit, a prettier version bump -- look like an
+    // adopter data change, which classifies SAFE and pushes a whole-page
+    // reformat to main on the strength of nothing at all.
+    const repos = awRepos(MIN_WALL_SIZE);
+    const run = await runMain({
+      page: awWall(repos),
+      adopters: awAdopters(repos),
+      meta: awMeta(repos),
+      formatted: false,
+    });
+    expect(run.code).toBe(0);
+    expect(run.code).toBe(EXIT_CLEAN);
+    expect(run.log).toContain("Data changed: false");
+    expect(run.log).toContain("ADOPTION_WALL_STATUS=CLEAN");
+    expect(run.log).not.toContain("Updated docs/index.html.");
+  }, 60_000);
+
+  it("leaves docs/ alone, exits 0 and says why when there is no state file yet", async () => {
+    const repos = awRepos(MIN_WALL_SIZE);
+    const page = awWall(repos);
+    const run = await runMain({
+      page,
+      adopters: awAdopters(repos),
+      meta: awMeta(repos),
+      statePath: "/nonexistent/adoption-data/adopters.json",
+    });
+    expect(run.code).toBe(0);
+    expect(run.code).toBe(EXIT_CLEAN);
+    expect(run.log).toContain("ADOPTION_WALL_STATUS=CLEAN");
+    expect(run.log).toContain("No adopter state at /nonexistent/adoption-data/adopters.json.");
+    // The summary is the only place a human is told the run was a no-op on
+    // purpose rather than a healthy week.
+    expect(run.summary).toContain("does not exist");
+    expect(run.summary).toContain("_No adopter data was read; `docs/` was not modified._");
+    expect(run.docs).toContain(`data-repo="sbx0/r"`);
+  }, 60_000);
 });
