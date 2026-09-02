@@ -954,7 +954,7 @@ describe("POST /v2/chat (journal)", () => {
     expect(entry!.path).toBe("/v2/chat");
     expect(entry!.response.status).toBe(200);
     expect(entry!.response.fixture).toBe(textFixture);
-    expect(entry!.body.model).toBe("command-r-plus");
+    expect(entry!.body!.model).toBe("command-r-plus");
   });
 });
 
@@ -1194,6 +1194,7 @@ function createDefaults(overrides: Partial<HandlerDefaults> = {}): HandlerDefaul
   return {
     latency: 0,
     chunkSize: 100,
+    replaySpeed: 1,
     logger: new Logger("silent"),
     ...overrides,
   };

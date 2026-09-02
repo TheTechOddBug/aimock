@@ -856,8 +856,8 @@ describe("POST /v1/responses (journal)", () => {
     });
 
     const entry = instance.journal.getLast();
-    expect(entry!.body.model).toBe("gpt-4");
-    expect(entry!.body.messages).toEqual([
+    expect(entry!.body!.model).toBe("gpt-4");
+    expect(entry!.body!.messages).toEqual([
       { role: "system", content: "Be nice" },
       { role: "user", content: "hello" },
     ]);
@@ -1248,11 +1248,16 @@ function createMockRes(): http.ServerResponse {
     headers[name.toLowerCase()] = String(value);
     return res;
   };
-  res.writeHead = (statusCode: number, hdrs?: Record<string, string>) => {
+  res.writeHead = (
+    statusCode: number,
+    arg1?: string | http.OutgoingHttpHeaders | http.OutgoingHttpHeader[],
+    arg2?: http.OutgoingHttpHeaders | http.OutgoingHttpHeader[],
+  ) => {
     (res as { statusCode: number }).statusCode = statusCode;
-    if (hdrs) {
+    const hdrs = typeof arg1 === "string" ? arg2 : arg1;
+    if (hdrs && !Array.isArray(hdrs)) {
       for (const [k, v] of Object.entries(hdrs)) {
-        headers[k.toLowerCase()] = v;
+        headers[k.toLowerCase()] = String(v);
       }
     }
     return res;
@@ -1276,7 +1281,7 @@ describe("handleResponses (direct call — ?? fallback branches)", () => {
   it("uses fallback POST and /v1/responses when req.method and req.url are undefined", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1308,7 +1313,7 @@ describe("handleResponses (direct call — ?? fallback branches)", () => {
   it("uses fallback method/path on malformed JSON with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1329,7 +1334,7 @@ describe("handleResponses (direct call — ?? fallback branches)", () => {
   it("uses fallback method/path on no-match with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1361,7 +1366,7 @@ describe("handleResponses (direct call — ?? fallback branches)", () => {
   it("uses fallback method/path for error fixture with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1393,7 +1398,7 @@ describe("handleResponses (direct call — ?? fallback branches)", () => {
   it("uses fallback for streaming text with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1426,7 +1431,7 @@ describe("handleResponses (direct call — ?? fallback branches)", () => {
   it("uses fallback for streaming tool call with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1459,7 +1464,7 @@ describe("handleResponses (direct call — ?? fallback branches)", () => {
   it("uses fallback for unknown response type with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1491,7 +1496,7 @@ describe("handleResponses (direct call — ?? fallback branches)", () => {
   it("uses fallback for strict mode no-match with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger, strict: true };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger, strict: true };
 
     const mockReq = {
       method: undefined,
@@ -1605,7 +1610,7 @@ describe("Bug 2: output_text includes annotations: []", () => {
     const events = buildTextStreamEvents("Hello", "gpt-4", 100);
     const partAdded = events.find((e) => e.type === "response.content_part.added");
     expect(partAdded).toBeDefined();
-    const part = (partAdded as { part: { type: string; annotations: unknown[] } }).part;
+    const part = partAdded!.part as { type: string; annotations: unknown[] };
     expect(part.type).toBe("output_text");
     expect(part.annotations).toEqual([]);
   });
@@ -1614,8 +1619,7 @@ describe("Bug 2: output_text includes annotations: []", () => {
     const events = buildTextStreamEvents("Hello", "gpt-4", 100);
     const partDone = events.find((e) => e.type === "response.content_part.done");
     expect(partDone).toBeDefined();
-    const part = (partDone as { part: { type: string; text: string; annotations: unknown[] } })
-      .part;
+    const part = partDone!.part as { type: string; text: string; annotations: unknown[] };
     expect(part.type).toBe("output_text");
     expect(part.text).toBe("Hello");
     expect(part.annotations).toEqual([]);
@@ -1636,10 +1640,10 @@ describe("Bug 2: output_text includes annotations: []", () => {
     const events = buildTextStreamEvents("Hello", "gpt-4", 100);
     const completed = events.find((e) => e.type === "response.completed");
     expect(completed).toBeDefined();
-    const response = completed!.response as { output: { content: { annotations: unknown[] }[] }[] };
-    const msgOutput = response.output.find(
-      (o: { type?: string }) => (o as { type: string }).type === "message",
-    ) as { content: { annotations: unknown[] }[] };
+    const response = completed!.response as {
+      output: { type?: string; content: { annotations: unknown[] }[] }[];
+    };
+    const msgOutput = response.output.find((o) => o.type === "message")!;
     expect(msgOutput).toBeDefined();
     expect(msgOutput.content[0].annotations).toEqual([]);
   });
@@ -1669,7 +1673,7 @@ describe("Bug 2: output_text includes annotations: []", () => {
     );
     const partAdded = events.find((e) => e.type === "response.content_part.added");
     expect(partAdded).toBeDefined();
-    const part = (partAdded as { part: { annotations: unknown[] } }).part;
+    const part = partAdded!.part as { annotations: unknown[] };
     expect(part.annotations).toEqual([]);
   });
 });
@@ -2535,7 +2539,7 @@ describe("handleResponses debug logging", () => {
       debugMessages.push(String(args[0]));
       origDebug(...args);
     };
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: "POST",
@@ -2570,7 +2574,7 @@ describe("handleResponses debug logging", () => {
       debugMessages.push(String(args[0]));
       origDebug(...args);
     };
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: "POST",

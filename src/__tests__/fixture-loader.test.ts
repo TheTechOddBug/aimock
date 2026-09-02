@@ -31,6 +31,15 @@ vi.mock("node:fs", async (importOriginal) => {
   };
 });
 
+/**
+ * `vi.spyOn(console, "warn")` replaces the method in place, so the only handle
+ * these afterEach hooks have is `console.warn` itself. Narrow it through a type
+ * guard rather than asserting across the overloaded `Console["warn"]` signature.
+ */
+function isRestorableSpy(fn: unknown): fn is { mockRestore: () => void } {
+  return typeof fn === "function" && "mockRestore" in fn;
+}
+
 function makeTmpDir(): string {
   return mkdtempSync(join(tmpdir(), "fixture-loader-test-"));
 }
@@ -52,8 +61,9 @@ describe("loadFixtureFile", () => {
     // Restore console spies that individual tests create via vi.spyOn(console, "warn").
     // We cannot use vi.restoreAllMocks() here because the top-level vi.mock("node:fs")
     // overrides would also be wiped, breaking subsequent tests.
-    if ("mockRestore" in console.warn) {
-      (console.warn as ReturnType<typeof vi.spyOn>).mockRestore();
+    const warn: unknown = console.warn;
+    if (isRestorableSpy(warn)) {
+      warn.mockRestore();
     }
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -395,8 +405,9 @@ describe("loadFixturesFromDir", () => {
     // Restore console spies that individual tests create via vi.spyOn(console, "warn").
     // We cannot use vi.restoreAllMocks() here because the top-level vi.mock("node:fs")
     // overrides would also be wiped, breaking subsequent tests.
-    if ("mockRestore" in console.warn) {
-      (console.warn as ReturnType<typeof vi.spyOn>).mockRestore();
+    const warn: unknown = console.warn;
+    if (isRestorableSpy(warn)) {
+      warn.mockRestore();
     }
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -2055,7 +2066,7 @@ describe("auto-stringify JSON objects in fixture entries", () => {
     const fixture = entryToFixture(entry);
     const resp = fixture.response as ContentWithToolCallsResponse;
     expect(resp.content).toBe('{"summary":"done"}');
-    expect(resp.toolCalls[0].arguments).toBe('{"id":1}');
+    expect(resp.toolCalls![0].arguments).toBe('{"id":1}');
   });
 
   it("preserves ResponseOverrides fields through normalization", () => {
@@ -2177,7 +2188,7 @@ describe("auto-stringify JSON objects in fixture entries", () => {
     };
     // Serialize -> parse (same as writing JSON to disk and reading it back)
     const parsed = JSON.parse(JSON.stringify(fixtureData)) as { fixtures: FixtureFileEntry[] };
-    const fixtures = parsed.fixtures.map(entryToFixture);
+    const fixtures = parsed.fixtures.map((entry) => entryToFixture(entry));
 
     expect(fixtures).toHaveLength(2);
 

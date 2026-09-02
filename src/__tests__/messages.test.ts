@@ -760,8 +760,8 @@ describe("POST /v1/messages (journal)", () => {
     });
 
     const entry = instance.journal.getLast();
-    expect(entry!.body.model).toBe("claude-3-5-sonnet-20241022");
-    expect(entry!.body.messages).toEqual([
+    expect(entry!.body!.model).toBe("claude-3-5-sonnet-20241022");
+    expect(entry!.body!.messages).toEqual([
       { role: "system", content: "Be nice" },
       { role: "user", content: "hello" },
     ]);
@@ -1476,11 +1476,16 @@ function createMockRes(): http.ServerResponse {
     headers[name.toLowerCase()] = String(value);
     return res;
   };
-  res.writeHead = (statusCode: number, hdrs?: Record<string, string>) => {
+  res.writeHead = (
+    statusCode: number,
+    arg1?: string | http.OutgoingHttpHeaders | http.OutgoingHttpHeader[],
+    arg2?: http.OutgoingHttpHeaders | http.OutgoingHttpHeader[],
+  ) => {
     (res as { statusCode: number }).statusCode = statusCode;
-    if (hdrs) {
+    const hdrs = typeof arg1 === "string" ? arg2 : arg1;
+    if (hdrs && !Array.isArray(hdrs)) {
       for (const [k, v] of Object.entries(hdrs)) {
-        headers[k.toLowerCase()] = v;
+        headers[k.toLowerCase()] = String(v);
       }
     }
     return res;
@@ -1504,7 +1509,7 @@ describe("handleMessages (direct call — ?? fallback branches)", () => {
   it("uses fallback POST and /v1/messages when req.method and req.url are undefined", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1537,7 +1542,7 @@ describe("handleMessages (direct call — ?? fallback branches)", () => {
   it("uses fallback method/path on malformed JSON with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1558,7 +1563,7 @@ describe("handleMessages (direct call — ?? fallback branches)", () => {
   it("uses fallback method/path on no-match with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1591,7 +1596,7 @@ describe("handleMessages (direct call — ?? fallback branches)", () => {
   it("uses fallback for error fixture with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1624,7 +1629,7 @@ describe("handleMessages (direct call — ?? fallback branches)", () => {
   it("uses fallback for streaming text with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1658,7 +1663,7 @@ describe("handleMessages (direct call — ?? fallback branches)", () => {
   it("uses fallback for streaming tool call with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1692,7 +1697,7 @@ describe("handleMessages (direct call — ?? fallback branches)", () => {
   it("uses fallback for unknown response type with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -1725,7 +1730,7 @@ describe("handleMessages (direct call — ?? fallback branches)", () => {
   it("uses fallback for strict mode no-match with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger, strict: true };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger, strict: true };
 
     const mockReq = {
       method: undefined,

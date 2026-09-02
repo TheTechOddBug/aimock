@@ -120,7 +120,7 @@ describe("Vertex AI: generateContent (non-streaming)", () => {
 
     const entry = instance.journal.getLast();
     expect(entry).not.toBeNull();
-    expect(entry!.body.model).toBe("gemini-1.5-pro");
+    expect(entry!.body!.model).toBe("gemini-1.5-pro");
   });
 
   it("returns tool call response with functionCall parts", async () => {

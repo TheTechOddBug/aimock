@@ -79,8 +79,8 @@ describe("OpenAI Responses API — fixture block ordering (#274)", () => {
     );
     expect(fcAdded).toBeDefined();
     expect(msgAdded).toBeDefined();
-    expect((fcAdded as { output_index: number }).output_index).toBe(0);
-    expect((msgAdded as { output_index: number }).output_index).toBe(1);
+    expect(fcAdded!.output_index).toBe(0);
+    expect(msgAdded!.output_index).toBe(1);
 
     // The final completed.output array must lead with the function_call item.
     const completed = events.find((e) => e.type === "response.completed");
@@ -135,8 +135,8 @@ describe("OpenAI Responses API — fixture block ordering (#274)", () => {
         (e.item as { type: string })?.type === "function_call",
     );
     // Legacy hardcoding: message at index 0, function_call at index 1.
-    expect((msgAdded as { output_index: number }).output_index).toBe(0);
-    expect((fcAdded as { output_index: number }).output_index).toBe(1);
+    expect(msgAdded!.output_index).toBe(0);
+    expect(fcAdded!.output_index).toBe(1);
 
     const completed = events.find((e) => e.type === "response.completed");
     const output = (completed!.response as { output: Array<{ type: string }> }).output;

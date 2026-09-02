@@ -3,7 +3,7 @@ import * as http from "node:http";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AGUIEvent, AGUIRunAgentInput, AGUITokenUsage } from "../agui-types.js";
+import type { AGUIEvent, AGUIMessage, AGUIRunAgentInput, AGUITokenUsage } from "../agui-types.js";
 import { AGUIMock } from "../agui-mock.js";
 import {
   buildTextResponse,
@@ -257,9 +257,9 @@ describe("AGUIMock core", () => {
 
   it("6. messages snapshot", async () => {
     agui = new AGUIMock({ port: 0 });
-    const msgs = [
-      { role: "user", content: "hi" },
-      { role: "assistant", content: "hello" },
+    const msgs: AGUIMessage[] = [
+      { id: "m1", role: "user", content: "hi" },
+      { id: "m2", role: "assistant", content: "hello" },
     ];
     const events = buildMessagesSnapshot(msgs);
     agui.addFixture({
@@ -482,7 +482,7 @@ describe("AGUIMock builders", () => {
     expect(delta.map((e) => e.type)).toEqual(["RUN_STARTED", "STATE_DELTA", "RUN_FINISHED"]);
 
     // buildMessagesSnapshot
-    const msgs = buildMessagesSnapshot([{ role: "user", content: "hi" }]);
+    const msgs = buildMessagesSnapshot([{ id: "m1", role: "user", content: "hi" }]);
     expect(msgs.map((e) => e.type)).toEqual(["RUN_STARTED", "MESSAGES_SNAPSHOT", "RUN_FINISHED"]);
 
     // buildErrorResponse
@@ -1477,6 +1477,8 @@ describe("extractLastUserMessage", () => {
   it("returns plain string content verbatim", () => {
     expect(
       extractLastUserMessage({
+        threadId: "t1",
+        runId: "r1",
         messages: [{ id: "1", role: "user", content: "hello" }],
       }),
     ).toBe("hello");
@@ -1485,6 +1487,8 @@ describe("extractLastUserMessage", () => {
   it("returns text from a single-part array", () => {
     expect(
       extractLastUserMessage({
+        threadId: "t1",
+        runId: "r1",
         messages: [{ id: "1", role: "user", content: [{ type: "text", text: "hello" }] }],
       }),
     ).toBe("hello");
@@ -1493,6 +1497,8 @@ describe("extractLastUserMessage", () => {
   it("joins multiple text parts with a single space", () => {
     expect(
       extractLastUserMessage({
+        threadId: "t1",
+        runId: "r1",
         messages: [
           {
             id: "1",
@@ -1510,6 +1516,8 @@ describe("extractLastUserMessage", () => {
   it("extracts only text parts when mixed with non-text parts (e.g. file attachments)", () => {
     expect(
       extractLastUserMessage({
+        threadId: "t1",
+        runId: "r1",
         messages: [
           {
             id: "1",
@@ -1530,6 +1538,8 @@ describe("extractLastUserMessage", () => {
   it("returns empty string when content has no text parts", () => {
     expect(
       extractLastUserMessage({
+        threadId: "t1",
+        runId: "r1",
         messages: [
           {
             id: "1",
@@ -1549,6 +1559,8 @@ describe("extractLastUserMessage", () => {
   it("ignores non-text parts that happen to carry a 'text' field", () => {
     expect(
       extractLastUserMessage({
+        threadId: "t1",
+        runId: "r1",
         messages: [
           {
             id: "1",
@@ -1563,6 +1575,8 @@ describe("extractLastUserMessage", () => {
   it("returns the last user turn's text when multiple user turns exist", () => {
     expect(
       extractLastUserMessage({
+        threadId: "t1",
+        runId: "r1",
         messages: [
           { id: "1", role: "user", content: "first" },
           { id: "2", role: "assistant", content: "ack" },
@@ -1575,6 +1589,8 @@ describe("extractLastUserMessage", () => {
   it("skips non-user roles even when they have text content", () => {
     expect(
       extractLastUserMessage({
+        threadId: "t1",
+        runId: "r1",
         messages: [
           { id: "1", role: "user", content: "real user message" },
           { id: "2", role: "assistant", content: "assistant turn" },
@@ -1584,13 +1600,15 @@ describe("extractLastUserMessage", () => {
   });
 
   it("returns empty string for empty or missing messages", () => {
-    expect(extractLastUserMessage({ messages: [] })).toBe("");
+    expect(extractLastUserMessage({ threadId: "t1", runId: "r1", messages: [] })).toBe("");
     expect(extractLastUserMessage({} as AGUIRunAgentInput)).toBe("");
   });
 
   it("returns empty string when user message content is undefined", () => {
     expect(
       extractLastUserMessage({
+        threadId: "t1",
+        runId: "r1",
         messages: [{ id: "1", role: "user" }],
       }),
     ).toBe("");
@@ -1650,7 +1668,7 @@ describe("AGUIMock recorder — structured user content", () => {
           ],
         },
       ],
-    } as AGUIRunAgentInput);
+    });
     expect(resp.status).toBe(200);
 
     const files = fs.readdirSync(tmpDir);
@@ -1670,6 +1688,8 @@ describe("AGUIMock recorder — structured user content", () => {
     await agui.start();
 
     const resp = await post(agui.url, {
+      threadId: "t1",
+      runId: "r1",
       messages: [
         {
           id: "u1",
@@ -1682,13 +1702,15 @@ describe("AGUIMock recorder — structured user content", () => {
           ],
         },
       ],
-    } as AGUIRunAgentInput);
+    });
     expect(resp.status).toBe(200);
 
     const files = fs.readdirSync(tmpDir);
     expect(files.length).toBe(0);
 
     const resp2 = await post(agui.url, {
+      threadId: "t2",
+      runId: "r2",
       messages: [
         {
           id: "u2",
@@ -1701,7 +1723,7 @@ describe("AGUIMock recorder — structured user content", () => {
           ],
         },
       ],
-    } as AGUIRunAgentInput);
+    });
     expect(resp2.status).toBe(200);
   });
 });

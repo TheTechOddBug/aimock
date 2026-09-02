@@ -538,11 +538,11 @@ function createMockRes(): http.ServerResponse & { _status: number; _body: string
   }) as http.ServerResponse & { _status: number; _body: string };
   writable._status = 0;
   writable._body = "";
-  writable.writeHead = function (statusCode: number) {
+  writable.writeHead = function (this: typeof writable, statusCode: number) {
     this._status = statusCode;
     return this;
   } as unknown as typeof writable.writeHead;
-  writable.end = function (body?: string) {
+  writable.end = function (this: typeof writable, body?: string) {
     if (body) this._body = body;
     return this;
   } as unknown as typeof writable.end;

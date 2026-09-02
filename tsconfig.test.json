@@ -1,0 +1,11 @@
+{
+  "//": "Type coverage for the test tree. Extends the root project but drops rootDir, because tests legitimately import across into scripts/ (e.g. adoption-wall.test.ts -> scripts/update-adoption-wall.ts), which the root project's rootDir: \"src\" rejects with TS6059. Nothing is emitted from this project, so rootDir carries no meaning here.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "declaration": false,
+    "declarationMap": false
+  },
+  "include": ["src", "vitest.config.ts", "vitest.config.drift.ts"],
+  "exclude": ["node_modules", "dist"]
+}

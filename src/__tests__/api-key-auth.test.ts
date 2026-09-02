@@ -105,11 +105,12 @@ describe("API key HTTP boundary", () => {
       [{ match: { userMessage: "hello" }, response: { content: "ok" } }],
       { auth: { apiKeys: ["primary", "rotated"] } },
     );
-    for (const headers of [
+    const rejectedHeaderSets: Record<string, string>[] = [
       {},
       { Authorization: "Bearer wrong" },
       { Authorization: "Bearer primary", "X-Api-Key": "rotated" },
-    ]) {
+    ];
+    for (const headers of rejectedHeaderSets) {
       const result = await request(`${instance.url}/v1/chat/completions`, headers);
       expect(result.status).toBe(401);
       expect(result.body).toBe(
@@ -124,7 +125,7 @@ describe("API key HTTP boundary", () => {
       [{ match: { userMessage: "hello" }, response: { content: "ok" } }],
       { auth: { apiKeys: ["primary"] } },
     );
-    for (const headers of [
+    const acceptedHeaderSets: Record<string, string>[] = [
       { Authorization: "Bearer primary" },
       { Authorization: "Key primary" },
       { Authorization: "bearer primary" },
@@ -133,7 +134,8 @@ describe("API key HTTP boundary", () => {
       { "X-Goog-Api-Key": "primary" },
       { "Api-Key": "primary" },
       { "Xi-Api-Key": "primary" },
-    ])
+    ];
+    for (const headers of acceptedHeaderSets)
       expect((await request(`${instance.url}/v1/chat/completions`, headers)).status).toBe(200);
     expect((await request(`${instance.url}/health`, {}, "GET")).status).toBe(200);
   });

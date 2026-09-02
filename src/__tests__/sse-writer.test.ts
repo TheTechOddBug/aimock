@@ -58,7 +58,7 @@ function makeChunk(id: string, content: string): SSEChunk {
     object: "chat.completion.chunk",
     created: 1700000000,
     model: "gpt-4",
-    choices: [{ index: 0, delta: { content }, finish_reason: null }],
+    choices: [{ index: 0, delta: { content }, logprobs: null, finish_reason: null }],
   };
 }
 

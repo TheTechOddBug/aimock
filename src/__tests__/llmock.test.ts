@@ -141,8 +141,9 @@ describe("LLMock", () => {
     });
 
     it("addFixturesFromJSON throws a contextful error on malformed JSON", () => {
-      mock = new LLMock();
-      expect(() => mock.addFixturesFromJSON("{ not valid json")).toThrow(/addFixturesFromJSON/);
+      const m = new LLMock();
+      mock = m;
+      expect(() => m.addFixturesFromJSON("{ not valid json")).toThrow(/addFixturesFromJSON/);
     });
 
     it("chaining API works across multiple calls", () => {
@@ -474,7 +475,7 @@ describe("LLMock", () => {
       expect(mock.journal.size).toBe(1);
       const entry = mock.journal.getLast();
       expect(entry).not.toBeNull();
-      expect(entry!.body.messages[0].content).toBe("journal-test");
+      expect(entry!.body!.messages[0].content).toBe("journal-test");
     });
   });
 
@@ -909,7 +910,7 @@ describe("LLMock", () => {
 
       const last = mock.getLastRequest();
       expect(last).not.toBeNull();
-      expect(last!.body.messages[0].content).toBe("b");
+      expect(last!.body!.messages[0].content).toBe("b");
     });
 
     it("getLastRequest returns null when no requests", async () => {

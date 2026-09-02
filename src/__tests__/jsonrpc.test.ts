@@ -13,23 +13,24 @@ function makeReqRes(): {
   };
 } {
   const req = Object.create(http.IncomingMessage.prototype) as http.IncomingMessage;
-  const res = {
-    _statusCode: 0,
-    _headers: {} as Record<string, string>,
-    _body: "",
-    writeHead(statusCode: number, headers?: Record<string, string>) {
-      this._statusCode = statusCode;
-      if (headers) Object.assign(this._headers, headers);
-      return this;
-    },
-    end(body?: string) {
-      if (body !== undefined) this._body = body;
-    },
-  } as unknown as http.ServerResponse & {
+  type Captured = {
     _statusCode: number;
     _headers: Record<string, string>;
     _body: string;
   };
+  const res = {
+    _statusCode: 0,
+    _headers: {} as Record<string, string>,
+    _body: "",
+    writeHead(this: Captured, statusCode: number, headers?: Record<string, string>) {
+      this._statusCode = statusCode;
+      if (headers) Object.assign(this._headers, headers);
+      return this;
+    },
+    end(this: Captured, body?: string) {
+      if (body !== undefined) this._body = body;
+    },
+  } as unknown as http.ServerResponse & Captured;
   return { req, res };
 }
 

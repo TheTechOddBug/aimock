@@ -99,6 +99,19 @@ function makeEntry(overrides: Partial<DriftEntry> = {}): DriftEntry {
   };
 }
 
+/**
+ * The `readDriftReport` validation tests deliberately poke values that
+ * `DriftEntry` forbids, to prove the reader rejects malformed reports.
+ * `DriftEntry` is an interface, so it carries no implicit index signature and
+ * cannot be narrowed to `Record<string, unknown>` directly. Widening through
+ * `object` — which every interface is assignable to — keeps that reinterpretation
+ * in exactly one place instead of at each mutation site, and it returns the SAME
+ * object so the mutation is visible on the enclosing report.
+ */
+function looseEntry(entry: object): Record<string, unknown> {
+  return entry as Record<string, unknown>;
+}
+
 function makeReport(overrides: Partial<DriftReport> = {}): DriftReport {
   return {
     timestamp: "2026-03-19T00:00:00.000Z",
@@ -178,7 +191,7 @@ describe("readDriftReport", () => {
 
   it("throws when entry is missing provider", () => {
     const report = makeReport();
-    (report.entries[0] as Record<string, unknown>).provider = "";
+    looseEntry(report.entries[0]).provider = "";
     mockedExistsSync.mockReturnValue(true);
     mockedReadFileSync.mockReturnValue(JSON.stringify(report));
 
@@ -189,7 +202,7 @@ describe("readDriftReport", () => {
 
   it("throws when entry has no diffs array", () => {
     const report = makeReport();
-    (report.entries[0] as Record<string, unknown>).diffs = "not-array";
+    looseEntry(report.entries[0]).diffs = "not-array";
     mockedExistsSync.mockReturnValue(true);
     mockedReadFileSync.mockReturnValue(JSON.stringify(report));
 
@@ -212,7 +225,7 @@ describe("readDriftReport", () => {
 
   it("throws when entry is missing builderFile", () => {
     const report = makeReport();
-    (report.entries[0] as Record<string, unknown>).builderFile = "";
+    looseEntry(report.entries[0]).builderFile = "";
     mockedExistsSync.mockReturnValue(true);
     mockedReadFileSync.mockReturnValue(JSON.stringify(report));
 
@@ -232,7 +245,7 @@ describe("readDriftReport", () => {
 
   it("throws when builderFunctions contains non-string elements", () => {
     const report = makeReport();
-    (report.entries[0] as Record<string, unknown>).builderFunctions = ["valid", 42];
+    looseEntry(report.entries[0]).builderFunctions = ["valid", 42];
     mockedExistsSync.mockReturnValue(true);
     mockedReadFileSync.mockReturnValue(JSON.stringify(report));
 
@@ -243,7 +256,7 @@ describe("readDriftReport", () => {
 
   it("throws when entry is missing scenario", () => {
     const report = makeReport();
-    (report.entries[0] as Record<string, unknown>).scenario = 123;
+    looseEntry(report.entries[0]).scenario = 123;
     mockedExistsSync.mockReturnValue(true);
     mockedReadFileSync.mockReturnValue(JSON.stringify(report));
 
@@ -252,7 +265,7 @@ describe("readDriftReport", () => {
 
   it("throws when entry is missing sdkShapesFile", () => {
     const report = makeReport();
-    (report.entries[0] as Record<string, unknown>).sdkShapesFile = "";
+    looseEntry(report.entries[0]).sdkShapesFile = "";
     mockedExistsSync.mockReturnValue(true);
     mockedReadFileSync.mockReturnValue(JSON.stringify(report));
 
@@ -261,7 +274,7 @@ describe("readDriftReport", () => {
 
   it("throws when typesFile is not a string or null", () => {
     const report = makeReport();
-    (report.entries[0] as Record<string, unknown>).typesFile = 42;
+    looseEntry(report.entries[0]).typesFile = 42;
     mockedExistsSync.mockReturnValue(true);
     mockedReadFileSync.mockReturnValue(JSON.stringify(report));
 

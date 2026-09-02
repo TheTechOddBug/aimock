@@ -3523,7 +3523,7 @@ describe("OpenRouter video record — round 3 CR", () => {
     // pending resolves AFTER the fast poll's capture replaced the entry.
     let statusCalls = 0;
     let selfUrl = "http://stub";
-    rawUpstream = await new Promise((resolve) => {
+    rawUpstream = await new Promise<{ url: string; close: () => Promise<void> }>((resolve) => {
       const server = http.createServer((req, res) => {
         const url = new URL(req.url ?? "/", selfUrl);
         const sendJson = (status: number, body: unknown): void => {
@@ -4620,24 +4620,26 @@ describe("OpenRouter video record — round 6 CR", () => {
     // A pathological multi-megabyte "envelope" must not be buffered in full
     // and relayed — the bounded read refuses it and the synthesis serves.
     let selfUrl = "http://stub";
-    rawUpstream = await new Promise((resolve, reject) => {
-      const server = http.createServer((req, res) => {
-        req.resume();
-        req.on("end", () => {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ data: [{ id: "x".repeat(2 * 1024 * 1024) }] }));
+    rawUpstream = await new Promise<{ url: string; close: () => Promise<void> }>(
+      (resolve, reject) => {
+        const server = http.createServer((req, res) => {
+          req.resume();
+          req.on("end", () => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ data: [{ id: "x".repeat(2 * 1024 * 1024) }] }));
+          });
         });
-      });
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => {
-        const { port } = server.address() as { port: number };
-        selfUrl = `http://127.0.0.1:${port}`;
-        resolve({
-          url: selfUrl,
-          close: () => new Promise<void>((r) => server.close(() => r())),
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", () => {
+          const { port } = server.address() as { port: number };
+          selfUrl = `http://127.0.0.1:${port}`;
+          resolve({
+            url: selfUrl,
+            close: () => new Promise<void>((r) => server.close(() => r())),
+          });
         });
-      });
-    });
+      },
+    );
     const m = await startMock(rawUpstream.url);
     m.addFixture({
       match: { userMessage: "synth model render", endpoint: "video", model: "synth/model-1" },
