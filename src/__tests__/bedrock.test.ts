@@ -281,7 +281,7 @@ describe("POST /model/{modelId}/invoke (journal)", () => {
     expect(entry!.path).toBe("/model/anthropic.claude-3-5-sonnet-20241022-v2:0/invoke");
     expect(entry!.response.status).toBe(200);
     expect(entry!.response.fixture).toBe(textFixture);
-    expect(entry!.body.model).toBe("anthropic.claude-3-5-sonnet-20241022-v2:0");
+    expect(entry!.body!.model).toBe("anthropic.claude-3-5-sonnet-20241022-v2:0");
   });
 });
 

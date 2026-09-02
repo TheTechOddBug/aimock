@@ -685,7 +685,7 @@ describe("fal.ai general handler — record and replay", () => {
     // so a bogus host would fail on DNS/connect instead of exercising the
     // intended status-500 branch (round-4 B8).
     let selfUrl = "http://stub";
-    upstream = await new Promise((resolve, reject) => {
+    upstream = await new Promise<{ url: string; close: () => Promise<void> }>((resolve, reject) => {
       const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -776,42 +776,44 @@ describe("fal.ai general handler — record and replay", () => {
       // Real upstream: the submit envelope nominates the EVIL host; the
       // constructed canonical paths on this origin serve the true lifecycle.
       let selfUrl = "http://stub";
-      upstream = await new Promise((resolve, reject) => {
-        const server = http.createServer((req, res) => {
-          const chunks: Buffer[] = [];
-          req.on("data", (c: Buffer) => chunks.push(c));
-          req.on("end", () => {
-            const url = new URL(req.url ?? "/", selfUrl);
-            const send = (status: number, body: unknown): void => {
-              res.writeHead(status, { "Content-Type": "application/json" });
-              res.end(JSON.stringify(body));
-            };
-            if (req.method === "POST") {
-              send(200, {
-                request_id: "r-a6",
-                status_url: `${evilUrl}/hijacked/requests/r-a6/status`,
-                response_url: `${evilUrl}/hijacked/requests/r-a6`,
-                status: "IN_QUEUE",
-              });
-              return;
-            }
-            if (url.pathname.endsWith("/status")) {
-              send(200, { status: "COMPLETED", request_id: "r-a6" });
-              return;
-            }
-            send(200, FINAL_BODY);
+      upstream = await new Promise<{ url: string; close: () => Promise<void> }>(
+        (resolve, reject) => {
+          const server = http.createServer((req, res) => {
+            const chunks: Buffer[] = [];
+            req.on("data", (c: Buffer) => chunks.push(c));
+            req.on("end", () => {
+              const url = new URL(req.url ?? "/", selfUrl);
+              const send = (status: number, body: unknown): void => {
+                res.writeHead(status, { "Content-Type": "application/json" });
+                res.end(JSON.stringify(body));
+              };
+              if (req.method === "POST") {
+                send(200, {
+                  request_id: "r-a6",
+                  status_url: `${evilUrl}/hijacked/requests/r-a6/status`,
+                  response_url: `${evilUrl}/hijacked/requests/r-a6`,
+                  status: "IN_QUEUE",
+                });
+                return;
+              }
+              if (url.pathname.endsWith("/status")) {
+                send(200, { status: "COMPLETED", request_id: "r-a6" });
+                return;
+              }
+              send(200, FINAL_BODY);
+            });
           });
-        });
-        server.once("error", reject);
-        server.listen(0, "127.0.0.1", () => {
-          const { port } = server.address() as { port: number };
-          selfUrl = `http://127.0.0.1:${port}`;
-          resolve({
-            url: selfUrl,
-            close: () => new Promise<void>((r) => server.close(() => r())),
+          server.once("error", reject);
+          server.listen(0, "127.0.0.1", () => {
+            const { port } = server.address() as { port: number };
+            selfUrl = `http://127.0.0.1:${port}`;
+            resolve({
+              url: selfUrl,
+              close: () => new Promise<void>((r) => server.close(() => r())),
+            });
           });
-        });
-      });
+        },
+      );
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "aimock-fal-a6-"));
       mock = new LLMock({
         port: 0,
@@ -894,7 +896,7 @@ describe("fal.ai general handler — record and replay", () => {
     // existing 502/no-fixture failure handling.
     let selfUrl = "http://stub";
     const sockets = new Set<net.Socket>();
-    upstream = await new Promise((resolve, reject) => {
+    upstream = await new Promise<{ url: string; close: () => Promise<void> }>((resolve, reject) => {
       const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -998,7 +1000,7 @@ describe("fal.ai general handler — record and replay", () => {
     // JSON.parse("null") passes parseJsonOrThrow — the walk must reject the
     // non-object shape itself instead of TypeError-ing on env.request_id.
     let selfUrl = "http://stub";
-    upstream = await new Promise((resolve, reject) => {
+    upstream = await new Promise<{ url: string; close: () => Promise<void> }>((resolve, reject) => {
       const server = http.createServer((req, res) => {
         req.resume();
         req.on("end", () => {

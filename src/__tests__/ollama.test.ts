@@ -445,6 +445,7 @@ describe("POST /api/chat (streaming)", () => {
     const chunks = parseNDJSON(res.body) as Array<{
       message: { tool_calls?: Array<{ function: { name: string; arguments: unknown } }> };
       done: boolean;
+      created_at: string;
     }>;
     const toolChunk = chunks.find((c) => c.message.tool_calls && c.message.tool_calls.length > 0);
     expect(toolChunk).toBeDefined();
@@ -453,7 +454,7 @@ describe("POST /api/chat (streaming)", () => {
 
     // All chunks should have created_at
     for (const chunk of chunks) {
-      expect((chunk as { created_at: string }).created_at).toEqual(expect.any(String));
+      expect(chunk.created_at).toEqual(expect.any(String));
     }
   });
 
@@ -899,7 +900,7 @@ describe("POST /api/chat (journal)", () => {
     expect(entry!.path).toBe("/api/chat");
     expect(entry!.response.status).toBe(200);
     expect(entry!.response.fixture).toBe(textFixture);
-    expect(entry!.body.model).toBe("llama3");
+    expect(entry!.body!.model).toBe("llama3");
   });
 });
 
@@ -1426,6 +1427,7 @@ function createDefaults(overrides: Partial<HandlerDefaults> = {}): HandlerDefaul
   return {
     latency: 0,
     chunkSize: 100,
+    replaySpeed: 1,
     logger: new Logger("silent"),
     ...overrides,
   };

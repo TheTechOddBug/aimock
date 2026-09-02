@@ -847,7 +847,7 @@ describe("Gemini routing", () => {
 
     const entry = instance.journal.getLast();
     expect(entry).not.toBeNull();
-    expect(entry!.body.model).toBe("gemini-1.5-pro");
+    expect(entry!.body!.model).toBe("gemini-1.5-pro");
   });
 });
 

@@ -16,7 +16,7 @@ import {
   applyChanges,
   COMPETITOR_MIGRATION_PAGES,
   type DetectedChange,
-} from "../../scripts/update-competitive-matrix.ts";
+} from "../../scripts/update-competitive-matrix.js";
 
 // Repo root: this file lives at <root>/src/__tests__/, so up two levels.
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");

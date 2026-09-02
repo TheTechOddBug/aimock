@@ -20,7 +20,7 @@ function parseSSEResponse(body: string): SSEChunk[] {
     .map((line) => JSON.parse(line.slice(6)));
 }
 
-function parseClaudeSSE(body: string): object[] {
+function parseClaudeSSE(body: string): Record<string, unknown>[] {
   return body
     .split("\n\n")
     .filter((line) => line.includes("data: "))
@@ -329,7 +329,7 @@ describe("response overrides: OpenAI Chat Completions (streaming)", () => {
     });
     const chunks = parseSSEResponse(res.body);
     for (const chunk of chunks) {
-      expect((chunk as Record<string, unknown>).system_fingerprint).toBe("fp_stream");
+      expect(chunk.system_fingerprint).toBe("fp_stream");
     }
   });
 });

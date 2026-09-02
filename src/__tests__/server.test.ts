@@ -729,7 +729,7 @@ describe("journal", () => {
     expect(entry).not.toBeNull();
     expect(entry!.method).toBe("POST");
     expect(entry!.path).toBe("/v1/chat/completions");
-    expect(entry!.body.model).toBe("gpt-4");
+    expect(entry!.body!.model).toBe("gpt-4");
     expect(entry!.response.status).toBe(200);
     expect(entry!.response.fixture).toBe(textFixture);
   });

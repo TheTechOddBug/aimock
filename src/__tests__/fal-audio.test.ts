@@ -295,7 +295,7 @@ describe("fal.ai audio queue — record walk (round 5)", () => {
     // the synthesized envelope's headers have not been sent when
     // persistFixture fails, so the failure can ride the response.
     let selfUrl = "http://stub";
-    upstream = await new Promise((resolve, reject) => {
+    upstream = await new Promise<{ url: string; close: () => Promise<void> }>((resolve, reject) => {
       const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));

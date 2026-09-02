@@ -140,12 +140,12 @@ describe("C4: checkDeprecatedFamiliesLive (infra-error short-circuit via isInfra
 
 describe("C4: isFamilyStillReferenced (real source-tree ref-scan, zero-LLM)", () => {
   it("finds a real reference (gpt-4 and gpt-4o are both referenced in src/server.ts)", () => {
-    expect(isFamilyStillReferenced("gpt-4", "openai")).toBe(true);
-    expect(isFamilyStillReferenced("gpt-4o", "openai")).toBe(true);
+    expect(isFamilyStillReferenced("gpt-4")).toBe(true);
+    expect(isFamilyStillReferenced("gpt-4o")).toBe(true);
   });
 
   it("reports zero-reference for a synthetic family that appears nowhere in src/", () => {
-    expect(isFamilyStillReferenced("zzz-totally-fictional-family-not-real", "openai")).toBe(false);
+    expect(isFamilyStillReferenced("zzz-totally-fictional-family-not-real")).toBe(false);
   });
 
   it("does not false-positive from being a strict substring of a longer live id", () => {
@@ -154,7 +154,7 @@ describe("C4: isFamilyStillReferenced (real source-tree ref-scan, zero-LLM)", ()
     // not confuse the two. gpt-4 IS separately, exactly referenced in
     // DEFAULT_MODELS (asserted above) — this confirms the match is a real
     // boundary hit, not a substring artifact.
-    expect(isFamilyStillReferenced("gpt-4-turbo-nonexistent-suffix", "openai")).toBe(false);
+    expect(isFamilyStillReferenced("gpt-4-turbo-nonexistent-suffix")).toBe(false);
   });
 });
 

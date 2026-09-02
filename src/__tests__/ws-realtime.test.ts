@@ -1188,11 +1188,11 @@ describe("WebSocket /v1/realtime", () => {
 
   it("maps input_image to ChatMessage image_url format for fixture matching", async () => {
     // Use a predicate to verify the ChatMessage structure produced by realtimeItemsToMessages
-    let capturedMessages: unknown[] | null = null;
+    const captured: { messages: unknown[] | null } = { messages: null };
     const imageFixture: Fixture = {
       match: {
         predicate: (req) => {
-          capturedMessages = req.messages;
+          captured.messages = req.messages;
           // Match any request so we get a response
           const lastUser = req.messages.filter((m) => m.role === "user").pop();
           return !!lastUser;
@@ -1231,8 +1231,8 @@ describe("WebSocket /v1/realtime", () => {
     expect(textDelta!.delta).toContain("I see a cat.");
 
     // Verify the ChatMessage structure passed to fixture matching
-    expect(capturedMessages).not.toBeNull();
-    const userMsg = (capturedMessages as Record<string, unknown>[]).find((m) => m.role === "user");
+    expect(captured.messages).not.toBeNull();
+    const userMsg = (captured.messages as Record<string, unknown>[]).find((m) => m.role === "user");
     expect(userMsg).toBeDefined();
     // After mapping, content should be an array with text + image_url parts
     const content = userMsg!.content as Array<Record<string, unknown>>;
@@ -1912,7 +1912,7 @@ describe("WebSocket /v1/realtime", () => {
 
     const entry = instance.journal.getLast();
     expect(entry).not.toBeNull();
-    expect(entry!.body._endpointType).toBe("realtime");
+    expect(entry!.body!._endpointType).toBe("realtime");
 
     ws.close();
   });
@@ -1938,7 +1938,7 @@ describe("WebSocket /v1/realtime", () => {
 
     const entry = instance.journal.getLast();
     expect(entry).not.toBeNull();
-    expect(entry!.body._endpointType).toBe("realtime-transcription");
+    expect(entry!.body!._endpointType).toBe("realtime-transcription");
 
     ws.close();
   });
@@ -1964,7 +1964,7 @@ describe("WebSocket /v1/realtime", () => {
 
     const entry = instance.journal.getLast();
     expect(entry).not.toBeNull();
-    expect(entry!.body._endpointType).toBe("realtime-translation");
+    expect(entry!.body!._endpointType).toBe("realtime-translation");
 
     ws.close();
   });

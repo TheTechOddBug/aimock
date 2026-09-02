@@ -304,8 +304,8 @@ describe("Mountable interface", () => {
 
     it("journal entry can include service field", async () => {
       // Create a mount that writes a journal entry with service field
-      const serviceMount: Mountable = {
-        journal: null as Journal | null,
+      const serviceMount: Mountable & { journal: Journal | null } = {
+        journal: null,
         /* eslint-disable @typescript-eslint/no-unused-vars */
         async handleRequest(
           req: http.IncomingMessage,

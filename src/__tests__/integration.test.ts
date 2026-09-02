@@ -357,14 +357,14 @@ describe("integration: journal verification", () => {
     // First entry
     expect(entries[0].method).toBe("POST");
     expect(entries[0].path).toBe("/v1/chat/completions");
-    expect(entries[0].body.messages[0].content).toBe("first message");
+    expect(entries[0].body!.messages[0].content).toBe("first message");
     expect(entries[0].response.status).toBe(200);
     expect(entries[0].response.fixture).not.toBeNull();
     expect(entries[0].id).toBeTruthy();
     expect(entries[0].timestamp).toBeGreaterThan(0);
 
     // Second entry
-    expect(entries[1].body.messages[0].content).toBe("second message");
+    expect(entries[1].body!.messages[0].content).toBe("second message");
     expect(entries[1].response.status).toBe(200);
 
     // Journal also records unmatched requests

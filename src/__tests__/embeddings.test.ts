@@ -774,11 +774,16 @@ function createMockRes(): http.ServerResponse {
     headers[name.toLowerCase()] = String(value);
     return res;
   };
-  res.writeHead = (statusCode: number, hdrs?: Record<string, string>) => {
+  res.writeHead = (
+    statusCode: number,
+    arg1?: string | http.OutgoingHttpHeaders | http.OutgoingHttpHeader[],
+    arg2?: http.OutgoingHttpHeaders | http.OutgoingHttpHeader[],
+  ) => {
     (res as { statusCode: number }).statusCode = statusCode;
-    if (hdrs) {
+    const hdrs = typeof arg1 === "string" ? arg2 : arg1;
+    if (hdrs && !Array.isArray(hdrs)) {
       for (const [k, v] of Object.entries(hdrs)) {
-        headers[k.toLowerCase()] = v;
+        headers[k.toLowerCase()] = String(v);
       }
     }
     return res;
@@ -802,7 +807,7 @@ describe("handleEmbeddings (direct call — ?? fallback branches)", () => {
   it("uses fallback POST and /v1/embeddings when req.method and req.url are undefined", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -834,7 +839,7 @@ describe("handleEmbeddings (direct call — ?? fallback branches)", () => {
   it("uses fallback method/path on malformed JSON with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const mockReq = {
       method: undefined,
@@ -855,7 +860,7 @@ describe("handleEmbeddings (direct call — ?? fallback branches)", () => {
   it("uses fallback for strict mode with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger, strict: true };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger, strict: true };
 
     const mockReq = {
       method: undefined,
@@ -887,7 +892,7 @@ describe("handleEmbeddings (direct call — ?? fallback branches)", () => {
   it("uses fallback for error fixture with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const errorFixture: Fixture = {
       match: { inputText: "err" },
@@ -927,7 +932,7 @@ describe("handleEmbeddings (direct call — ?? fallback branches)", () => {
   it("uses fallback for embedding fixture with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const embFixture: Fixture = {
       match: { inputText: "embed" },
@@ -964,7 +969,7 @@ describe("handleEmbeddings (direct call — ?? fallback branches)", () => {
   it("uses fallback for incompatible fixture response with undefined req fields", async () => {
     const journal = new Journal();
     const logger = new Logger("silent");
-    const defaults = { latency: 0, chunkSize: 10, logger };
+    const defaults = { latency: 0, chunkSize: 10, replaySpeed: 1, logger };
 
     const badFixture: Fixture = {
       match: { predicate: () => true },

@@ -32,7 +32,7 @@ describe("recorder context path traversal", () => {
     return {
       match: {
         userMessage: "hello",
-        endpoint: "/v1/chat/completions",
+        endpoint: "chat",
         context,
       },
       response: { content: "hi" },
