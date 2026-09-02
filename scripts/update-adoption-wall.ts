@@ -92,7 +92,12 @@
  *
  * Exit codes (the workflow branches on these, not on prose):
  *   0  CLEAN         — logos healthy, no data change. Nothing to commit.
- *   10 CHANGED_SAFE  — logos healthy, wall changed additively. Safe to push.
+ *   10 CHANGED_SAFE  — logos healthy, the wall changed, and none of the
+ *                      guardrails listed under 20 fired. Safe to push. This is
+ *                      NOT "the wall only grew": classify() returns SAFE for any
+ *                      change it found no reason to stop, which includes
+ *                      reorders, star-driven reshuffles, avatar refreshes and
+ *                      EXPLAINED removals. A removal can auto-land. See classify.
  *   20 NEEDS_REVIEW  — human. Any of: a logo is dead or unverifiable; the wall
  *                      shrank past its explained removals; it would render fewer
  *                      than MIN_WALL_SIZE tiles; the highest-starred candidate the

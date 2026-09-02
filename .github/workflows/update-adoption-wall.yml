@@ -245,6 +245,59 @@ jobs:
             *)  echo "Adoption wall script failed with exit ${CODE}"; exit "$CODE" ;;
           esac
 
+      # THE RUN'S ACCOUNT OF ITSELF, ROUTED SOMEWHERE A HUMAN READS IT.
+      # The generator writes its summary to $RUNNER_TEMP on EVERY verdict, but
+      # until this step existed its only consumer was the --body-file of "Open
+      # review PR" below, which fires on the NEEDS-REVIEW path alone. So on the
+      # two verdicts that are the base case -- CLEAN, and SAFE, the one that
+      # pushes to a public homepage unattended -- the exclude-list suppression
+      # count, the fork-disagreement table, the unmapped-adopter queue, the org
+      # runners-up and the selected wall were written, read by nobody, and
+      # discarded with the runner. One of them had no other channel at all:
+      # staleExclusions is computed only to build this summary and is never
+      # console.log'd, so on a green run it existed nowhere.
+      #
+      # `if: always()` and a body that CANNOT FAIL THE JOB. This step reports; it
+      # does not decide. A failure here after a successful auto-land would flip a
+      # genuinely-successful run to "failed" and fire a Slack alert naming no
+      # real cause, so every append is `|| true`: losing the summary must never
+      # lose the run's verdict.
+      #
+      # "Open review PR" still reads the same file. This step only copies it.
+      - name: Publish run summary
+        if: always()
+        run: |
+          SUMMARY="${RUNNER_TEMP}/adoption-wall-summary.md"
+          LOG="${RUNNER_TEMP}/adoption-wall.log"
+          # $GITHUB_STEP_SUMMARY is capped at 1 MiB and the runner DISCARDS an
+          # oversized file rather than truncating it, which would lose the very
+          # thing this step exists to keep. Leave headroom for the notice.
+          LIMIT=$((1024 * 1024 - 4096))
+          if [ -s "$SUMMARY" ]; then
+            head -c "$LIMIT" "$SUMMARY" >> "$GITHUB_STEP_SUMMARY" || true
+            if [ "$(wc -c < "$SUMMARY")" -gt "$LIMIT" ]; then
+              {
+                echo
+                echo "_Truncated at ${LIMIT} bytes for the job-summary cap; the full text is in the \`Update adoption wall\` step log._"
+              } >> "$GITHUB_STEP_SUMMARY" || true
+            fi
+          else
+            # The generator writes the summary BEFORE it returns its verdict and
+            # does not gate that write on the status, so on exit 0/10/20 the file
+            # is there. Absent means the run died earlier than that -- the step
+            # above `exit`ed with the raw code -- and the log tail is then the
+            # only account of the run that exists.
+            {
+              echo "## Adoption wall: no summary was produced"
+              echo
+              echo "The generator did not write a summary, so it failed before reaching that point. Tail of its log:"
+              echo
+              echo '```'
+              tail -c 60000 "$LOG" 2>/dev/null || echo "(the generator produced no log either)"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+
       # THE PRODUCER'S OTHER HALF. The generator rewrote adoption-data/adopters.json
       # in place; this lands it on the orphan branch. Without it `lastScan` never
       # moves, and MAX_STATE_AGE_DAYS turns from a guard into a fuse: three weeks
@@ -377,8 +430,10 @@ jobs:
             echo "The diff is confined to the generated region; it may auto-land."
           fi
 
-      # The whole point of the wall: a healthy, purely-additive refresh lands
-      # itself. No weekly click.
+      # The whole point of the wall: a healthy refresh that tripped none of the
+      # guardrails lands itself. No weekly click. SAFE is not "the wall only
+      # grew" -- classify() returns it for any change no guardrail stopped, so
+      # a reorder, an avatar refresh or an EXPLAINED removal auto-lands here too.
       #
       # NOTE: there is no separate opt-in variable gating this. A safe, changed,
       # region-confined run pushes to ${{ github.ref_name }} unattended, and the
