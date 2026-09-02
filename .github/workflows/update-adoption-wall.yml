@@ -430,8 +430,10 @@ jobs:
             echo "The diff is confined to the generated region; it may auto-land."
           fi
 
-      # The whole point of the wall: a healthy, purely-additive refresh lands
-      # itself. No weekly click.
+      # The whole point of the wall: a healthy refresh that tripped none of the
+      # guardrails lands itself. No weekly click. SAFE is not "the wall only
+      # grew" -- classify() returns it for any change no guardrail stopped, so
+      # a reorder, an avatar refresh or an EXPLAINED removal auto-lands here too.
       #
       # NOTE: there is no separate opt-in variable gating this. A safe, changed,
       # region-confined run pushes to ${{ github.ref_name }} unattended, and the
