@@ -19,8 +19,11 @@ docs/specs/
 # The workflow writes these to $RUNNER_TEMP (outside the checkout) so the
 # drift-success predicate's `git status` scan never sees them; this glob is
 # belt-and-suspenders for local runs and covers the post-fix / pinned variants.
-claude-code-output.log
-drift-report*.json
+# Anchored to the repo root deliberately: these are root-CWD local-run artifacts,
+# not a name to suppress at any depth (an unanchored glob would silently hide a
+# fixture such as src/__tests__/fixtures/drift-report-*.json).
+/claude-code-output.log
+/drift-report*.json
 
 # Adopter state checked out from the orphan adoption-data branch by
 # .github/workflows/update-adoption-wall.yml. Never committed to main.
